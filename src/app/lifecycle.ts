@@ -19,8 +19,8 @@ export class AppLifecycle {
 
   async start() {
     await this.input.transcriptStore.ensureInitialized();
-    await this.input.runtime.start();
     await this.input.renderer.start();
+    await this.input.runtime.start();
     this.input.terminal.start();
   }
 }

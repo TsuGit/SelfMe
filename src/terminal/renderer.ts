@@ -4,12 +4,14 @@ import { clearLine, hideCursor, moveCursorTo, readCursorPosition, showCursor } f
 import { renderTerminalLayout, type TerminalMessageBlock } from "./layout.js";
 import type { SettingsStore } from "../storage/settings.js";
 import type { SessionRecord } from "../types/session.js";
+import { fg, paint } from "./theme.js";
 
 interface RenderState {
   editorValue: string;
   editorCursor: number;
   messages: TerminalMessageBlock[];
   messageViewportOffset: number;
+  workingFrame: number;
 }
 
 export class TerminalRenderer {
@@ -20,8 +22,10 @@ export class TerminalRenderer {
     editorValue: "",
     editorCursor: 0,
     messages: [],
-    messageViewportOffset: 0
+    messageViewportOffset: 0,
+    workingFrame: 0
   };
+  private workingTimer?: NodeJS.Timeout;
 
   constructor(
     private readonly input: {
@@ -41,6 +45,7 @@ export class TerminalRenderer {
       `${logo[2]}  ${ansiDim(shortenHomePath(this.input.session.cwd ?? process.cwd()))}`
     ];
     this.state.messages.push({
+      kind: "welcome",
       title: "",
       body: welcomeLines.join("\n")
     });
@@ -52,10 +57,20 @@ export class TerminalRenderer {
     });
 
     this.input.bus.on("user.message.submitted", (event) => {
-      this.state.messages.push({
-        title: "You",
+      const userMessage: TerminalMessageBlock = {
+        kind: "user",
+        title: "",
         body: event.payload.content
-      });
+      };
+
+      const last = this.state.messages.at(-1);
+
+      if (last?.kind === "assistant-working") {
+        this.state.messages.splice(this.state.messages.length - 1, 0, userMessage);
+      } else {
+        this.state.messages.push(userMessage);
+      }
+
       this.state.messageViewportOffset = 0;
       this.state.editorValue = "";
       this.state.editorCursor = 0;
@@ -64,6 +79,7 @@ export class TerminalRenderer {
 
     this.input.bus.on("system.message.appended", (event) => {
       this.state.messages.push({
+        kind: "system",
         title: event.payload.title,
         body: event.payload.content
       });
@@ -72,39 +88,60 @@ export class TerminalRenderer {
     });
 
     this.input.bus.on("assistant.stream.started", () => {
-      this.state.messages.push({
-        title: "Assistant",
-        body: "(streaming...)"
-      });
+      const last = this.state.messages.at(-1);
+      const workingMessage: TerminalMessageBlock = {
+        kind: "assistant-working",
+        title: "",
+        body: this.renderWorkingLabel()
+      };
+
+      if (last?.kind === "assistant-working" || last?.kind === "assistant") {
+        this.state.messages[this.state.messages.length - 1] = workingMessage;
+      } else {
+        this.state.messages.push(workingMessage);
+      }
+
       this.state.messageViewportOffset = 0;
+      this.startWorkingAnimation();
       this.render();
     });
 
     this.input.bus.on("assistant.delta.received", (event) => {
       const last = this.state.messages.at(-1);
 
-      if (!last || last.title !== "Assistant") {
+      if (last?.kind === "assistant-working") {
+        this.state.messages[this.state.messages.length - 1] = {
+          kind: "assistant",
+          title: "",
+          body: event.payload.delta
+        };
+      } else if (!last || last.kind !== "assistant") {
         this.state.messages.push({
-          title: "Assistant",
+          kind: "assistant",
+          title: "",
           body: event.payload.delta
         });
       } else {
         this.state.messages[this.state.messages.length - 1] = {
-          title: "Assistant",
-          body: last.body === "(streaming...)" ? event.payload.delta : `${last.body}${event.payload.delta}`
+          kind: "assistant",
+          title: "",
+          body: `${last.body}${event.payload.delta}`
         };
       }
 
+      this.stopWorkingAnimation();
       this.state.messageViewportOffset = 0;
       this.render();
     });
 
     this.input.bus.on("assistant.completed", () => {
+      this.stopWorkingAnimation();
       this.render();
     });
 
     this.input.bus.on("tool.execution.started", (event) => {
       this.state.messages.push({
+        kind: "tool",
         title: "Tool",
         body: `[${event.payload.toolName}] running...`
       });
@@ -114,6 +151,7 @@ export class TerminalRenderer {
 
     this.input.bus.on("tool.execution.completed", (event) => {
       this.state.messages.push({
+        kind: "tool",
         title: "Tool",
         body: [
           `[${event.payload.toolName}] ${event.payload.summary}`,
@@ -126,6 +164,7 @@ export class TerminalRenderer {
 
     this.input.bus.on("approval.requested", (event) => {
       this.state.messages.push({
+        kind: "approval",
         title: "Approval",
         body: [
           `[${event.payload.toolName}] ${event.payload.reason}`,
@@ -140,6 +179,7 @@ export class TerminalRenderer {
 
     this.input.bus.on("approval.resolved", (event) => {
       this.state.messages.push({
+        kind: "approval",
         title: "Approval",
         body: `${event.payload.approved ? "Approved" : "Denied"}: ${event.payload.approvalId}`
       });
@@ -148,7 +188,9 @@ export class TerminalRenderer {
     });
 
     this.input.bus.on("runtime.error.raised", (event) => {
+      this.stopWorkingAnimation();
       this.state.messages.push({
+        kind: "error",
         title: "Error",
         body: event.payload.message
       });
@@ -162,6 +204,7 @@ export class TerminalRenderer {
     });
 
     process.on("exit", () => {
+      this.stopWorkingAnimation();
       process.stdout.write(showCursor());
     });
 
@@ -175,7 +218,9 @@ export class TerminalRenderer {
     const layout = renderTerminalLayout({
       messages: this.state.messages,
       promptLines: prompt.lines,
+      promptCursorRow: prompt.cursorRow,
       viewportHeight: process.stdout.rows ?? 24,
+      viewportWidth: process.stdout.columns ?? 80,
       messageViewportOffset: this.state.messageViewportOffset
     });
     const lines = layout.content.split("\n");
@@ -206,7 +251,12 @@ export class TerminalRenderer {
     const clampedCursor = Math.max(0, Math.min(this.state.editorCursor, this.state.editorValue.length));
     const value = this.state.editorValue;
     const lines = value.length > 0 ? value.split("\n") : [""];
-    const promptLines = lines.map((line, index) => `${index === 0 ? "> " : "  "}${line}`);
+    const viewportWidth = process.stdout.columns ?? 80;
+    const promptLines = lines.map((line, index) => {
+      const prefix = index === 0 ? "> " : "· ";
+      const contentWidth = Math.max(1, viewportWidth - getDisplayWidth(prefix));
+      return `${ansiComposerPrefix(prefix)}${ansiComposerFill(padToDisplayWidth(line || " ", contentWidth))}`;
+    });
     const beforeCursor = value.slice(0, clampedCursor);
     const cursorSegments = beforeCursor.split("\n");
     const cursorRow = cursorSegments.length - 1;
@@ -217,6 +267,81 @@ export class TerminalRenderer {
       cursorRow,
       cursorColumn
     };
+  }
+
+  private startWorkingAnimation() {
+    this.stopWorkingAnimation();
+    this.state.workingFrame = 0;
+    const last = this.state.messages.at(-1);
+
+    if (last?.kind === "assistant-working") {
+      this.state.messages[this.state.messages.length - 1] = {
+        ...last,
+        body: this.renderWorkingLabel()
+      };
+    }
+
+    this.workingTimer = setInterval(() => {
+      const last = this.state.messages.at(-1);
+
+      if (!last || last.kind !== "assistant-working") {
+        this.stopWorkingAnimation();
+        return;
+      }
+
+      this.state.workingFrame += 0.55;
+      this.state.messages[this.state.messages.length - 1] = {
+        ...last,
+        body: this.renderWorkingLabel()
+      };
+      this.render();
+    }, 60);
+  }
+
+  private stopWorkingAnimation() {
+    if (!this.workingTimer) {
+      return;
+    }
+
+    clearInterval(this.workingTimer);
+    this.workingTimer = undefined;
+  }
+
+  private renderWorkingLabel() {
+    const text = "• Working";
+    const beamWidth = 3;
+    const cycleLength = text.length + beamWidth * 2;
+    const beamCenter = (this.state.workingFrame % cycleLength) - beamWidth;
+    let output = "";
+
+    for (let index = 0; index < text.length; index += 1) {
+      const char = text[index] ?? "";
+      const distance = Math.abs(index - beamCenter);
+
+      if (distance < 0.32) {
+        output += ansiWorkingBeamHidden(char);
+        continue;
+      }
+
+      if (distance < 0.82) {
+        output += ansiWorkingBeamCore(char);
+        continue;
+      }
+
+      if (distance < 1.4) {
+        output += ansiWorkingBeamMid(char);
+        continue;
+      }
+
+      if (distance < 2.1) {
+        output += ansiWorkingBeamTrail(char);
+        continue;
+      }
+
+      output += ansiWorkingBase(char);
+    }
+
+    return output;
   }
 }
 
@@ -245,15 +370,51 @@ function shortenHomePath(path: string) {
 }
 
 function ansiBright(text: string) {
-  return `\u001b[1;97m${text}\u001b[0m`;
+  return paint(text, { fg: "textPrimary", bold: true });
 }
 
 function ansiDim(text: string) {
-  return `\u001b[38;2;145;163;183m${text}\u001b[0m`;
+  return fg("textMuted", text);
+}
+
+function ansiMuted(text: string) {
+  return fg("textMuted", text);
+}
+
+function ansiPrompt(text: string) {
+  return fg("textPrimary", text);
+}
+
+function ansiComposerPrefix(text: string) {
+  return paint(text, { bg: "bgSubtle", fg: "textPrimary" });
+}
+
+function ansiComposerFill(text: string) {
+  return paint(text, { bg: "bgSubtle", fg: "textPrimary" });
+}
+
+function ansiWorkingBase(text: string) {
+  return fg("textSecondary", text);
+}
+
+function ansiWorkingBeamHidden(text: string) {
+  return paint(text, { conceal: true });
+}
+
+function ansiWorkingBeamCore(text: string) {
+  return fg("bgPanel", text);
+}
+
+function ansiWorkingBeamMid(text: string) {
+  return fg("lineStrong", text);
+}
+
+function ansiWorkingBeamTrail(text: string) {
+  return fg("textMuted", text);
 }
 
 function ansiLogo(text: string) {
-  return `\u001b[38;2;60;200;255m${text}\u001b[0m`;
+  return fg("accentPrimary", text);
 }
 
 function renderWelcomeLogo() {
@@ -295,4 +456,10 @@ function getCharDisplayWidth(char: string) {
   }
 
   return 1;
+}
+
+function padToDisplayWidth(text: string, width: number) {
+  const fillWidth = Math.max(0, width - getDisplayWidth(text));
+
+  return `${text}${" ".repeat(fillWidth)}`;
 }

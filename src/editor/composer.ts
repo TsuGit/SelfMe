@@ -1,6 +1,6 @@
 import { EventBus } from "../app/event-bus.js";
 import { createUserMessageSubmittedEvent } from "../runtime/events.js";
-import { createEmptyBuffer, deleteBackward, insertText, moveLeft, moveRight, type EditorBufferState } from "./buffer.js";
+import { createEmptyBuffer, deleteBackward, insertText, moveDown, moveLeft, moveRight, moveUp, type EditorBufferState } from "./buffer.js";
 
 export class EditorController {
   private state: EditorBufferState = createEmptyBuffer();
@@ -25,6 +25,14 @@ export class EditorController {
     this.state = moveRight(this.state);
   }
 
+  handleUp() {
+    this.state = moveUp(this.state);
+  }
+
+  handleDown() {
+    this.state = moveDown(this.state);
+  }
+
   handleNewline() {
     this.state = insertText(this.state, "\n");
   }
@@ -43,4 +51,3 @@ export class EditorController {
     this.state = createEmptyBuffer();
   }
 }
-
