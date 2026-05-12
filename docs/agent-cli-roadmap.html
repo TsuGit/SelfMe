@@ -7,13 +7,13 @@
     <style>
       :root {
         color-scheme: dark;
-        --bg: #091018;
-        --panel: #111925;
-        --panel-2: #0d141d;
+        --bg: #0a1628;
+        --panel: #122033;
+        --panel-2: #16263b;
         --text: #edf4fb;
-        --muted: #93a3b4;
-        --line: #223244;
-        --accent: #79d7ff;
+        --muted: #91a3b7;
+        --line: #22364f;
+        --accent: #3cc8ff;
         --accent-2: #7be0b6;
         --accent-3: #d8c18f;
         --shadow: 0 28px 80px rgba(0, 0, 0, 0.34);
@@ -28,9 +28,9 @@
         font-family: "Iowan Old Style", "Palatino Linotype", "Noto Serif SC", serif;
         color: var(--text);
         background:
-          radial-gradient(circle at top left, rgba(121, 215, 255, 0.12), transparent 24%),
-          radial-gradient(circle at top right, rgba(123, 224, 182, 0.1), transparent 26%),
-          linear-gradient(180deg, #081019 0%, var(--bg) 100%);
+          radial-gradient(circle at top left, rgba(60, 200, 255, 0.11), transparent 26%),
+          radial-gradient(circle at top right, rgba(99, 184, 255, 0.08), transparent 24%),
+          linear-gradient(180deg, #08121f 0%, var(--bg) 100%);
       }
 
       .page {
@@ -59,7 +59,7 @@
         letter-spacing: 0.12em;
         text-transform: uppercase;
         color: var(--accent);
-        background: rgba(121, 215, 255, 0.12);
+        background: rgba(60, 200, 255, 0.14);
       }
 
       h1,
@@ -116,7 +116,7 @@
 
       .tag.ts {
         color: var(--accent);
-        background: rgba(121, 215, 255, 0.09);
+        background: rgba(60, 200, 255, 0.14);
       }
 
       h2 {
@@ -193,7 +193,7 @@
         margin-top: 18px;
         padding: 16px 18px;
         border-left: 4px solid var(--accent);
-        background: rgba(121, 215, 255, 0.08);
+        background: rgba(60, 200, 255, 0.14);
       }
 
       code,
@@ -213,7 +213,7 @@
         padding: 18px;
         overflow: auto;
         border: 1px solid var(--line);
-        background: #0a1118;
+        background: #0b1420;
         color: var(--text);
         line-height: 1.6;
       }
@@ -334,6 +334,26 @@ stdout repaint</code></pre>
           这个架构下，所有核心模块都在同一个本地进程里。真正重要的是事件流、状态投影和模块边界，
           不是先把系统拆成多个壳。
         </p>
+      </section>
+
+      <section class="section">
+        <div class="tag ts">Foundation</div>
+        <h2>Terminal / Editor Foundation</h2>
+        <p>
+          这一层不是 UI 细节，也不是后期润色，而是整个 CLI 是否能成为产品的基础设施。
+          如果输入、光标、重绘、滚动、IME 处理做不好，后面 runtime、tools、planning 再强，整体体验也不会成立。
+        </p>
+        <ul>
+          <li>输入区必须使用真实终端光标，不接受伪光标方案长期存在。</li>
+          <li>消息区和输入区必须分离，输入区固定，消息区独立滚动。</li>
+          <li>必须减少全屏粗暴重绘，逐步收敛到稳定区域重绘。</li>
+          <li>Editor 必须独立承担多行输入、cursor、history、粘贴和后续选择能力。</li>
+          <li>中文输入法体验必须作为专门问题处理，不能假设终端会自动替我们解决。</li>
+        </ul>
+        <div class="highlight">
+          <strong>执行要求：</strong>
+          <span>Terminal / Editor Foundation 属于前置阶段，不是最后优化阶段。必须在 agent 复杂能力继续膨胀之前，把输入体验和渲染基础做稳。</span>
+        </div>
       </section>
 
       <section class="section">

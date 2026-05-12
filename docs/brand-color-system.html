@@ -1,0 +1,456 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SelfMe Brand Color System</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg-base: #0a1628;
+        --bg-subtle: #0d1b2f;
+        --bg-panel: #122033;
+        --bg-panel-2: #16263b;
+        --line-subtle: #22364f;
+        --line-strong: #2c4665;
+        --text-primary: #edf4fb;
+        --text-secondary: #c6d3e0;
+        --text-muted: #91a3b7;
+        --text-inverse: #07131f;
+        --accent-primary: #3cc8ff;
+        --accent-primary-soft: rgba(60, 200, 255, 0.14);
+        --accent-secondary: #63b8ff;
+        --accent-secondary-soft: rgba(99, 184, 255, 0.12);
+        --accent-tertiary: #7be0b6;
+        --accent-tertiary-soft: rgba(123, 224, 182, 0.12);
+        --accent-warm: #d8c18f;
+        --accent-warm-soft: rgba(216, 193, 143, 0.12);
+        --state-success: #58d68d;
+        --state-warning: #f3c66a;
+        --state-error: #ff7a90;
+        --shadow: 0 28px 80px rgba(0, 0, 0, 0.34);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: "Iowan Old Style", "Palatino Linotype", "Noto Serif SC", serif;
+        color: var(--text-primary);
+        background:
+          radial-gradient(circle at top left, rgba(60, 200, 255, 0.11), transparent 26%),
+          radial-gradient(circle at top right, rgba(99, 184, 255, 0.08), transparent 24%),
+          linear-gradient(180deg, #08121f 0%, var(--bg-base) 100%);
+      }
+
+      .page {
+        width: min(1080px, calc(100vw - 40px));
+        margin: 40px auto 80px;
+      }
+
+      .hero,
+      .section,
+      .card {
+        background: linear-gradient(180deg, var(--bg-panel) 0%, var(--bg-panel-2) 100%);
+        border: 1px solid var(--line-subtle);
+        box-shadow: var(--shadow);
+      }
+
+      .hero {
+        padding: 40px;
+        margin-bottom: 24px;
+      }
+
+      .section {
+        padding: 26px;
+        margin-top: 24px;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 16px;
+      }
+
+      .card {
+        padding: 18px;
+      }
+
+      .eyebrow,
+      .tag {
+        display: inline-block;
+        margin-bottom: 14px;
+        padding: 6px 10px;
+        font-size: 12px;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        border: 1px solid var(--line-subtle);
+      }
+
+      .eyebrow {
+        color: var(--accent-primary);
+        background: var(--accent-primary-soft);
+      }
+
+      .tag {
+        color: var(--accent-secondary);
+        background: var(--accent-secondary-soft);
+      }
+
+      h1,
+      h2,
+      h3,
+      p {
+        margin: 0;
+      }
+
+      h1 {
+        font-size: clamp(36px, 6vw, 58px);
+        line-height: 1.08;
+        margin-bottom: 14px;
+      }
+
+      h2 {
+        font-size: 28px;
+        margin-bottom: 12px;
+      }
+
+      h3 {
+        font-size: 20px;
+        margin-bottom: 10px;
+      }
+
+      p,
+      li {
+        color: var(--text-secondary);
+        font-size: 17px;
+        line-height: 1.75;
+      }
+
+      .lead {
+        max-width: 56rem;
+        color: var(--text-muted);
+        font-size: 20px;
+      }
+
+      ul {
+        margin: 0;
+        padding-left: 22px;
+      }
+
+      li + li {
+        margin-top: 8px;
+      }
+
+      .highlight {
+        margin-top: 18px;
+        padding: 16px 18px;
+        border-left: 4px solid var(--accent-primary);
+        background: var(--accent-primary-soft);
+      }
+
+      .swatch {
+        width: 100%;
+        aspect-ratio: 16 / 9;
+        border-radius: 12px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        margin-bottom: 12px;
+      }
+
+      .meta {
+        color: var(--text-muted);
+        font-size: 14px;
+        line-height: 1.6;
+      }
+
+      code,
+      pre {
+        font-family: "SFMono-Regular", "SF Mono", "JetBrains Mono", "Menlo", monospace;
+      }
+
+      code {
+        padding: 0.12em 0.38em;
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.06);
+        color: var(--text-primary);
+      }
+
+      pre {
+        margin: 14px 0 0;
+        padding: 18px;
+        overflow: auto;
+        border: 1px solid var(--line-subtle);
+        background: #0a1118;
+        color: var(--text-primary);
+        line-height: 1.6;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 14px;
+      }
+
+      th,
+      td {
+        text-align: left;
+        padding: 12px 14px;
+        border-bottom: 1px solid var(--line-subtle);
+        vertical-align: top;
+      }
+
+      th {
+        color: var(--text-primary);
+        font-weight: 600;
+      }
+
+      .footer {
+        margin-top: 28px;
+        color: var(--text-muted);
+        font-size: 14px;
+        text-align: center;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="page">
+      <section class="hero">
+        <div class="eyebrow">Brand Standard</div>
+        <h1>SelfMe Brand Color System</h1>
+        <p class="lead">
+          这份文档定义 SelfMe 的统一配色制度。官网、文档、CLI、桌面端都必须从这一套颜色系统取值，
+          不允许各自新增主色、临时换蓝、或者随页面自由漂移。
+        </p>
+        <div class="highlight">
+          <strong>核心原则：</strong>
+          <span>SelfMe 的品牌主线固定为 <code>深海军蓝</code> 背景体系和 <code>冷青蓝</code> 强调体系。不同载体只能调整使用强度，不能改掉品牌色相方向。</span>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="tag">Principles</div>
+        <h2>品牌原则</h2>
+        <ul>
+          <li>品牌气质关键词固定为：冷静、现代、可信、深海感、未来感。</li>
+          <li>主背景永远走深蓝黑体系，不走纯黑，也不走偏紫。</li>
+          <li>主强调永远走冷青蓝体系，不允许每个页面换一种蓝。</li>
+          <li>辅助色可以存在，但只能做少量语义区分或信息分层，不能抢主品牌色。</li>
+          <li>官网可以更亮，文档可以更稳，CLI 可以更克制，但都必须使用同一套 token。</li>
+        </ul>
+      </section>
+
+      <section class="section">
+        <div class="tag">Palette</div>
+        <h2>基础调色板</h2>
+        <div class="grid">
+          <article class="card">
+            <div class="swatch" style="background:#0a1628;"></div>
+            <h3>Brand Base 900</h3>
+            <p class="meta"><code>#0a1628</code><br />主背景基底。官网、文档、产品端都从这里展开。</p>
+          </article>
+          <article class="card">
+            <div class="swatch" style="background:#122033;"></div>
+            <h3>Brand Panel 800</h3>
+            <p class="meta"><code>#122033</code><br />卡片、面板、文档 section、桌面端浮层。</p>
+          </article>
+          <article class="card">
+            <div class="swatch" style="background:#3cc8ff;"></div>
+            <h3>Accent Primary</h3>
+            <p class="meta"><code>#3cc8ff</code><br />统一品牌主强调色。替代官网和文档目前分裂的主蓝。</p>
+          </article>
+          <article class="card">
+            <div class="swatch" style="background:#63b8ff;"></div>
+            <h3>Accent Secondary</h3>
+            <p class="meta"><code>#63b8ff</code><br />用于渐变、hover、次级强调。</p>
+          </article>
+          <article class="card">
+            <div class="swatch" style="background:#7be0b6;"></div>
+            <h3>Accent Tertiary</h3>
+            <p class="meta"><code>#7be0b6</code><br />辅助成功色或次级区块标签，不作为主品牌色。</p>
+          </article>
+          <article class="card">
+            <div class="swatch" style="background:#d8c18f;"></div>
+            <h3>Accent Warm</h3>
+            <p class="meta"><code>#d8c18f</code><br />仅用于少量强调或分类标签，不进入主视觉主线。</p>
+          </article>
+          <article class="card">
+            <div class="swatch" style="background:#edf4fb;"></div>
+            <h3>Text Primary</h3>
+            <p class="meta"><code>#edf4fb</code><br />主标题、重要正文、高对比关键信息。</p>
+          </article>
+          <article class="card">
+            <div class="swatch" style="background:#91a3b7;"></div>
+            <h3>Text Muted</h3>
+            <p class="meta"><code>#91a3b7</code><br />说明文字、次要信息、CLI 次级元信息。</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="tag">Tokens</div>
+        <h2>语义 Token</h2>
+        <pre><code>:root {
+  --color-bg-base: #0a1628;
+  --color-bg-subtle: #0d1b2f;
+  --color-bg-panel: #122033;
+  --color-bg-panel-2: #16263b;
+  --color-line-subtle: #22364f;
+  --color-line-strong: #2c4665;
+  --color-text-primary: #edf4fb;
+  --color-text-secondary: #c6d3e0;
+  --color-text-muted: #91a3b7;
+  --color-text-inverse: #07131f;
+  --color-accent-primary: #3cc8ff;
+  --color-accent-primary-soft: rgba(60, 200, 255, 0.14);
+  --color-accent-secondary: #63b8ff;
+  --color-accent-secondary-soft: rgba(99, 184, 255, 0.12);
+  --color-accent-tertiary: #7be0b6;
+  --color-accent-tertiary-soft: rgba(123, 224, 182, 0.12);
+  --color-accent-warm: #d8c18f;
+  --color-accent-warm-soft: rgba(216, 193, 143, 0.12);
+  --color-state-success: #58d68d;
+  --color-state-warning: #f3c66a;
+  --color-state-error: #ff7a90;
+}</code></pre>
+      </section>
+
+      <section class="section">
+        <div class="tag">Usage</div>
+        <h2>使用规则</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Token</th>
+              <th>用途</th>
+              <th>禁止事项</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>accent-primary</code></td>
+              <td>品牌标题高亮、主按钮、链接 hover、关键选中态</td>
+              <td>不能大面积铺整个页面背景</td>
+            </tr>
+            <tr>
+              <td><code>accent-secondary</code></td>
+              <td>渐变辅助、动态图形、弱一级高亮</td>
+              <td>不能替代主品牌色独立使用为主色</td>
+            </tr>
+            <tr>
+              <td><code>accent-tertiary</code></td>
+              <td>成功标签、辅助类别标签</td>
+              <td>不能进入官网或 CLI 的主视觉第一层</td>
+            </tr>
+            <tr>
+              <td><code>accent-warm</code></td>
+              <td>少量强调、分类差异化</td>
+              <td>不能与主品牌蓝平级争抢主视觉</td>
+            </tr>
+            <tr>
+              <td><code>text-muted</code></td>
+              <td>说明文字、次级元信息、CLI 次级行</td>
+              <td>不能用于高优先级正文或 CTA</td>
+            </tr>
+            <tr>
+              <td><code>line-subtle</code></td>
+              <td>卡片边框、代码块边框、分隔线</td>
+              <td>不能亮到像强调色</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="section">
+        <div class="tag">Surfaces</div>
+        <h2>载体映射</h2>
+        <div class="grid">
+          <article class="card">
+            <h3>官网</h3>
+            <p>允许使用更亮的 <code>accent-primary</code> 渐变和轻发光，但背景基底仍然必须来自 <code>bg-base</code> 系列。</p>
+          </article>
+          <article class="card">
+            <h3>文档</h3>
+            <p>优先可读性和层次，强调色只做标题、tag、highlight，不做大面积情绪化发光。</p>
+          </article>
+          <article class="card">
+            <h3>CLI</h3>
+            <p>只允许少量 accent。主体以 <code>text-primary</code> 和 <code>text-muted</code> 为主，强调色只用于 logo、关键状态或少量提示。</p>
+          </article>
+          <article class="card">
+            <h3>桌面端</h3>
+            <p>介于官网和文档之间。比 CLI 丰富，但不能回到官网首页那种强营销张力。</p>
+          </article>
+        </div>
+        <h3>CLI ANSI 映射</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>终端元素</th>
+              <th>品牌 token</th>
+              <th>当前映射</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>欢迎 logo</td>
+              <td><code>accent-primary</code></td>
+              <td><code>#3cc8ff</code></td>
+            </tr>
+            <tr>
+              <td>SelfMe 主标题</td>
+              <td><code>text-primary</code></td>
+              <td><code>#edf4fb</code></td>
+            </tr>
+            <tr>
+              <td>版本 / 模型 / 目录</td>
+              <td><code>text-muted</code></td>
+              <td><code>#91a3b7</code></td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="section">
+        <div class="tag">Status</div>
+        <h2>当前统一状态</h2>
+        <h3>官网</h3>
+        <ul>
+          <li>官网已经统一到 <code>bg-base</code>、<code>accent-primary</code>、<code>accent-secondary</code> 这套标准值上。</li>
+          <li>官网仍然保留比文档更亮、更有张力的使用方式，但底层颜色系统已经与文档一致。</li>
+        </ul>
+
+        <h3>文档</h3>
+        <ul>
+          <li>品牌制度文档和 roadmap 文档已经统一到同一套背景、文字和强调色体系。</li>
+          <li>文档中的绿色和金色继续只作为辅助色存在，不承担主品牌识别。</li>
+        </ul>
+
+        <h3>CLI</h3>
+        <ul>
+          <li>CLI 已经接入同一套品牌逻辑：logo 使用 <code>accent-primary</code>，次级信息使用 <code>text-muted</code>。</li>
+          <li>CLI 的用色强度严格低于官网，符合“同体系、不同强度”的载体规则。</li>
+        </ul>
+
+        <div class="highlight">
+          <strong>当前结论：</strong>
+          <span>官网、文档、CLI 现在已经不再是各自漂移的配色，而是共享一套品牌 token，并按载体强度差异化使用。</span>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="tag">Governance</div>
+        <h2>后续执行规则</h2>
+        <ol>
+          <li>以后新增页面、组件、端形态时，只能从这套系统取值，不允许重新发明品牌蓝。</li>
+          <li>如果需要新增颜色，必须先更新这份制度文档，再更新具体载体实现。</li>
+          <li>桌面端未来应直接继承本制度，不允许单独派生一套“桌面端专属品牌色”。</li>
+          <li>CLI 如果继续扩展状态色、提示色、审批色，也必须继续映射到本制度的语义 token。</li>
+        </ol>
+      </section>
+
+      <p class="footer">SelfMe Brand System / Color Standard v1</p>
+    </main>
+  </body>
+</html>
