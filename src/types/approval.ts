@@ -5,6 +5,7 @@ export interface ApprovalRequest {
   sessionId: string;
   taskId?: string;
   toolName: string;
+  input?: unknown;
   reason: string;
   risk: ApprovalRisk;
   createdAt: string;

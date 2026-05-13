@@ -34,6 +34,7 @@ export class OpenAIProvider implements ProviderClient {
         model: this.input.model,
         stream: true,
         messages: [
+          ...(input.contextMessages ?? []),
           {
             role: "user",
             content: input.content

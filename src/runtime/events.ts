@@ -5,6 +5,8 @@ import type {
   AssistantDeltaReceivedEvent,
   AssistantStreamStartedEvent,
   MessageViewportChangedEvent,
+  TerminalCommandInvokedEvent,
+  TerminalUiStateChangedEvent,
   SystemMessageAppendedEvent,
   ApprovalRequestedEvent,
   ApprovalResolvedEvent,
@@ -81,6 +83,35 @@ export function createMessageViewportChangedEvent(input: {
     }),
     payload: {
       offset: input.offset
+    }
+  };
+}
+
+export function createTerminalUiStateChangedEvent(input: {
+  sessionId: string;
+}): TerminalUiStateChangedEvent {
+  return {
+    ...createBase({
+      sessionId: input.sessionId,
+      source: "user",
+      type: "terminal.ui.state.changed"
+    }),
+    payload: {}
+  };
+}
+
+export function createTerminalCommandInvokedEvent(input: {
+  sessionId: string;
+  content: string;
+}): TerminalCommandInvokedEvent {
+  return {
+    ...createBase({
+      sessionId: input.sessionId,
+      source: "user",
+      type: "terminal.command.invoked"
+    }),
+    payload: {
+      content: input.content
     }
   };
 }
@@ -220,6 +251,7 @@ export function createApprovalRequestedEvent(input: {
   sessionId: string;
   taskId?: string;
   toolName: string;
+  input?: unknown;
   reason: string;
   risk: "low" | "medium" | "high";
 }): ApprovalRequestedEvent {
@@ -235,6 +267,7 @@ export function createApprovalRequestedEvent(input: {
       sessionId: input.sessionId,
       taskId: input.taskId,
       toolName: input.toolName,
+      input: input.input,
       reason: input.reason,
       risk: input.risk,
       createdAt: new Date().toISOString()

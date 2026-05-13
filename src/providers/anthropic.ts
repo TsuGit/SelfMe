@@ -37,6 +37,18 @@ export class AnthropicProvider implements ProviderClient {
 
   async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
     const isMiniMax = isMiniMaxAnthropicCompatible(this.input.baseUrl);
+    const contextMessages = input.contextMessages ?? [];
+    const systemPrompt = contextMessages
+      .filter((message) => message.role === "system")
+      .map((message) => message.content.trim())
+      .filter(Boolean)
+      .join("\n\n");
+    const historyMessages = contextMessages
+      .filter((message) => message.role === "user" || message.role === "assistant")
+      .map((message) => ({
+        role: message.role,
+        content: message.content
+      }));
     const response = await fetch(resolveMessagesEndpoint(this.input.baseUrl), {
       method: "POST",
       headers: {
@@ -54,7 +66,9 @@ export class AnthropicProvider implements ProviderClient {
         model: this.input.model,
         max_tokens: 4096,
         stream: true,
+        ...(systemPrompt ? { system: systemPrompt } : {}),
         messages: [
+          ...historyMessages,
           {
             role: "user",
             content: input.content

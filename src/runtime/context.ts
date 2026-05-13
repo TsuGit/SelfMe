@@ -13,3 +13,16 @@ export function createDefaultSessionRecord(cwd: string, version: string): Sessio
     cwd
   };
 }
+
+export function createResumedSessionRecord(input: {
+  previous: SessionRecord;
+  cwd: string;
+  version: string;
+}) {
+  return {
+    ...input.previous,
+    cwd: input.cwd,
+    version: input.version,
+    updatedAt: new Date().toISOString()
+  };
+}

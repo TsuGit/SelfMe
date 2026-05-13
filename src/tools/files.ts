@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 import { readFile, stat } from "node:fs/promises";
-import { basename, resolve } from "node:path";
+import { resolve } from "node:path";
 
 import type { ToolImplementation, ToolResult } from "../types/tool.js";
 
@@ -37,7 +37,12 @@ export const fileTool: ToolImplementation<FileToolInput> = {
 
     return {
       ok: true,
-      summary: `Read ${basename(input.path)}:${safeStartLine}-${safeEndLine}`,
+      summary: buildFileSummary({
+        path: input.path,
+        startLine: safeStartLine,
+        endLine: safeEndLine,
+        truncated: clipped.truncated
+      }),
       structuredOutput: {
         path: input.path,
         sizeBytes: fileStat.size,
@@ -79,4 +84,15 @@ function clipText(text: string, maxBytes: number) {
     text: `${output}\n...truncated...`,
     truncated: true
   };
+}
+
+function buildFileSummary(input: {
+  path: string;
+  startLine: number;
+  endLine: number;
+  truncated: boolean;
+}) {
+  const range = `${input.startLine}-${input.endLine}`;
+  const suffix = input.truncated ? " · truncated" : "";
+  return `${input.path}:${range}${suffix}`;
 }

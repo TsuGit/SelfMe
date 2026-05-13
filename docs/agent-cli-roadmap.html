@@ -632,9 +632,10 @@ type ToolResult = {
 
         <h3>Step 5</h3>
         <ul>
-          <li>补 file tool。</li>
-          <li>补 approval flow 的最小闭环。</li>
-          <li>补 session / logs / checkpoints。</li>
+          <li>file tool 已落地。</li>
+          <li>approval flow 最小闭环已落地。</li>
+          <li>session / transcripts / logs / checkpoints 已落地。</li>
+          <li>最小 session resume 已落地。</li>
         </ul>
       </section>
 
@@ -689,16 +690,20 @@ type ToolResult = {
 
       <section class="section">
         <div class="tag ts">Checklist</div>
-        <h2>当前行动清单</h2>
+        <h2>当前状态与下一步</h2>
         <ul>
-          <li>搭一个空项目骨架。</li>
-          <li>先把 terminal / editor / runtime / tools / storage 目录拆出来。</li>
-          <li>先定义 runtime events、tool contract、approval policy、context strategy 四个核心契约。</li>
-          <li>先实现最小输入循环，不追求花哨 UI。</li>
-          <li>接一个 provider，验证流式输出链路。</li>
-          <li>接一个 shell tool，验证 tool execution 生命周期。</li>
-          <li>把 session transcript 和 logs 存下来。</li>
-          <li>再开始补 task / approval / history / context compaction。</li>
+          <li>稳定输入区、多行输入、流式回复、shell tool、file tool 已完成。</li>
+          <li>runtime events、transcripts、tool logs、session metadata、checkpoint snapshot 已完成。</li>
+          <li>最小 approval flow 和最小 session resume 已完成。</li>
+        </ul>
+
+        <h3>Next</h3>
+        <ul>
+          <li>task list / plan 最小闭环已完成。</li>
+          <li>把 history / search / jump 做成可用功能，不只停留在 transcript 文件层。</li>
+          <li>补 context compaction，避免长会话无限膨胀。</li>
+          <li>补 retry / resume 的真正执行恢复，而不只是历史可见恢复。</li>
+          <li>补 tool output folding 和更强 diagnostics。</li>
         </ul>
       </section>
 

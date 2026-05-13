@@ -11,6 +11,7 @@ export interface ToolContext {
   cwd: string;
   sessionId: string;
   taskId?: string;
+  onStdoutChunk?: (chunk: string) => Promise<void> | void;
 }
 
 export interface ToolResult {

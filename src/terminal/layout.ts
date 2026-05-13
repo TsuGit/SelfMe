@@ -9,11 +9,20 @@ export interface TerminalMessageBlock {
   kind?: "welcome" | "user" | "assistant" | "assistant-working" | "system" | "tool" | "approval" | "error";
   title: string;
   body: string;
+  taskId?: string;
+  approvalId?: string;
+  actions?: Array<{
+    id: string;
+    label: string;
+    command: string;
+    style?: "primary" | "secondary" | "danger";
+  }>;
 }
 
 export interface TerminalLayoutInput {
   messages: TerminalMessageBlock[];
   promptLines: string[];
+  footerLines?: string[];
   promptCursorRow: number;
   viewportHeight: number;
   viewportWidth: number;
@@ -35,16 +44,15 @@ export function renderTerminalLayout(input: TerminalLayoutInput): RenderedTermin
   const hasViewportHint = input.messageViewportOffset > 0;
   const composerTopPad = 1;
   const composerBottomPad = 1;
+  const footerRows = input.footerLines?.length ?? 0;
   const messageLines = input.messages.length > 0
-    ? input.messages
-        .map((message) => renderMessageBlock(message, input.viewportWidth))
-        .join("\n\n")
-        .split("\n")
+    ? renderMessageSequence(input.messages, input.viewportWidth).split("\n")
     : [];
 
   const reservedRows =
     composerTopPad +
     input.promptLines.length +
+    footerRows +
     composerBottomPad +
     (hasMessages ? 1 : 0) +
     (hasViewportHint ? 1 : 0);
@@ -77,8 +85,14 @@ export function renderTerminalLayout(input: TerminalLayoutInput): RenderedTermin
   lines.push(...input.promptLines);
   lines.push(renderComposerPadLine(input.viewportWidth));
 
+  if (input.footerLines?.length) {
+    for (const footerLine of input.footerLines) {
+      lines.push(formatComposerMetaLine(footerLine, input.viewportWidth));
+    }
+  }
+
   const content = lines.join("\n");
-  const inputRow = Math.max(0, lines.length - input.promptLines.length - composerBottomPad);
+  const inputRow = Math.max(0, lines.length - input.promptLines.length - composerBottomPad - footerRows);
 
   return {
     content,
@@ -91,13 +105,34 @@ export function renderTerminalLayout(input: TerminalLayoutInput): RenderedTermin
   };
 }
 
-function renderMessageBlock(message: TerminalMessageBlock, viewportWidth: number) {
+function renderMessageSequence(
+  messages: TerminalMessageBlock[],
+  viewportWidth: number
+) {
+  const chunks: string[] = [];
+
+  for (const [index, message] of messages.entries()) {
+    if (index > 0) {
+      const previous = messages[index - 1];
+      chunks.push(shouldTightGroup(previous, message) ? "\n" : "\n\n");
+    }
+
+    chunks.push(renderMessageBlock(message, viewportWidth));
+  }
+
+  return chunks.join("");
+}
+
+function renderMessageBlock(
+  message: TerminalMessageBlock,
+  viewportWidth: number
+) {
   const contentWidth = Math.max(12, viewportWidth - 1);
 
   if (message.kind === "user") {
     const userContentWidth = Math.max(8, viewportWidth - 2);
     const contentLines = wrapBlockLines(message.body, userContentWidth)
-      .map((line, index) => formatComposerLine(line, index === 0 ? "> " : "  ", viewportWidth))
+      .map((line, index) => formatUserComposerLine(line, index === 0 ? "› " : "  ", viewportWidth))
       .join("\n");
 
     return [
@@ -108,24 +143,19 @@ function renderMessageBlock(message: TerminalMessageBlock, viewportWidth: number
   }
 
   if (message.kind === "tool") {
-    const wrappedBody = wrapBlockLines(message.body, Math.max(8, contentWidth - 2))
-      .map((line) => `${ansiMuted("│ ")}${ansiTool(line)}`);
-
-    return [formatMetaTitle("tool"), ...wrappedBody].join("\n");
+    return renderStructuredMetaBlock(message.body, Math.max(8, contentWidth - 2), "tool");
   }
 
   if (message.kind === "approval") {
-    const wrappedBody = wrapBlockLines(message.body, Math.max(8, contentWidth - 2))
-      .map((line) => `${ansiMuted("│ ")}${ansiApproval(line)}`);
-
-    return [formatMetaTitle("approval"), ...wrappedBody].join("\n");
+    return renderStructuredMetaBlock(
+      message.body,
+      Math.max(8, contentWidth - 2),
+      "approval"
+    );
   }
 
   if (message.kind === "error") {
-    const wrappedBody = wrapBlockLines(message.body, Math.max(8, contentWidth - 2))
-      .map((line) => `${ansiMuted("│ ")}${ansiError(line)}`);
-
-    return [formatMetaTitle("error"), ...wrappedBody].join("\n");
+    return renderStructuredMetaBlock(message.body, Math.max(8, contentWidth - 2), "error");
   }
 
   if (message.kind === "system") {
@@ -281,8 +311,19 @@ function formatComposerLine(line: string, prefix: string, viewportWidth: number)
   return `${ansiComposerPrefix(prefix)}${ansiInputFill(padded)}`;
 }
 
+function formatUserComposerLine(line: string, prefix: string, viewportWidth: number) {
+  const contentWidth = Math.max(1, viewportWidth - getDisplayWidth(prefix));
+  const padded = padToDisplayWidth(line || " ", contentWidth);
+
+  return `${ansiUserComposerPrefix(prefix)}${ansiInputFill(padded)}`;
+}
+
 function renderComposerPadLine(viewportWidth: number) {
   return ansiInputFill(" ".repeat(Math.max(1, viewportWidth)));
+}
+
+function formatComposerMetaLine(line: string, viewportWidth: number) {
+  return ansiInputMeta(padToDisplayWidth(line, Math.max(1, viewportWidth)));
 }
 
 function formatAssistantLine(line: string, prefix: string) {
@@ -301,6 +342,61 @@ function formatMetaTitle(title: string) {
   return `${ansiMuted("[" + title + "]")}`;
 }
 
+function renderStructuredMetaBlock(
+  body: string,
+  width: number,
+  tone: "tool" | "approval" | "error"
+) {
+  const lines = body.split("\n");
+  const [headline = "", ...rest] = lines;
+  const headlineRenderer = tone === "tool"
+    ? ansiToolHeadline
+    : tone === "approval"
+      ? ansiApprovalHeadline
+      : ansiErrorHeadline;
+  const bodyRenderer = tone === "tool"
+    ? ansiTool
+    : tone === "approval"
+      ? ansiApproval
+      : ansiError;
+  const wrappedHeadline = wrapBlockLines(headline, width)
+    .map((line, index) => `${index === 0 ? ansiMuted("• ") : ansiMuted("  ")}${headlineRenderer(line)}`);
+  const filteredBody = tone === "approval"
+    ? rest.filter((line) => !line.startsWith("approve · /approve ") && !line.startsWith("deny · /deny "))
+    : rest;
+  const wrappedBody = filteredBody.flatMap((line) => renderStructuredMetaBodyLine(line, width, bodyRenderer));
+
+  return [...wrappedHeadline, ...wrappedBody].join("\n");
+}
+
+function renderStructuredMetaBodyLine(
+  line: string,
+  width: number,
+  renderer: (text: string) => string
+) {
+  const isCodeLike = /^[ \t]*\d+[ \t]*\|/.test(line) || /^[ \t]*\.\.\.truncated\.\.\./.test(line);
+  const prefix = isCodeLike ? "    " : "  ";
+  const wrapped = wrapBlockLines(line, Math.max(1, width - prefix.length));
+
+  return wrapped.map((segment) => `${ansiMuted(prefix)}${renderer(segment)}`);
+}
+
+function shouldTightGroup(previous: TerminalMessageBlock | undefined, next: TerminalMessageBlock) {
+  if (!previous?.taskId || !next.taskId || previous.taskId !== next.taskId) {
+    return false;
+  }
+
+  return isTaskFlowKind(previous.kind) && isTaskFlowKind(next.kind);
+}
+
+function isTaskFlowKind(kind: TerminalMessageBlock["kind"]) {
+  return kind === "assistant" ||
+    kind === "assistant-working" ||
+    kind === "tool" ||
+    kind === "approval" ||
+    kind === "error";
+}
+
 function ansiPrompt(text: string) {
   return fg("textPrimary", text);
 }
@@ -309,8 +405,16 @@ function ansiComposerPrefix(text: string) {
   return paint(text, { bg: "bgSubtle", fg: "textPrimary" });
 }
 
+function ansiUserComposerPrefix(text: string) {
+  return paint(text, { bg: "bgSubtle", fg: "textSecondary" });
+}
+
 function ansiInputFill(text: string) {
   return paint(text, { bg: "bgSubtle", fg: "textPrimary" });
+}
+
+function ansiInputMeta(text: string) {
+  return fg("textMuted", text);
 }
 
 function ansiMuted(text: string) {
@@ -325,15 +429,31 @@ function ansiViewportHint(text: string) {
   return fg("textMuted", text);
 }
 
+function ansiActionLine(text: string) {
+  return fg("textSecondary", text);
+}
+
 function ansiTool(text: string) {
   return fg("textSecondary", text);
+}
+
+function ansiToolHeadline(text: string) {
+  return fg("textPrimary", text);
 }
 
 function ansiApproval(text: string) {
   return fg("accentWarm", text);
 }
 
+function ansiApprovalHeadline(text: string) {
+  return fg("accentWarm", text);
+}
+
 function ansiError(text: string) {
+  return fg("stateError", text);
+}
+
+function ansiErrorHeadline(text: string) {
   return fg("stateError", text);
 }
 

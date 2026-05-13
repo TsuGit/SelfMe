@@ -9,6 +9,13 @@ export class EditorController {
     return this.state;
   }
 
+  setValue(value: string) {
+    this.state = {
+      value,
+      cursor: value.length
+    };
+  }
+
   handlePrintable(input: string) {
     this.state = insertText(this.state, input);
   }

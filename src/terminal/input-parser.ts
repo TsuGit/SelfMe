@@ -2,6 +2,9 @@ export type TerminalInputEvent =
   | { type: "quit" }
   | { type: "submit" }
   | { type: "newline" }
+  | { type: "action-next" }
+  | { type: "action-prev" }
+  | { type: "action-cancel" }
   | { type: "backspace" }
   | { type: "move-up" }
   | { type: "move-down" }
@@ -17,6 +20,8 @@ const fixedSequences: Array<{
   { sequence: "\u0003", event: { type: "quit" } },
   { sequence: "\u001b[99;5u", event: { type: "quit" } },
   { sequence: "\u001b[67;5u", event: { type: "quit" } },
+  { sequence: "\u001b[Z", event: { type: "action-prev" } },
+  { sequence: "\t", event: { type: "action-next" } },
   { sequence: "\u001b[13;2u", event: { type: "newline" } },
   { sequence: "\u001b[27;13;2~", event: { type: "newline" } },
   { sequence: "\u001b[13;2~", event: { type: "newline" } },
@@ -37,7 +42,8 @@ const fixedSequences: Array<{
   { sequence: "\u007f", event: { type: "backspace" } },
   { sequence: "\b", event: { type: "backspace" } },
   { sequence: "\r", event: { type: "submit" } },
-  { sequence: "\n", event: { type: "newline" } }
+  { sequence: "\n", event: { type: "newline" } },
+  { sequence: "\u001b", event: { type: "action-cancel" } }
 ];
 
 export function parseTerminalInput(chunk: Buffer | string) {

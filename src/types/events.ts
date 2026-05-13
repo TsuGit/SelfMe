@@ -31,6 +31,16 @@ export type MessageViewportChangedEvent = RuntimeEventBase<
   { offset: number }
 >;
 
+export type TerminalUiStateChangedEvent = RuntimeEventBase<
+  "terminal.ui.state.changed",
+  Record<string, never>
+>;
+
+export type TerminalCommandInvokedEvent = RuntimeEventBase<
+  "terminal.command.invoked",
+  { content: string }
+>;
+
 export type AssistantStreamStartedEvent = RuntimeEventBase<
   "assistant.stream.started",
   Record<string, never>
@@ -91,6 +101,8 @@ export type RuntimeEvent =
   | EditorStateChangedEvent
   | SystemMessageAppendedEvent
   | MessageViewportChangedEvent
+  | TerminalUiStateChangedEvent
+  | TerminalCommandInvokedEvent
   | AssistantStreamStartedEvent
   | AssistantDeltaReceivedEvent
   | AssistantCompletedEvent

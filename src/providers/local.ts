@@ -4,7 +4,12 @@ export class LocalProvider implements ProviderClient {
   readonly name = "local-scaffold";
 
   async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
-    const text = `Scaffold online.\n\nReceived:\n${input.content.trim()}\n\nProvider integration is the next step.`;
+    const recentUserContext = input.contextMessages
+      ?.filter((message) => message.role === "user")
+      .at(-1)
+      ?.content
+      ?.trim();
+    const text = `Scaffold online.\n\nReceived:\n${input.content.trim()}\n\nRecent context:\n${recentUserContext ?? "none"}\n\nProvider integration is the next step.`;
     const words = text.split(" ");
 
     for (const word of words) {
