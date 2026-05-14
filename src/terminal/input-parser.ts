@@ -43,7 +43,6 @@ const fixedSequences: Array<{
   { sequence: "\b", event: { type: "backspace" } },
   { sequence: "\r", event: { type: "submit" } },
   { sequence: "\n", event: { type: "newline" } },
-  { sequence: "\u001b", event: { type: "action-cancel" } }
 ];
 
 export function parseTerminalInput(chunk: Buffer | string) {
@@ -64,6 +63,11 @@ export function parseTerminalInput(chunk: Buffer | string) {
     if (controlSequence) {
       remaining = remaining.slice(controlSequence.length);
       continue;
+    }
+
+    if (remaining === "\u001b") {
+      events.push({ type: "action-cancel" });
+      break;
     }
 
     if (remaining.startsWith("\u001b")) {

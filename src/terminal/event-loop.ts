@@ -62,6 +62,12 @@ export class TerminalEventLoop {
           }
 
           if (isSlashCommand(currentValue)) {
+            const panel = this.input.panel.getState(currentValue);
+
+            if (panel.mode === "command" && panel.options.length > 0) {
+              continue;
+            }
+
             this.input.bus.emit(createTerminalCommandInvokedEvent({
               sessionId: this.input.sessionId ?? "local-session",
               content: currentValue.trim()
@@ -91,10 +97,14 @@ export class TerminalEventLoop {
         }
 
         if (event.type === "action-cancel") {
-          if (this.input.panel.clear(this.input.editor.getState().value)) {
+          const currentValue = this.input.editor.getState().value;
+
+          if (this.input.panel.clear(currentValue)) {
             this.emitUiState();
             continue;
           }
+
+          continue;
         }
 
         if (event.type === "scroll") {
@@ -112,6 +122,15 @@ export class TerminalEventLoop {
         }
 
         if (event.type === "move-left") {
+          const panel = this.input.panel.getState(this.input.editor.getState().value);
+
+          if (panel.mode === "help") {
+            if (this.input.panel.focusHelpPreviousTab()) {
+              this.emitUiState();
+            }
+            continue;
+          }
+
           if (this.input.panel.hasOpenPanel(this.input.editor.getState().value)) {
             continue;
           }
@@ -122,6 +141,15 @@ export class TerminalEventLoop {
         }
 
         if (event.type === "move-right") {
+          const panel = this.input.panel.getState(this.input.editor.getState().value);
+
+          if (panel.mode === "help") {
+            if (this.input.panel.focusHelpNextTab()) {
+              this.emitUiState();
+            }
+            continue;
+          }
+
           if (this.input.panel.hasOpenPanel(this.input.editor.getState().value)) {
             continue;
           }

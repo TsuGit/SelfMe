@@ -234,6 +234,11 @@ export class TerminalRenderer {
         title: "Approval",
         taskId: event.taskId,
         approvalId: event.payload.approvalId,
+        approvalContext: {
+          toolName: event.payload.toolName,
+          reason: event.payload.reason,
+          risk: event.payload.risk
+        },
         actions: [
           {
             id: "approve",
@@ -248,12 +253,7 @@ export class TerminalRenderer {
             style: "danger"
           }
         ],
-        body: createApprovalRequestedMessage({
-          toolName: event.payload.toolName,
-          reason: event.payload.reason,
-          risk: event.payload.risk,
-          approvalId: event.payload.approvalId
-        })
+        body: ""
       };
       this.state.messages.push(nextMessage);
       this.state.messageViewportOffset = 0;
@@ -267,6 +267,7 @@ export class TerminalRenderer {
         title: "Approval",
         taskId: event.taskId,
         approvalId: event.payload.approvalId,
+        approvalContext: undefined,
         actions: [],
         body: createApprovalResolvedMessage(event.payload.approvalId, event.payload.approved)
       });
@@ -399,6 +400,21 @@ export class TerminalRenderer {
 
     lines.push(truncateAnsiLine([title, subtitle].filter(Boolean).join(separator), viewportWidth));
 
+    if (panel.description) {
+      lines.push(truncateAnsiLine(ansiPanelDescription(panel.description), viewportWidth));
+    }
+
+    if (panel.mode === "help" && panel.tabs?.length) {
+      lines.push(truncateAnsiLine(
+        panel.tabs
+          .map((tab, index) => index === panel.activeTabIndex
+            ? ansiPanelActiveTab(tab.label)
+            : ansiPanelTab(tab.label))
+          .join("  "),
+        viewportWidth
+      ));
+    }
+
     if (panel.mode === "command" && panel.query !== undefined) {
       lines.push(truncateAnsiLine(`${ansiPanelLabel("Filter")} ${ansiPanelQuery(`/${panel.query}`)}`, viewportWidth));
     }
@@ -406,12 +422,18 @@ export class TerminalRenderer {
     const visibleOptions = panel.options.slice(0, 5);
 
     for (const [index, option] of visibleOptions.entries()) {
+      if (panel.mode === "help") {
+        lines.push(truncateAnsiLine(this.renderPanelHelpLine(option.label), viewportWidth));
+        continue;
+      }
+
       const isSelected = index === panel.selectedIndex;
       lines.push(truncateAnsiLine(this.renderPanelOption(option.label, option.detail, option.style, isSelected), viewportWidth));
     }
 
-    lines.push(truncateAnsiLine(
-      `${ansiActionHint("↑↓")} ${ansiPanelHelp("select")}  ${ansiActionHint("Enter")} ${ansiPanelHelp("confirm")}  ${ansiActionHint("Esc")} ${ansiPanelHelp("close")}`,
+    lines.push(truncateAnsiLine(panel.mode === "help"
+      ? `${ansiActionHint("←→")} ${ansiPanelHelp("tabs")}  ${ansiActionHint("Esc")} ${ansiPanelHelp("close")}`
+      : `${ansiActionHint("↑↓")} ${ansiPanelHelp("select")}  ${ansiActionHint("Enter")} ${ansiPanelHelp("confirm")}  ${ansiActionHint("Esc")} ${ansiPanelHelp("close")}`,
       viewportWidth
     ));
 
@@ -431,6 +453,10 @@ export class TerminalRenderer {
     const detailText = detail ? `  ${ansiPanelDetail(detail)}` : "";
 
     return `${mark} ${content}${detailText}`;
+  }
+
+  private renderPanelHelpLine(text: string) {
+    return `  ${ansiPanelHelpLine(text)}`;
   }
 
   private startWorkingAnimation() {
@@ -615,8 +641,24 @@ function ansiPanelDetail(text: string) {
   return fg("textMuted", text);
 }
 
+function ansiPanelDescription(text: string) {
+  return fg("textSecondary", text);
+}
+
+function ansiPanelTab(text: string) {
+  return fg("textMuted", text);
+}
+
+function ansiPanelActiveTab(text: string) {
+  return paint(` ${text} `, { fg: "bgBase", bg: "textSecondary", bold: true });
+}
+
 function ansiPanelHelp(text: string) {
   return fg("textMuted", text);
+}
+
+function ansiPanelHelpLine(text: string) {
+  return fg("textSecondary", text);
 }
 
 function ansiActionMenuItem(text: string, style?: "primary" | "secondary" | "danger") {
@@ -759,8 +801,8 @@ function createApprovalRequestedMessage(input: {
   ].join("\n");
 }
 
-function createApprovalResolvedMessage(approvalId: string, approved: boolean) {
-  return `approval · ${approved ? "approved" : "denied"} · ${approvalId}`;
+function createApprovalResolvedMessage(_approvalId: string, approved: boolean) {
+  return `approval · ${approved ? "approved" : "denied"}`;
 }
 
 function createTaskErrorMessage(previousBody: string | undefined, message: string) {
@@ -947,6 +989,11 @@ function projectRestoredMessages(events: RuntimeEvent[]): TerminalMessageBlock[]
         title: "Approval",
         taskId: event.taskId,
         approvalId: event.payload.approvalId,
+        approvalContext: {
+          toolName: event.payload.toolName,
+          reason: event.payload.reason,
+          risk: event.payload.risk
+        },
         actions: [
           {
             id: "approve",
@@ -961,12 +1008,7 @@ function projectRestoredMessages(events: RuntimeEvent[]): TerminalMessageBlock[]
             style: "danger"
           }
         ],
-        body: createApprovalRequestedMessage({
-          toolName: event.payload.toolName,
-          reason: event.payload.reason,
-          risk: event.payload.risk,
-          approvalId: event.payload.approvalId
-        })
+        body: ""
       });
       continue;
     }
@@ -977,6 +1019,7 @@ function projectRestoredMessages(events: RuntimeEvent[]): TerminalMessageBlock[]
         title: "Approval",
         taskId: event.taskId,
         approvalId: event.payload.approvalId,
+        approvalContext: undefined,
         actions: [],
         body: createApprovalResolvedMessage(event.payload.approvalId, event.payload.approved)
       });

@@ -1,5 +1,10 @@
 import type { EventBus } from "../app/event-bus.js";
-import { listCommandPaletteItems } from "../runtime/commands.js";
+import {
+  listCommandPaletteItems,
+  listHelpTabs,
+  type CommandPaletteItem,
+  type HelpTab
+} from "../runtime/commands.js";
 import { createTerminalCommandInvokedEvent } from "../runtime/events.js";
 import type { TerminalMessageBlock } from "./layout.js";
 
@@ -12,18 +17,23 @@ export interface TerminalPanelOption {
 }
 
 export interface TerminalPanelState {
-  mode: "idle" | "approval" | "command";
+  mode: "idle" | "approval" | "command" | "help";
   title?: string;
   subtitle?: string;
+  description?: string;
   query?: string;
   options: TerminalPanelOption[];
   selectedIndex: number;
+  tabs?: HelpTab[];
+  activeTabIndex?: number;
 }
 
 interface ApprovalItem {
   key: string;
   label: string;
-  detail?: string;
+  toolName?: string;
+  reason?: string;
+  risk?: string;
   command: string;
   style?: "primary" | "secondary" | "danger";
 }
@@ -34,6 +44,8 @@ export class TerminalPanelController {
   private selectedApprovalKey?: string;
   private selectedCommandKey?: string;
   private suppressedCommandValue?: string;
+  private helpOpen = false;
+  private helpTabIndex = 0;
 
   sync(messages: TerminalMessageBlock[], editorValue: string) {
     const previousSignature = this.approvals.map((item) => item.key).join("|");
@@ -45,7 +57,9 @@ export class TerminalPanelController {
       return message.actions.map((action) => ({
         key: getActionKey(message, action.id),
         label: action.label,
-        detail: deriveActionContext(message),
+        toolName: message.approvalContext?.toolName,
+        reason: message.approvalContext?.reason,
+        risk: message.approvalContext?.risk,
         command: action.command,
         style: action.style
       }));
@@ -85,6 +99,26 @@ export class TerminalPanelController {
   }
 
   getState(editorValue: string): TerminalPanelState {
+    if (this.helpOpen) {
+      const tabs = listHelpTabs();
+      const activeTabIndex = Math.max(0, Math.min(this.helpTabIndex, tabs.length - 1));
+      const activeTab = tabs[activeTabIndex];
+
+      return {
+        mode: "help",
+        title: "Help",
+        subtitle: activeTab?.label,
+        description: "Browse command groups",
+        tabs,
+        activeTabIndex,
+        options: (activeTab?.lines ?? []).map((line, index) => ({
+          key: `${activeTab?.key ?? "help"}-${index}`,
+          label: line
+        })),
+        selectedIndex: 0
+      };
+    }
+
     const commandPanel = buildCommandPanel(editorValue);
 
     if (commandPanel && this.suppressedCommandValue !== editorValue) {
@@ -95,14 +129,17 @@ export class TerminalPanelController {
     }
 
     if (this.approvals.length > 0 && !this.approvalSuppressed) {
+      const current = this.approvals[getSelectedIndex(this.approvals, this.selectedApprovalKey)];
+
       return {
         mode: "approval",
         title: "Approval Required",
-        subtitle: this.approvals[0]?.detail,
-        options: this.approvals.map((item) => ({
+        subtitle: current?.toolName,
+        description: current?.reason,
+        options: this.approvals.map((item, index) => ({
           key: item.key,
           label: item.label,
-          detail: item.detail,
+          detail: item.label.toLowerCase() === "deny" ? item.risk ? `risk · ${item.risk}` : "" : "",
           style: item.style,
           command: item.command
         })),
@@ -118,7 +155,8 @@ export class TerminalPanelController {
   }
 
   hasOpenPanel(editorValue: string) {
-    return this.getState(editorValue).mode !== "idle";
+    const panel = this.getState(editorValue);
+    return panel.mode !== "idle" && panel.options.length > 0;
   }
 
   focusNext(editorValue: string) {
@@ -147,6 +185,11 @@ export class TerminalPanelController {
 
   clear(editorValue: string) {
     const panel = this.getState(editorValue);
+
+    if (panel.mode === "help") {
+      this.helpOpen = false;
+      return true;
+    }
 
     if (panel.mode === "command") {
       this.suppressedCommandValue = editorValue;
@@ -179,6 +222,12 @@ export class TerminalPanelController {
 
       if (!item) {
         return false;
+      }
+
+      if (item.opensView === "help") {
+        this.helpOpen = true;
+        this.selectedCommandKey = undefined;
+        return true;
       }
 
       if (item.requiresInput) {
@@ -224,7 +273,7 @@ export class TerminalPanelController {
       return undefined;
     }
 
-    if (!item.requiresInput) {
+    if (!shouldInsertCommand(item, editorValue)) {
       return undefined;
     }
 
@@ -233,6 +282,26 @@ export class TerminalPanelController {
 
   acceptCommandInsertion(value: string) {
     this.suppressedCommandValue = value;
+  }
+
+  focusHelpNextTab() {
+    if (!this.helpOpen) {
+      return false;
+    }
+
+    const tabs = listHelpTabs();
+    this.helpTabIndex = (this.helpTabIndex + 1) % tabs.length;
+    return true;
+  }
+
+  focusHelpPreviousTab() {
+    if (!this.helpOpen) {
+      return false;
+    }
+
+    const tabs = listHelpTabs();
+    this.helpTabIndex = (this.helpTabIndex - 1 + tabs.length) % tabs.length;
+    return true;
   }
 
   private setSelectedKey(mode: TerminalPanelState["mode"], key?: string) {
@@ -276,15 +345,20 @@ function buildCommandPanel(editorValue: string): TerminalPanelState | undefined 
 }
 
 function filterCommandItems(query: string) {
-  const normalized = query.trim().toLowerCase();
+  const normalized = query.toLowerCase();
 
   if (!normalized) {
     return listCommandPaletteItems();
   }
 
+  const commandToken = normalized.trimStart().split(/\s+/, 1)[0] ?? "";
+
+  if (!commandToken) {
+    return listCommandPaletteItems();
+  }
+
   return listCommandPaletteItems().filter((item) =>
-    item.command.slice(1).toLowerCase().startsWith(normalized) ||
-    item.summary.toLowerCase().includes(normalized)
+    item.command.slice(1).toLowerCase().startsWith(commandToken)
   );
 }
 
@@ -300,6 +374,26 @@ function deriveSlashQuery(value: string) {
   return value.slice(1);
 }
 
+function shouldInsertCommand(item: CommandPaletteItem, editorValue: string) {
+  if (item.opensView) {
+    return false;
+  }
+
+  if (!item.requiresInput) {
+    return false;
+  }
+
+  const trimmedLeft = editorValue.trimStart();
+  const typedWithoutSlash = trimmedLeft.startsWith("/") ? trimmedLeft.slice(1) : trimmedLeft;
+  const typedCommand = typedWithoutSlash.trim();
+
+  if (!typedCommand) {
+    return true;
+  }
+
+  return item.command.slice(1).toLowerCase().startsWith(typedCommand.toLowerCase());
+}
+
 function getSelectedIndex(options: Array<{ key: string }>, selectedKey?: string) {
   if (!selectedKey) {
     return 0;
@@ -311,14 +405,4 @@ function getSelectedIndex(options: Array<{ key: string }>, selectedKey?: string)
 
 function getActionKey(message: Pick<TerminalMessageBlock, "approvalId" | "taskId">, actionId: string) {
   return `${message.approvalId ?? message.taskId ?? "message"}:${actionId}`;
-}
-
-function deriveActionContext(message: TerminalMessageBlock) {
-  const [headline] = message.body.split("\n");
-
-  if (!headline) {
-    return message.title || "Action";
-  }
-
-  return headline;
 }

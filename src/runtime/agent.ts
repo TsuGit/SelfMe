@@ -511,48 +511,6 @@ export class AgentRuntime {
     const builtInCommand = parseBuiltInCommand(input.content);
 
     if (builtInCommand === "help") {
-      const helpEvent = createSystemMessageAppendedEvent({
-        sessionId: input.sessionId,
-        title: "Help",
-        content: [
-          formatCommandSection("Workspace", [
-            "/sessions",
-            "/tasks",
-            "/plan",
-            "/checkpoint"
-          ]),
-          formatCommandSection("History", [
-            "/history",
-            "/search <query>",
-            "/jump latest",
-            "/retry latest"
-          ]),
-          formatCommandSection("Recovery", [
-            "/resume",
-            "/resume latest",
-            "/resume <taskId>",
-            "/approve <id>",
-            "/deny <id>"
-          ]),
-          formatCommandSection("Tools", [
-            "/tools",
-            "/read <path>",
-            "/read <path:start-end>",
-            "/read <path> --max-bytes <n>",
-            "/shell <command>"
-          ]),
-          formatCommandSection("Launch", [
-            "selfme --new",
-            "selfme --session <id>"
-          ]),
-          formatCommandSection("Navigation", [
-            "PageUp / PageDown  scroll messages",
-            "Ctrl+Up / Ctrl+Down  fine scroll"
-          ])
-        ].join("\n\n")
-      });
-      this.input.bus.emit(helpEvent);
-      await this.input.transcriptStore.appendEvent(helpEvent);
       return true;
     }
 

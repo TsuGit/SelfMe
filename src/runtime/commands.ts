@@ -16,10 +16,17 @@ export interface CommandPaletteItem {
   command: string;
   summary: string;
   requiresInput?: boolean;
+  opensView?: "help";
+}
+
+export interface HelpTab {
+  key: string;
+  label: string;
+  lines: string[];
 }
 
 const commandPaletteItems: CommandPaletteItem[] = [
-  { key: "help", command: "/help", summary: "Show command reference" },
+  { key: "help", command: "/help", summary: "Show command reference", opensView: "help" },
   { key: "tools", command: "/tools", summary: "List available tools" },
   { key: "tasks", command: "/tasks", summary: "Show current tasks" },
   { key: "plan", command: "/plan", summary: "Summarize current recovery plan" },
@@ -37,6 +44,73 @@ const commandPaletteItems: CommandPaletteItem[] = [
 
 export function listCommandPaletteItems() {
   return commandPaletteItems.map((item) => ({ ...item }));
+}
+
+export function listHelpTabs(): HelpTab[] {
+  return [
+    {
+      key: "workspace",
+      label: "Workspace",
+      lines: [
+        "/sessions",
+        "/tasks",
+        "/plan",
+        "/checkpoint"
+      ]
+    },
+    {
+      key: "history",
+      label: "History",
+      lines: [
+        "/history",
+        "/search <query>",
+        "/jump latest",
+        "/retry latest"
+      ]
+    },
+    {
+      key: "recovery",
+      label: "Recovery",
+      lines: [
+        "/resume",
+        "/resume latest",
+        "/resume <taskId>",
+        "/approve <id>",
+        "/deny <id>"
+      ]
+    },
+    {
+      key: "tools",
+      label: "Tools",
+      lines: [
+        "/tools",
+        "/read <path>",
+        "/read <path:start-end>",
+        "/read <path> --max-bytes <n>",
+        "/shell <command>"
+      ]
+    },
+    {
+      key: "launch",
+      label: "Launch",
+      lines: [
+        "selfme --new",
+        "selfme --session <id>"
+      ]
+    },
+    {
+      key: "keys",
+      label: "Keys",
+      lines: [
+        "Up / Down  select menu item",
+        "Tab / Shift+Tab  move within menu",
+        "Enter  confirm",
+        "Esc  close",
+        "PageUp / PageDown  scroll messages",
+        "Ctrl+Up / Ctrl+Down  fine scroll"
+      ]
+    }
+  ];
 }
 
 export interface ParsedSessionCommand {

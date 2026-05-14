@@ -11,6 +11,11 @@ export interface TerminalMessageBlock {
   body: string;
   taskId?: string;
   approvalId?: string;
+  approvalContext?: {
+    toolName: string;
+    reason: string;
+    risk: string;
+  };
   actions?: Array<{
     id: string;
     label: string;
@@ -147,6 +152,10 @@ function renderMessageBlock(
   }
 
   if (message.kind === "approval") {
+    if (!message.body.trim()) {
+      return "";
+    }
+
     return renderStructuredMetaBlock(
       message.body,
       Math.max(8, contentWidth - 2),
