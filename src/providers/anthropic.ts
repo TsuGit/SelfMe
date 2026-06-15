@@ -51,6 +51,7 @@ export class AnthropicProvider implements ProviderClient {
       }));
     const response = await fetch(resolveMessagesEndpoint(this.input.baseUrl), {
       method: "POST",
+      signal: input.signal,
       headers: {
         "Content-Type": "application/json",
         ...(isMiniMax

@@ -1,4 +1,4 @@
-export type BuiltInCommandName = "help" | "tools";
+export type BuiltInCommandName = "help" | "tools" | "stop";
 
 export interface CommandPaletteItem {
   key: string;
@@ -10,6 +10,7 @@ export interface CommandPaletteItem {
 const commandPaletteItems: CommandPaletteItem[] = [
   { key: "help", command: "/help", summary: "Show the minimal command reference" },
   { key: "tools", command: "/tools", summary: "List available tools" },
+  { key: "stop", command: "/stop", summary: "Stop the current running task" },
   { key: "read", command: "/read ", summary: "Read a file or line range", requiresInput: true },
   { key: "write", command: "/write ", summary: "Write a file from multiline input", requiresInput: true },
   { key: "edit", command: "/edit ", summary: "Replace a file range from multiline input", requiresInput: true },
@@ -37,6 +38,7 @@ export function renderHelpLines() {
   return [
     "/help",
     "/tools",
+    "/stop",
     "/read <path>",
     "/read <path:start-end>",
     "/read <path> --max-bytes <n>",
@@ -56,6 +58,10 @@ export function parseBuiltInCommand(content: string): BuiltInCommandName | undef
 
   if (trimmed === "/tools") {
     return "tools";
+  }
+
+  if (trimmed === "/stop") {
+    return "stop";
   }
 
   return undefined;

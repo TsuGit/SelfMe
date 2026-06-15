@@ -26,6 +26,7 @@ export class OpenAIProvider implements ProviderClient {
   async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
     const response = await fetch(`${this.input.baseUrl.replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
+      signal: input.signal,
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${this.input.apiKey}`

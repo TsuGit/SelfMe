@@ -16,6 +16,7 @@ import {
   createAssistantCompletedEvent,
   createAssistantDeltaEvent,
   createAssistantStartedEvent,
+  createRuntimeBusyStateChangedEvent,
   createRuntimeErrorRaisedEvent,
   createSystemMessageAppendedEvent,
   createTaskStateChangedEvent,
@@ -35,6 +36,14 @@ interface ParsedAssistantToolCall {
   input: unknown;
 }
 
+interface ActiveRunState {
+  sessionId: string;
+  taskId: string;
+  controller: AbortController;
+  phase: "assistant" | "tool" | "approval";
+  pendingApprovalId?: string;
+}
+
 export class AgentRuntime {
   private readonly pendingApprovals = new Map<string, {
     request: ApprovalRequest;
@@ -42,6 +51,8 @@ export class AgentRuntime {
     input: unknown;
     autoContinue?: boolean;
   }>();
+  private activeRun?: ActiveRunState;
+  private readonly pendingUserTurns = new Map<string, AbortController>();
 
   constructor(
     private readonly input: {
@@ -55,19 +66,38 @@ export class AgentRuntime {
   ) {}
 
   async start() {
-    this.input.bus.on("user.message.submitted", async (event) => {
-      const handled = await this.handleCommandContent(event.sessionId, event.payload.content, true);
+    this.emitBusyState(this.input.session.sessionId, false, "idle");
 
-      if (handled) {
+    this.input.bus.on("user.message.submitted", async (event) => {
+      if (this.isLockedForSession(event.sessionId)) {
+        this.emitTransientStatus(event.sessionId, "Busy", "A task is still running. Press Esc, Ctrl+C, or /stop before sending a new message.");
         return;
       }
 
-      await this.input.transcriptStore.appendEvent(event);
-      await this.handleAssistantTurn(event.sessionId, event.payload.content);
+      const pendingController = new AbortController();
+      this.pendingUserTurns.set(event.sessionId, pendingController);
+
+      try {
+        if (pendingController.signal.aborted) {
+          this.emitTransientStatus(event.sessionId, "Stopped", "Current task stopped.");
+          return;
+        }
+
+        await this.input.transcriptStore.appendEvent(event);
+        await this.handleAssistantTurn(event.sessionId, event.payload.content);
+      } finally {
+        if (this.pendingUserTurns.get(event.sessionId) === pendingController) {
+          this.pendingUserTurns.delete(event.sessionId);
+        }
+      }
     });
 
     this.input.bus.on("terminal.command.invoked", async (event) => {
       await this.handleCommandContent(event.sessionId, event.payload.content, false);
+    });
+
+    this.input.bus.on("runtime.interrupt.requested", async (event) => {
+      await this.stopActiveRun(event.sessionId, event.payload.reason);
     });
 
     this.input.bus.on("approval.resolved", async (event) => {
@@ -120,6 +150,7 @@ export class AgentRuntime {
           cwd: this.input.session.cwd ?? process.cwd(),
           sessionId: event.sessionId,
           taskId: event.taskId,
+          signal: this.getActiveSignal(event.sessionId, event.taskId),
           onStdoutChunk: async (chunk) => {
             const stdoutEvent = createToolStdoutAppendedEvent({
               sessionId: event.sessionId,
@@ -175,13 +206,37 @@ export class AgentRuntime {
           const taskCompleted = createTaskStateChangedEvent({
             sessionId: event.sessionId,
             taskId: event.taskId,
-            state: result.ok ? "completed" : "failed",
+            state: isCancellationResult(result) ? "cancelled" : result.ok ? "completed" : "failed",
             title: `Run ${event.payload.toolName}`
           });
           this.input.bus.emit(taskCompleted);
           await this.input.transcriptStore.appendEvent(taskCompleted);
         }
       } catch (error) {
+        if (isAbortError(error)) {
+          const completed = createToolExecutionCompletedEvent({
+            sessionId: event.sessionId,
+            taskId: event.taskId,
+            toolName: event.payload.toolName,
+            summary: "cancelled"
+          });
+          this.input.bus.emit(completed);
+          await this.input.transcriptStore.appendEvent(completed);
+
+          if (event.taskId) {
+            const taskCancelled = createTaskStateChangedEvent({
+              sessionId: event.sessionId,
+              taskId: event.taskId,
+              state: "cancelled",
+              title: `Run ${event.payload.toolName}`
+            });
+            this.input.bus.emit(taskCancelled);
+            await this.input.transcriptStore.appendEvent(taskCancelled);
+          }
+
+          return;
+        }
+
         const runtimeError = createRuntimeErrorRaisedEvent({
           sessionId: event.sessionId,
           taskId: event.taskId,
@@ -205,6 +260,13 @@ export class AgentRuntime {
   }
 
   private async handleCommandContent(sessionId: string, content: string, persistUserMessage: boolean) {
+    const builtInCommand = parseBuiltInCommand(content);
+
+    if (builtInCommand === "stop") {
+      await this.stopActiveRun(sessionId, "command");
+      return true;
+    }
+
     const approvalMatch = content.trim().match(/^\/(approve|deny)\s+([a-f0-9-]+)$/i);
 
     if (approvalMatch) {
@@ -230,6 +292,7 @@ export class AgentRuntime {
       await this.input.transcriptStore.appendEvent(resolved);
 
       this.pendingApprovals.delete(approvalId);
+      this.setActivePendingApproval(pending.request.taskId ?? "", undefined);
 
       if (action === "approve" && !pending.autoContinue) {
         const toolEvent = createToolExecutionRequestedEvent({
@@ -242,6 +305,11 @@ export class AgentRuntime {
         await this.input.transcriptStore.appendEvent(toolEvent);
       }
 
+      return true;
+    }
+
+    if (this.isLockedForSession(sessionId)) {
+      this.emitTransientStatus(sessionId, "Busy", "A task is still running. Press Esc, Ctrl+C, or /stop before starting another action.");
       return true;
     }
 
@@ -262,6 +330,7 @@ export class AgentRuntime {
     sessionId: string;
     content: string;
   }) {
+    const builtInCommand = parseBuiltInCommand(input.content);
     const parsedToolCommand = parseToolCommand(input.content);
 
     if (parsedToolCommand) {
@@ -325,8 +394,6 @@ export class AgentRuntime {
       return true;
     }
 
-    const builtInCommand = parseBuiltInCommand(input.content);
-
     if (builtInCommand === "help") {
       const helpEvent = createSystemMessageAppendedEvent({
         sessionId: input.sessionId,
@@ -361,6 +428,7 @@ export class AgentRuntime {
     const responseTaskId = randomUUID();
     const originalRequest = content;
     let nextPrompt = content;
+    const activeRun = this.startActiveRun(sessionId, responseTaskId);
 
     this.input.bus.emit(createTaskStateChangedEvent({
       sessionId,
@@ -374,7 +442,8 @@ export class AgentRuntime {
         const assistantPass = await this.runAssistantPass({
           sessionId,
           taskId: responseTaskId,
-          content: nextPrompt
+          content: nextPrompt,
+          signal: activeRun.controller.signal
         });
 
         if (assistantPass.kind === "message") {
@@ -407,7 +476,8 @@ export class AgentRuntime {
         const toolTaskResult = await this.requestToolFromAssistant({
           sessionId,
           tool,
-          input: toolInput
+          input: toolInput,
+          signal: activeRun.controller.signal
         });
 
         if (toolTaskResult.kind === "denied") {
@@ -425,6 +495,28 @@ export class AgentRuntime {
 
       throw new Error(`Agent stopped after ${MAX_AGENT_TOOL_STEPS} tool steps`);
     } catch (error) {
+      if (isAbortError(error)) {
+        const completedEvent = createAssistantCompletedEvent({
+          sessionId,
+          taskId: responseTaskId,
+          model: this.input.session.model
+        });
+        this.input.bus.emit(completedEvent);
+        await this.input.transcriptStore.appendEvent(completedEvent);
+
+        const taskCancelled = createTaskStateChangedEvent({
+          sessionId,
+          taskId: responseTaskId,
+          state: "cancelled",
+          title: "Respond to user input"
+        });
+        this.input.bus.emit(taskCancelled);
+        await this.input.transcriptStore.appendEvent(taskCancelled);
+
+        this.emitTransientStatus(sessionId, "Stopped", "Current task stopped.");
+        return;
+      }
+
       const completedEvent = createAssistantCompletedEvent({
         sessionId,
         taskId: responseTaskId,
@@ -449,6 +541,8 @@ export class AgentRuntime {
       });
       this.input.bus.emit(taskFailed);
       await this.input.transcriptStore.appendEvent(taskFailed);
+    } finally {
+      this.clearActiveRun(responseTaskId);
     }
   }
 
@@ -456,7 +550,9 @@ export class AgentRuntime {
     sessionId: string;
     taskId: string;
     content: string;
+    signal: AbortSignal;
   }) {
+    this.setActivePhase(input.taskId, "assistant");
     const startedEvent = createAssistantStartedEvent({
       sessionId: input.sessionId,
       taskId: input.taskId
@@ -478,7 +574,8 @@ export class AgentRuntime {
 
     for await (const chunk of this.input.provider.streamResponse({
       content: input.content,
-      contextMessages
+      contextMessages,
+      signal: input.signal
     })) {
       buffer += chunk.delta;
 
@@ -559,6 +656,7 @@ export class AgentRuntime {
     sessionId: string;
     tool: ToolImplementation;
     input: unknown;
+    signal: AbortSignal;
   }) {
     const toolTaskId = randomUUID();
 
@@ -567,7 +665,8 @@ export class AgentRuntime {
         sessionId: input.sessionId,
         taskId: toolTaskId,
         tool: input.tool,
-        input: input.input
+        input: input.input,
+        signal: input.signal
       });
 
       if (!decision.approved) {
@@ -581,7 +680,8 @@ export class AgentRuntime {
       sessionId: input.sessionId,
       taskId: toolTaskId,
       toolName: input.tool.name,
-      input: input.input
+      input: input.input,
+      signal: input.signal
     });
 
     if (!result.ok) {
@@ -602,7 +702,9 @@ export class AgentRuntime {
     taskId: string;
     tool: ToolImplementation;
     input: unknown;
+    signal: AbortSignal;
   }) {
+    this.setActivePhase(input.taskId, "approval");
     const approvalDescriptor = input.tool.buildApproval?.(input.input) ?? buildDefaultApprovalDescriptor(input.tool, input.input);
     const waitingApprovalTask = createTaskStateChangedEvent({
       sessionId: input.sessionId,
@@ -625,8 +727,9 @@ export class AgentRuntime {
       input: input.input,
       autoContinue: true
     });
+    this.setActivePendingApproval(input.taskId, approval.payload.approvalId);
 
-    const decisionPromise = this.waitForApprovalResolution(approval.payload.approvalId);
+    const decisionPromise = this.waitForApprovalResolution(approval.payload.approvalId, input.signal);
 
     this.input.bus.emit(waitingApprovalTask);
     this.input.bus.emit(approval);
@@ -636,18 +739,24 @@ export class AgentRuntime {
     return await decisionPromise;
   }
 
-  private async waitForApprovalResolution(approvalId: string) {
-    return await new Promise<{ approved: boolean }>((resolve) => {
+  private async waitForApprovalResolution(approvalId: string, signal: AbortSignal) {
+    return await new Promise<{ approved: boolean }>((resolve, reject) => {
+      const abortListener = () => {
+        unsubscribe();
+        reject(createAbortError());
+      };
       const unsubscribe = this.input.bus.on("approval.resolved", (event) => {
         if (event.payload.approvalId !== approvalId) {
           return;
         }
 
         unsubscribe();
+        signal.removeEventListener("abort", abortListener);
         resolve({
           approved: event.payload.approved
         });
       });
+      signal.addEventListener("abort", abortListener, { once: true });
     });
   }
 
@@ -656,7 +765,9 @@ export class AgentRuntime {
     taskId: string;
     toolName: string;
     input: unknown;
+    signal: AbortSignal;
   }) {
+    this.setActivePhase(input.taskId, "tool");
     const resultPromise = new Promise<{
       ok: boolean;
       toolName: string;
@@ -706,6 +817,117 @@ export class AgentRuntime {
     await this.input.transcriptStore.appendEvent(toolEvent);
 
     return await resultPromise;
+  }
+
+  private isBusyForSession(sessionId: string) {
+    return this.activeRun?.sessionId === sessionId;
+  }
+
+  private isLockedForSession(sessionId: string) {
+    return this.pendingUserTurns.has(sessionId) || this.isBusyForSession(sessionId);
+  }
+
+  private startActiveRun(sessionId: string, taskId: string) {
+    this.pendingUserTurns.delete(sessionId);
+    const controller = new AbortController();
+    this.activeRun = {
+      sessionId,
+      taskId,
+      controller,
+      phase: "assistant"
+    };
+    this.emitBusyState(sessionId, true, "assistant");
+    return this.activeRun;
+  }
+
+  private clearActiveRun(taskId: string) {
+    if (!this.activeRun || this.activeRun.taskId !== taskId) {
+      return;
+    }
+
+    const sessionId = this.activeRun.sessionId;
+    this.activeRun = undefined;
+    this.emitBusyState(sessionId, false, "idle");
+  }
+
+  private setActivePhase(taskId: string, phase: "assistant" | "tool" | "approval") {
+    if (!this.activeRun || this.activeRun.taskId !== taskId) {
+      return;
+    }
+
+    this.activeRun.phase = phase;
+    this.emitBusyState(this.activeRun.sessionId, true, phase);
+  }
+
+  private setActivePendingApproval(taskId: string, approvalId?: string) {
+    if (!this.activeRun || this.activeRun.taskId !== taskId) {
+      return;
+    }
+
+    this.activeRun.pendingApprovalId = approvalId;
+  }
+
+  private getActiveSignal(sessionId: string, taskId?: string) {
+    if (!this.activeRun || this.activeRun.sessionId !== sessionId || !taskId || this.activeRun.taskId !== taskId) {
+      return undefined;
+    }
+
+    return this.activeRun.controller.signal;
+  }
+
+  private emitBusyState(sessionId: string, active: boolean, phase: "idle" | "assistant" | "tool" | "approval") {
+    this.input.bus.emit(createRuntimeBusyStateChangedEvent({
+      sessionId,
+      active,
+      phase
+    }));
+  }
+
+  private emitTransientStatus(sessionId: string, title: string, content: string) {
+    this.input.bus.emit(createSystemMessageAppendedEvent({
+      sessionId,
+      title,
+      content
+    }));
+  }
+
+  private async stopActiveRun(sessionId: string, reason: "cancel" | "quit" | "command") {
+    if (!this.activeRun || this.activeRun.sessionId !== sessionId) {
+      const pendingTurn = this.pendingUserTurns.get(sessionId);
+
+      if (pendingTurn) {
+        pendingTurn.abort();
+        this.pendingUserTurns.delete(sessionId);
+        this.emitTransientStatus(sessionId, "Stopped", "Current task stopped.");
+        return true;
+      }
+
+      if (reason !== "quit") {
+        this.emitTransientStatus(sessionId, "Stopped", "No active task to stop.");
+      }
+      return false;
+    }
+
+    const current = this.activeRun;
+
+    if (current.pendingApprovalId) {
+      const pending = this.pendingApprovals.get(current.pendingApprovalId);
+
+      if (pending) {
+        const resolved = createApprovalResolvedEvent({
+          sessionId,
+          taskId: pending.request.taskId,
+          approvalId: current.pendingApprovalId,
+          approved: false
+        });
+        this.input.bus.emit(resolved);
+        await this.input.transcriptStore.appendEvent(resolved);
+        this.pendingApprovals.delete(current.pendingApprovalId);
+      }
+    }
+
+    current.controller.abort();
+    return true;
   }
 }
 
@@ -758,6 +980,27 @@ function combineToolRawOutput(stdout?: string, stderr?: string) {
   return [stdout, stderr]
     .filter((value) => typeof value === "string" && value.length > 0)
     .join(stdout && stderr ? "\n" : "");
+}
+
+function createAbortError() {
+  const error = new Error("Request aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function isAbortError(error: unknown) {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function isCancellationResult(result: {
+  ok: boolean;
+  errorMessage?: string;
+  summary: string;
+}) {
+  return !result.ok && (
+    result.errorMessage === "Shell command cancelled" ||
+    result.summary.includes("cancelled")
+  );
 }
 
 function buildToolContinuationPrompt(originalRequest: string, input: {

@@ -51,10 +51,17 @@ async function runWithPty(
   return await new Promise<ToolResult>((resolve) => {
     let settled = false;
     let timedOut = false;
+    let aborted = false;
     const timeout = setTimeout(() => {
       timedOut = true;
       child.kill();
     }, SHELL_TIMEOUT_MS);
+    const abortListener = () => {
+      aborted = true;
+      child.kill();
+    };
+
+    context.signal?.addEventListener("abort", abortListener, { once: true });
 
     const finalize = (exitCode: number) => {
       if (settled) {
@@ -63,12 +70,14 @@ async function runWithPty(
 
       settled = true;
       clearTimeout(timeout);
+      context.signal?.removeEventListener("abort", abortListener);
       const stdout = stdoutCapture.read();
       resolve({
-        ok: exitCode === 0 && !timedOut,
-        summary: buildShellSummary(command, exitCode, timedOut, stdout.truncated),
+        ok: exitCode === 0 && !timedOut && !aborted,
+        summary: buildShellSummary(command, exitCode, timedOut, stdout.truncated, aborted),
         structuredOutput: {
           command,
+          aborted,
           timedOut,
           truncated: stdout.truncated
         },
@@ -76,7 +85,9 @@ async function runWithPty(
           stdout: stdout.text
         },
         exitCode,
-        errorMessage: timedOut
+        errorMessage: aborted
+          ? "Shell command cancelled"
+          : timedOut
           ? `Shell command timed out after ${Math.floor(SHELL_TIMEOUT_MS / 1000)}s`
           : exitCode === 0
             ? undefined
@@ -112,11 +123,19 @@ async function runWithSpawn(
   return await new Promise<ToolResult>((resolve, reject) => {
     let settled = false;
     let timedOut = false;
+    let aborted = false;
     const timeout = setTimeout(() => {
       timedOut = true;
       child.kill("SIGTERM");
       setTimeout(() => child.kill("SIGKILL"), 1000).unref();
     }, SHELL_TIMEOUT_MS);
+    const abortListener = () => {
+      aborted = true;
+      child.kill("SIGTERM");
+      setTimeout(() => child.kill("SIGKILL"), 1000).unref();
+    };
+
+    context.signal?.addEventListener("abort", abortListener, { once: true });
 
     const finalize = (exitCode: number) => {
       if (settled) {
@@ -125,13 +144,15 @@ async function runWithSpawn(
 
       settled = true;
       clearTimeout(timeout);
+      context.signal?.removeEventListener("abort", abortListener);
       const stdout = stdoutCapture.read();
       const stderr = stderrCapture.read();
       resolve({
-        ok: exitCode === 0 && !timedOut,
-        summary: buildShellSummary(command, exitCode, timedOut, stdout.truncated || stderr.truncated),
+        ok: exitCode === 0 && !timedOut && !aborted,
+        summary: buildShellSummary(command, exitCode, timedOut, stdout.truncated || stderr.truncated, aborted),
         structuredOutput: {
           command,
+          aborted,
           timedOut,
           truncated: stdout.truncated || stderr.truncated
         },
@@ -140,7 +161,9 @@ async function runWithSpawn(
           stderr: stderr.text
         },
         exitCode,
-        errorMessage: timedOut
+        errorMessage: aborted
+          ? "Shell command cancelled"
+          : timedOut
           ? `Shell command timed out after ${Math.floor(SHELL_TIMEOUT_MS / 1000)}s`
           : exitCode === 0
             ? undefined
@@ -162,16 +185,21 @@ async function runWithSpawn(
 
     child.on("error", (error) => {
       clearTimeout(timeout);
+      context.signal?.removeEventListener("abort", abortListener);
       reject(error);
     });
     child.on("close", (code) => {
-      finalize(code ?? (timedOut ? 124 : 1));
+      finalize(code ?? (aborted ? 130 : timedOut ? 124 : 1));
     });
   });
 }
 
-function buildShellSummary(command: string, exitCode: number, timedOut: boolean, truncated: boolean) {
+function buildShellSummary(command: string, exitCode: number, timedOut: boolean, truncated: boolean, aborted: boolean) {
   const preview = createCommandPreview(command, 120);
+
+  if (aborted) {
+    return `${preview} · cancelled${truncated ? " · truncated" : ""}`;
+  }
 
   if (timedOut) {
     return `${preview} · timed out${truncated ? " · truncated" : ""}`;

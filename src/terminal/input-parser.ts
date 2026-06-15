@@ -50,6 +50,14 @@ export function parseTerminalInput(chunk: Buffer | string) {
   let remaining = chunk.toString("utf8");
 
   while (remaining.length > 0) {
+    const controlEvent = matchControlEvent(remaining);
+
+    if (controlEvent) {
+      events.push(controlEvent.event);
+      remaining = remaining.slice(controlEvent.length);
+      continue;
+    }
+
     const fixed = fixedSequences.find((candidate) => remaining.startsWith(candidate.sequence));
 
     if (fixed) {
@@ -90,6 +98,19 @@ export function parseTerminalInput(chunk: Buffer | string) {
   }
 
   return events;
+}
+
+function matchControlEvent(input: string) {
+  const escapeKeyMatch = input.match(/^\u001b\[27(?:;[0-9]+)?(?:u|~)/);
+
+  if (escapeKeyMatch) {
+    return {
+      length: escapeKeyMatch[0].length,
+      event: { type: "action-cancel" } satisfies TerminalInputEvent
+    };
+  }
+
+  return undefined;
 }
 
 function matchControlSequence(input: string) {

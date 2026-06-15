@@ -20,6 +20,7 @@ export interface ToolContext {
   cwd: string;
   sessionId: string;
   taskId?: string;
+  signal?: AbortSignal;
   onStdoutChunk?: (chunk: string) => Promise<void> | void;
 }
 

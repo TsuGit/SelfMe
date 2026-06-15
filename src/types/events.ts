@@ -41,6 +41,16 @@ export type TerminalCommandInvokedEvent = RuntimeEventBase<
   { content: string }
 >;
 
+export type RuntimeInterruptRequestedEvent = RuntimeEventBase<
+  "runtime.interrupt.requested",
+  { reason: "cancel" | "quit" | "command" }
+>;
+
+export type RuntimeBusyStateChangedEvent = RuntimeEventBase<
+  "runtime.busy.changed",
+  { active: boolean; phase: "idle" | "assistant" | "tool" | "approval" }
+>;
+
 export type AssistantStreamStartedEvent = RuntimeEventBase<
   "assistant.stream.started",
   Record<string, never>
@@ -103,6 +113,8 @@ export type RuntimeEvent =
   | MessageViewportChangedEvent
   | TerminalUiStateChangedEvent
   | TerminalCommandInvokedEvent
+  | RuntimeInterruptRequestedEvent
+  | RuntimeBusyStateChangedEvent
   | AssistantStreamStartedEvent
   | AssistantDeltaReceivedEvent
   | AssistantCompletedEvent

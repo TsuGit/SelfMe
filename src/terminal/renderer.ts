@@ -949,7 +949,7 @@ function shouldUpsertSystemMessage(title: string) {
 }
 
 function isTransientSystemNotice(title: string) {
-  return title === "Help" || title === "Tools";
+  return title === "Help" || title === "Tools" || title === "Busy" || title === "Stopped";
 }
 
 function isTransientRuntimeNotice(message: string) {

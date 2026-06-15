@@ -13,6 +13,12 @@ export class LocalProvider implements ProviderClient {
     const words = text.split(" ");
 
     for (const word of words) {
+      if (input.signal?.aborted) {
+        const error = new Error("Request aborted");
+        error.name = "AbortError";
+        throw error;
+      }
+
       yield { delta: `${word} ` };
       await new Promise((resolve) => setTimeout(resolve, 20));
     }

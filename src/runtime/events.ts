@@ -6,6 +6,8 @@ import type {
   AssistantStreamStartedEvent,
   MessageViewportChangedEvent,
   TerminalCommandInvokedEvent,
+  RuntimeInterruptRequestedEvent,
+  RuntimeBusyStateChangedEvent,
   TerminalUiStateChangedEvent,
   SystemMessageAppendedEvent,
   ApprovalRequestedEvent,
@@ -112,6 +114,40 @@ export function createTerminalCommandInvokedEvent(input: {
     }),
     payload: {
       content: input.content
+    }
+  };
+}
+
+export function createRuntimeInterruptRequestedEvent(input: {
+  sessionId: string;
+  reason: "cancel" | "quit" | "command";
+}): RuntimeInterruptRequestedEvent {
+  return {
+    ...createBase({
+      sessionId: input.sessionId,
+      source: "user",
+      type: "runtime.interrupt.requested"
+    }),
+    payload: {
+      reason: input.reason
+    }
+  };
+}
+
+export function createRuntimeBusyStateChangedEvent(input: {
+  sessionId: string;
+  active: boolean;
+  phase: "idle" | "assistant" | "tool" | "approval";
+}): RuntimeBusyStateChangedEvent {
+  return {
+    ...createBase({
+      sessionId: input.sessionId,
+      source: "runtime",
+      type: "runtime.busy.changed"
+    }),
+    payload: {
+      active: input.active,
+      phase: input.phase
     }
   };
 }

@@ -4,6 +4,8 @@ import type { EventBus } from "../app/event-bus.js";
 import type { EditorController } from "../editor/composer.js";
 import {
   createMessageViewportChangedEvent,
+  createRuntimeInterruptRequestedEvent,
+  createSystemMessageAppendedEvent,
   createTerminalCommandInvokedEvent,
   createTerminalUiStateChangedEvent
 } from "../runtime/events.js";
@@ -11,6 +13,8 @@ import type { TerminalPanelController } from "./panel-controller.js";
 import { parseTerminalInput } from "./input-parser.js";
 
 export class TerminalEventLoop {
+  private isBusy = false;
+
   constructor(
     private readonly input: {
       bus: EventBus;
@@ -21,6 +25,10 @@ export class TerminalEventLoop {
   ) {}
 
   start() {
+    this.input.bus.on("runtime.busy.changed", (event) => {
+      this.isBusy = event.payload.active;
+    });
+
     if (process.stdin.isTTY) {
       process.stdin.setRawMode(true);
     }
@@ -30,6 +38,14 @@ export class TerminalEventLoop {
     process.stdin.on("data", (chunk) => {
       for (const event of parseTerminalInput(chunk)) {
         if (event.type === "quit") {
+          if (this.isBusy) {
+            this.input.bus.emit(createRuntimeInterruptRequestedEvent({
+              sessionId: this.input.sessionId ?? "local-session",
+              reason: "quit"
+            }));
+            continue;
+          }
+
           process.stdout.write("\n");
           process.exit(0);
         }
@@ -89,6 +105,15 @@ export class TerminalEventLoop {
             continue;
           }
 
+          if (this.isBusy) {
+            this.input.bus.emit(createSystemMessageAppendedEvent({
+              sessionId: this.input.sessionId ?? "local-session",
+              title: "Busy",
+              content: "A task is still running. Press Esc, Ctrl+C, or /stop before sending a new message."
+            }));
+            continue;
+          }
+
           this.input.editor.submit(this.input.bus, this.input.sessionId ?? "local-session");
           continue;
         }
@@ -113,6 +138,13 @@ export class TerminalEventLoop {
           if (this.input.panel.clear(currentValue)) {
             this.emitUiState();
             continue;
+          }
+
+          if (this.isBusy) {
+            this.input.bus.emit(createRuntimeInterruptRequestedEvent({
+              sessionId: this.input.sessionId ?? "local-session",
+              reason: "cancel"
+            }));
           }
 
           continue;

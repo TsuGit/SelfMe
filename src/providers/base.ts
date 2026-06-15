@@ -6,6 +6,7 @@ export interface ProviderContextMessage {
 export interface ProviderStreamInput {
   content: string;
   contextMessages?: ProviderContextMessage[];
+  signal?: AbortSignal;
 }
 
 export interface ProviderStreamChunk {
