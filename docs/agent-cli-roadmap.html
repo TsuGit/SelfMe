@@ -218,7 +218,7 @@
           </article>
           <article class="card">
             <h3>Commands</h3>
-            <p>当前保留最小命令面：<code>/help</code>、<code>/tools</code>、<code>/read</code>、<code>/write</code>、<code>/edit</code>、<code>/shell</code>。</p>
+            <p>当前保留最小命令面：<code>/help</code>、<code>/tools</code>、<code>/stop</code>、<code>/read</code>、<code>/write</code>、<code>/edit</code>、<code>/shell</code>。</p>
           </article>
           <article class="card">
             <h3>Approvals</h3>
@@ -227,6 +227,10 @@
           <article class="card">
             <h3>Storage</h3>
             <p>已保留 transcript、logs、settings 等必要存储，去掉了复杂恢复和多余状态层。</p>
+          </article>
+          <article class="card">
+            <h3>Runtime Control</h3>
+            <p>已具备单活跃任务模型、忙时拦截新消息、<code>Esc</code> / <code>Ctrl+C</code> / <code>/stop</code> 中断当前任务，以及 provider / shell abort 贯通。</p>
           </article>
         </div>
       </section>
@@ -248,20 +252,20 @@
         <h2>下一阶段要做什么</h2>
         <ol>
           <li>
-            <strong>工具执行收口</strong>
-            <p>统一 shell 和 files 的错误格式、输出截断、摘要、超时和失败反馈，避免工具结果越来越乱。</p>
+            <strong>真实 coding task 回归</strong>
+            <p>不再只测单句命令，开始用一批真实小任务验证闭环，例如读文件、改文件、跑命令、看结果、继续修正，确认 agent 真能持续完成工作。</p>
           </li>
           <li>
             <strong>上下文裁剪</strong>
             <p>transcript 全量保留，但传给模型的上下文必须裁剪，避免长会话持续退化。</p>
           </li>
           <li>
-            <strong>最小命令面完善</strong>
-            <p>命令补全、参数提示、审批说明、工具说明继续补稳，但不扩张命令体系。</p>
+            <strong>工具展示收口</strong>
+            <p>继续收工具块展示、长输出样本、失败说明和最终回答的克制程度，避免信息重复或工具噪音过强。</p>
           </li>
           <li>
-            <strong>真实 coding task 回归</strong>
-            <p>用真实任务验证闭环，例如读文件、改文件、跑命令、解释结果、继续修正，而不是只做单点 smoke。</p>
+            <strong>最小命令面维持稳定</strong>
+            <p>命令系统只保留最小集，不再扩张，但要继续保证 <code>/stop</code>、审批、帮助、命令补全这些入口稳定可用。</p>
           </li>
         </ol>
       </section>
@@ -296,7 +300,7 @@
           </article>
           <article class="card">
             <h3>M3</h3>
-            <p>上下文裁剪和工具输出收口完成，长对话仍然稳定，不因日志和冗余上下文迅速变笨。</p>
+            <p>中断控制和单活跃任务模型完成；接下来补上下文裁剪和工具输出收口，保证长对话仍然稳定。</p>
           </article>
           <article class="card">
             <h3>M4</h3>
@@ -321,8 +325,8 @@
         <div class="tag next">Immediate</div>
         <h2>当前建议的直接开工项</h2>
         <p>
-          下一步直接做 <strong>工具执行收口</strong>，重点是 shell 超时、输出截断、错误格式统一，以及 read / write / edit 的反馈一致性。
-          这是把“功能已经有了”推进到“长期可维护、真实任务稳定可用”的关键一步。
+          下一步直接做 <strong>真实 coding task 回归 + 上下文裁剪设计</strong>。基础自动工具调用、审批和中断控制已经成立，
+          现在该验证它在连续真实任务里的稳定性，并开始处理长会话上下文退化问题。
         </p>
       </section>
 
