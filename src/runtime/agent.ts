@@ -426,7 +426,7 @@ export class AgentRuntime {
     }));
 
     try {
-      for (let step = 0; step < MAX_AGENT_TOOL_STEPS; step += 1) {
+      for (let step = 0; step <= MAX_AGENT_TOOL_STEPS; step += 1) {
         const assistantPass = await this.runAssistantPass({
           sessionId,
           taskId: responseTaskId,
@@ -454,6 +454,10 @@ export class AgentRuntime {
           return;
         }
 
+        if (step === MAX_AGENT_TOOL_STEPS) {
+          throw new Error(`Agent stopped after ${MAX_AGENT_TOOL_STEPS} tool steps`);
+        }
+
         const tool = this.input.tools.get(assistantPass.toolCall.tool);
 
         if (!tool) {
@@ -474,14 +478,44 @@ export class AgentRuntime {
         }
 
         if (toolTaskResult.kind === "failed") {
+          if (shouldAutoSummarizeToolFailure(originalRequest, toolTaskResult.result)) {
+            const directAnswer = buildDirectToolFailureAnswer(originalRequest, toolTaskResult.result);
+
+            if (directAnswer) {
+              const nextEvent = createAssistantDeltaEvent({
+                sessionId,
+                taskId: responseTaskId,
+                delta: directAnswer
+              });
+              this.input.bus.emit(nextEvent);
+              await this.input.transcriptStore.appendEvent(nextEvent);
+
+              const completedEvent = createAssistantCompletedEvent({
+                sessionId,
+                taskId: responseTaskId,
+                model: this.input.session.model
+              });
+              this.input.bus.emit(completedEvent);
+              await this.input.transcriptStore.appendEvent(completedEvent);
+
+              const taskCompleted = createTaskStateChangedEvent({
+                sessionId,
+                taskId: responseTaskId,
+                state: "completed",
+                title: "Respond to user input"
+              });
+              this.input.bus.emit(taskCompleted);
+              await this.input.transcriptStore.appendEvent(taskCompleted);
+              return;
+            }
+          }
+
           nextPrompt = buildToolFailureContinuationPrompt(originalRequest, toolTaskResult.result);
           continue;
         }
 
         nextPrompt = buildToolContinuationPrompt(originalRequest, toolTaskResult.result);
       }
-
-      throw new Error(`Agent stopped after ${MAX_AGENT_TOOL_STEPS} tool steps`);
     } catch (error) {
       if (isAbortError(error)) {
         const completedEvent = createAssistantCompletedEvent({
@@ -608,7 +642,7 @@ export class AgentRuntime {
 
     if (!parsedToolCall) {
       if (looksLikeToolCallBuffer(buffer)) {
-        throw new Error("Model emitted a malformed tool call");
+        throw new Error(`Model emitted a malformed tool call: ${createMalformedToolCallPreview(buffer)}`);
       }
 
       if (buffer.trim().length > 0) {
@@ -770,11 +804,14 @@ export class AgentRuntime {
 
         offCompleted();
         offError();
+        const summary = event.payload.summary;
+        const ok = !isToolExecutionFailureSummary(summary);
         resolve({
-          ok: true,
+          ok,
           toolName: event.payload.toolName,
-          summary: event.payload.summary,
-          rawOutput: event.payload.rawOutput
+          summary,
+          rawOutput: event.payload.rawOutput,
+          errorMessage: ok ? undefined : summary
         });
       });
 
@@ -965,9 +1002,24 @@ function parseToolInput(tool: ToolImplementation, input: unknown) {
 }
 
 function combineToolRawOutput(stdout?: string, stderr?: string) {
-  return [stdout, stderr]
-    .filter((value) => typeof value === "string" && value.length > 0)
-    .join(stdout && stderr ? "\n" : "");
+  const hasStdout = typeof stdout === "string" && stdout.length > 0;
+  const hasStderr = typeof stderr === "string" && stderr.length > 0;
+
+  if (hasStdout && hasStderr) {
+    return [
+      "stdout:",
+      stdout,
+      "",
+      "stderr:",
+      stderr
+    ].join("\n");
+  }
+
+  if (hasStdout) {
+    return stdout;
+  }
+
+  return hasStderr ? stderr : "";
 }
 
 function createAbortError() {
@@ -991,6 +1043,10 @@ function isCancellationResult(result: {
   );
 }
 
+function isToolExecutionFailureSummary(summary: string) {
+  return /\bfailed\b/i.test(summary) || /\btimed out\b/i.test(summary) || /\bcancelled\b/i.test(summary);
+}
+
 function buildToolContinuationPrompt(originalRequest: string, input: {
   toolName: string;
   summary: string;
@@ -1004,13 +1060,16 @@ function buildToolContinuationPrompt(originalRequest: string, input: {
     "If another tool is required, return exactly one tool call block.",
     "If the original request is not yet completed, keep working instead of stopping at a status update.",
     "Otherwise answer the user briefly and directly.",
+    "The terminal already shows the raw tool output to the user.",
+    "Do not restate raw output line-by-line or quote it verbatim unless the user explicitly asked for a transformation or summary.",
+    "For listings, reads, and command output, prefer a one-sentence conclusion over repeating the visible lines.",
     "",
     `Tool: ${input.toolName}`,
     `Summary: ${input.summary}`
   ];
 
   if (input.rawOutput && input.rawOutput.trim().length > 0) {
-    lines.push("Raw output:");
+    lines.push("Raw output (already shown to the user):");
     lines.push(input.rawOutput);
   } else {
     lines.push("Raw output: (none)");
@@ -1041,17 +1100,26 @@ function buildToolFailureContinuationPrompt(originalRequest: string, input: {
     "Explain the failure briefly and accurately.",
     "If another tool can help, return exactly one tool call block.",
     "Otherwise answer directly.",
+    "The terminal already shows the raw tool output to the user.",
+    "Do not restate stdout or stderr line-by-line unless one exact line is necessary to explain the next action.",
+    "Prefer a short conclusion such as the key error, missing file, or exit code.",
     "",
     `Tool: ${input.toolName}`,
     `Summary: ${input.summary}`
   ];
+
+  const replyHint = buildFailureReplyHint(input);
+
+  if (replyHint) {
+    lines.push(`Preferred answer style: ${replyHint}`);
+  }
 
   if (input.errorMessage) {
     lines.push(`Error: ${input.errorMessage}`);
   }
 
   if (input.rawOutput && input.rawOutput !== input.errorMessage) {
-    lines.push("Raw output:");
+    lines.push("Raw output (already shown to the user):");
     lines.push(input.rawOutput);
   }
 
@@ -1067,6 +1135,7 @@ function buildAgentSystemPrompt(tools: ToolImplementation[]) {
     '{"tool":"shell","input":{"command":"pwd"}}',
     `${TOOL_CALL_CLOSE}`,
     "Always place tool arguments inside the input object.",
+    "Reply in the same language as the user's latest request unless the user explicitly asked for another language.",
     "If no tool is needed, answer normally.",
     "Prefer read before edit when you need to inspect a file.",
     "Use write to create or replace a whole file.",
@@ -1074,6 +1143,8 @@ function buildAgentSystemPrompt(tools: ToolImplementation[]) {
     "When answering after a tool result, ground your answer strictly in the actual tool output.",
     "Do not invent files, directories, lines, commands, errors, or truncation that are not explicitly present in the latest tool result.",
     "If the latest tool result already fully answers the user, give a short direct answer instead of restating or embellishing the output.",
+    "The terminal UI already shows raw tool output to the user, so do not repeat listings, file contents, stdout, or stderr line-by-line unless the user explicitly asked for that transformation.",
+    "Prefer one concise conclusion sentence over echoing visible tool output.",
     "For directory listings, only mention entries that actually appear in the listing.",
     "Never invent tool names or input fields.",
     "Available tools:"
@@ -1089,6 +1160,88 @@ function buildAgentSystemPrompt(tools: ToolImplementation[]) {
   return lines.join("\n");
 }
 
+function buildFailureReplyHint(input: {
+  toolName: string;
+  summary: string;
+  errorMessage?: string;
+}) {
+  if (input.toolName === "shell") {
+    const exitCode = parseExitCode(input.summary) ?? parseExitCode(input.errorMessage);
+
+    if (typeof exitCode === "number") {
+      return `say in one short sentence that the command failed and mention exit code ${exitCode}; do not say the command simply ran or completed; reply in the same language as the user's latest request; if replying in Chinese, use wording very close to "命令执行失败，退出码为 ${exitCode}。"`; 
+    }
+
+    return "say in one short sentence that the command failed; do not say the command simply ran or completed; reply in the same language as the user's latest request; if replying in Chinese, use wording very close to \"命令执行失败。\"";
+  }
+
+  if (input.toolName === "files" && /ENOENT|no such file or directory/i.test(input.errorMessage ?? "")) {
+    return "say in one sentence that the file does not exist; reply in the same language as the user's latest request; if replying in Chinese, prefer wording like \"该文件不存在。\"";
+  }
+
+  return undefined;
+}
+
+function parseExitCode(text?: string) {
+  if (!text) {
+    return undefined;
+  }
+
+  const match = text.match(/(?:failed\s*\((\d+)\)|exit code\s+(\d+))/i);
+  const value = match?.[1] ?? match?.[2];
+
+  if (!value) {
+    return undefined;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function shouldAutoSummarizeToolFailure(originalRequest: string, input: {
+  toolName: string;
+  summary: string;
+  errorMessage?: string;
+}) {
+  if (input.toolName !== "shell") {
+    return false;
+  }
+
+  return isDirectShellExecutionRequest(originalRequest) && typeof parseExitCode(input.summary) === "number";
+}
+
+function buildDirectToolFailureAnswer(originalRequest: string, input: {
+  summary: string;
+  errorMessage?: string;
+}) {
+  const exitCode = parseExitCode(input.summary) ?? parseExitCode(input.errorMessage);
+
+  if (typeof exitCode !== "number") {
+    return undefined;
+  }
+
+  if (containsHanScript(originalRequest)) {
+    return `命令执行失败，退出码为 ${exitCode}。`;
+  }
+
+  return `The command failed with exit code ${exitCode}.`;
+}
+
+function isDirectShellExecutionRequest(content: string) {
+  const trimmed = content.trim();
+
+  if (/^(运行|执行|run)\s+/i.test(trimmed)) {
+    return true;
+  }
+
+  return /^(?:\.{0,2}\/\S+|~\/\S+|[a-z0-9_][a-z0-9_.-]*)(?:\s+.+)?$/.test(trimmed)
+    && (/\s/.test(trimmed) || /^\.{0,2}\//.test(trimmed) || /^~\//.test(trimmed));
+}
+
+function containsHanScript(content: string) {
+  return /[\p{Script=Han}]/u.test(content);
+}
+
 function classifyAssistantBuffer(content: string) {
   const trimmedStart = normalizeToolCallBufferPrefix(content);
 
@@ -1096,33 +1249,42 @@ function classifyAssistantBuffer(content: string) {
     return "pending" as const;
   }
 
-  if (trimmedStart.startsWith(TOOL_CALL_OPEN)) {
+  if (trimmedStart.includes(TOOL_CALL_OPEN)) {
     return "tool" as const;
   }
 
-  if (TOOL_CALL_OPEN.startsWith(trimmedStart)) {
+  if (hasTrailingToolCallPrefix(trimmedStart)) {
     return "pending" as const;
   }
 
   return "message" as const;
 }
 
+function hasTrailingToolCallPrefix(content: string) {
+  const maxLength = Math.min(content.length, TOOL_CALL_OPEN.length - 1);
+
+  for (let length = maxLength; length >= 1; length -= 1) {
+    if (TOOL_CALL_OPEN.startsWith(content.slice(-length))) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function parseAssistantToolCall(content: string): ParsedAssistantToolCall | undefined {
   const normalized = normalizeToolCallBufferPrefix(content).trim();
+  const openIndex = normalized.indexOf(TOOL_CALL_OPEN);
 
-  if (!normalized.startsWith(TOOL_CALL_OPEN)) {
+  if (openIndex < 0) {
     return undefined;
   }
 
-  const closeIndex = normalized.indexOf(TOOL_CALL_CLOSE, TOOL_CALL_OPEN.length);
-
-  if (closeIndex < 0) {
-    return undefined;
-  }
-
-  const jsonText = normalized
-    .slice(TOOL_CALL_OPEN.length, closeIndex)
-    .trim();
+  const closeIndex = normalized.indexOf(TOOL_CALL_CLOSE, openIndex + TOOL_CALL_OPEN.length);
+  const rawPayload = closeIndex >= 0
+    ? normalized.slice(openIndex + TOOL_CALL_OPEN.length, closeIndex).trim()
+    : normalized.slice(openIndex + TOOL_CALL_OPEN.length).trim();
+  const jsonText = extractToolCallJsonCandidate(normalizeToolCallPayload(rawPayload));
 
   if (!jsonText) {
     return undefined;
@@ -1140,7 +1302,32 @@ function parseAssistantToolCall(content: string): ParsedAssistantToolCall | unde
       input?: unknown;
     };
   } catch {
-    return undefined;
+    const repaired = repairToolCallJson(jsonText);
+
+    if (repaired) {
+      try {
+        parsed = JSON.parse(repaired) as {
+          tool?: unknown;
+          input?: unknown;
+        };
+      } catch {
+        const loose = parseLooseAssistantToolCall(jsonText);
+
+        if (!loose) {
+          return undefined;
+        }
+
+        return loose;
+      }
+    } else {
+      const loose = parseLooseAssistantToolCall(jsonText);
+
+      if (!loose) {
+        return undefined;
+      }
+
+      return loose;
+    }
   }
 
   if (typeof parsed.tool !== "string" || parsed.tool.trim().length === 0) {
@@ -1158,7 +1345,7 @@ function parseAssistantToolCall(content: string): ParsedAssistantToolCall | unde
 }
 
 function looksLikeToolCallBuffer(content: string) {
-  return normalizeToolCallBufferPrefix(content).startsWith(TOOL_CALL_OPEN);
+  return normalizeToolCallBufferPrefix(content).includes(TOOL_CALL_OPEN);
 }
 
 function normalizeToolCallBufferPrefix(content: string) {
@@ -1181,4 +1368,149 @@ function normalizeToolCallBufferPrefix(content: string) {
   }
 
   return normalized;
+}
+
+function normalizeToolCallPayload(content: string) {
+  let normalized = content.trim();
+
+  if (normalized.startsWith("```")) {
+    const firstNewlineIndex = normalized.indexOf("\n");
+
+    if (firstNewlineIndex >= 0) {
+      normalized = normalized.slice(firstNewlineIndex + 1).trimStart();
+    }
+
+    if (normalized.endsWith("```")) {
+      normalized = normalized.slice(0, -3).trimEnd();
+    }
+  }
+
+  if (normalized.startsWith("json\n")) {
+    normalized = normalized.slice("json\n".length).trimStart();
+  }
+
+  return normalized.trim().replace(/;$/, "").trim();
+}
+
+function repairToolCallJson(content: string) {
+  const normalized = content
+    .replace(/[“”]/g, "\"")
+    .replace(/[‘’]/g, "'");
+
+  return normalized === content ? undefined : normalized;
+}
+
+function extractToolCallJsonCandidate(content: string) {
+  const trimmed = content.trim();
+
+  if (!trimmed) {
+    return "";
+  }
+
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    return trimmed;
+  }
+
+  const startIndex = trimmed.indexOf("{");
+
+  if (startIndex < 0) {
+    return trimmed;
+  }
+
+  const balanced = extractBalancedJsonObject(trimmed.slice(startIndex));
+  return balanced ?? trimmed.slice(startIndex).trim();
+}
+
+function extractBalancedJsonObject(content: string) {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < content.length; index += 1) {
+    const char = content[index] ?? "";
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+
+    if (char === "\"") {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) {
+      continue;
+    }
+
+    if (char === "{") {
+      depth += 1;
+      continue;
+    }
+
+    if (char === "}") {
+      depth -= 1;
+
+      if (depth === 0) {
+        return content.slice(0, index + 1);
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function parseLooseAssistantToolCall(content: string): ParsedAssistantToolCall | undefined {
+  const toolMatch = content.match(/"tool"\s*:\s*"([^"]+)"/i);
+  const toolName = toolMatch?.[1]?.trim();
+
+  if (!toolName) {
+    return undefined;
+  }
+
+  if (toolName === "shell") {
+    const command = extractLooseQuotedField(content, "command");
+
+    if (!command) {
+      return undefined;
+    }
+
+    return {
+      tool: "shell",
+      input: {
+        command
+      }
+    };
+  }
+
+  return undefined;
+}
+
+function extractLooseQuotedField(content: string, fieldName: string) {
+  const escapedField = fieldName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`"${escapedField}"\\s*:\\s*"([\\s\\S]*?)"\\s*(?:,|[}\\]])`, "i");
+  const match = content.match(pattern);
+
+  if (!match?.[1]) {
+    return undefined;
+  }
+
+  return match[1].trim();
+}
+
+function createMalformedToolCallPreview(content: string, maxLength = 220) {
+  const normalized = normalizeToolCallBufferPrefix(content)
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, maxLength - 3).trimEnd()}...`;
 }

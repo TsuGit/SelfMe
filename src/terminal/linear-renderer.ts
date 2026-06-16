@@ -808,7 +808,7 @@ function renderStructuredMetaBodyLine(
   width: number,
   renderer: (text: string) => string
 ) {
-  const isCodeLike = /^[ \t]*\d+[ \t]*\|/.test(line) || /^[ \t]*\.\.\.truncated\.\.\./.test(line);
+  const isCodeLike = /^[ \t]*\d+[ \t]*\|/.test(line) || /^[ \t]*\.\.\./.test(line);
   const prefix = isCodeLike ? "    " : "  ";
   const wrapped = wrapLine(line, Math.max(1, width - prefix.length));
 
@@ -1033,12 +1033,18 @@ function finalizeToolMessage(current: string, toolName: string, summary: string,
   const meaningfulOutput = hasMeaningfulToolOutput(sanitizedOutput) ? sanitizedOutput : "";
   const lines = current ? current.split("\n").filter(Boolean) : [];
   const header = summary.trim() || `${toolName} · completed`;
+  const hasStructuredOutput = /^(stdout:|stderr:)/m.test(meaningfulOutput);
 
   if (lines.length === 0) {
     return meaningfulOutput ? clipToolTranscript([header, meaningfulOutput].join("\n")) : header;
   }
 
+  if (hasStructuredOutput) {
+    return clipToolTranscript([header, meaningfulOutput].join("\n"));
+  }
+
   const preserved = lines.slice(1).filter((line) =>
+    !line.startsWith("target · ") &&
     !line.startsWith("command · ") &&
     !line.startsWith("path · ")
   );
@@ -1057,14 +1063,14 @@ function finalizeToolMessage(current: string, toolName: string, summary: string,
 
 function renderToolTargetLine(toolName: string, input?: unknown) {
   if (toolName === "shell" && input && typeof input === "object" && "command" in input && typeof input.command === "string") {
-    return `command · ${createToolPreview(input.command, 140)}`;
+    return `target · ${createToolPreview(input.command, 140)}`;
   }
 
   if ((toolName === "files" || toolName === "write" || toolName === "edit") && input && typeof input === "object" && "path" in input && typeof input.path === "string") {
     const range = "startLine" in input && typeof input.startLine === "number"
       ? `:${input.startLine}${"endLine" in input && typeof input.endLine === "number" ? `-${input.endLine}` : ""}`
       : "";
-    return `path · ${input.path}${range}`;
+    return `target · ${input.path}${range}`;
   }
 
   return "";
@@ -1090,7 +1096,7 @@ function clipToolTranscript(text: string, maxLines = 12, maxChars = 2400) {
   const lines = text.split("\n");
   const [header = "", ...bodyLines] = lines;
   const bodyBudget = Math.max(0, maxChars - header.length - 1);
-  const clippedBody = clipToolBodyByChars(bodyLines.join("\n"), bodyBudget);
+  const clippedBody = clipToolBodyByChars(normalizeToolClipMarkers(bodyLines.join("\n")), bodyBudget);
   const normalizedLines = [header, ...clippedBody.split("\n").filter(Boolean)].filter(Boolean);
 
   if (normalizedLines.length <= maxLines) {
@@ -1101,11 +1107,12 @@ function clipToolTranscript(text: string, maxLines = 12, maxChars = 2400) {
   const maxBodyLines = Math.max(1, maxLines - 1);
   const keepHeadLines = Math.min(4, Math.max(1, Math.floor((maxBodyLines - 1) / 2)));
   const keepTailLines = Math.max(0, maxBodyLines - keepHeadLines - 1);
+  const omittedLineCount = Math.max(1, visibleBodyLines.length - keepHeadLines - keepTailLines);
 
   return [
     header,
     ...visibleBodyLines.slice(0, keepHeadLines),
-    "...truncated...",
+    formatToolLineClipMarker(omittedLineCount),
     ...(keepTailLines > 0 ? visibleBodyLines.slice(-keepTailLines) : [])
   ].filter(Boolean).join("\n");
 }
@@ -1115,19 +1122,49 @@ function clipToolBodyByChars(body: string, maxChars: number) {
     return body;
   }
 
-  const marker = "\n...truncated...\n";
+  const marker = "\n... output clipped ...\n";
   const budgetWithoutMarker = Math.max(0, maxChars - marker.length);
 
   if (budgetWithoutMarker <= 0) {
-    return "...truncated...";
+    return marker.trim();
   }
 
   const headBudget = Math.max(1, Math.floor(budgetWithoutMarker * 0.58));
   const tailBudget = Math.max(1, budgetWithoutMarker - headBudget);
-  const head = body.slice(0, headBudget).trimEnd();
-  const tail = body.slice(-tailBudget).trimStart();
+  const head = trimToolClipHead(body.slice(0, headBudget));
+  const tail = trimToolClipTail(body.slice(-tailBudget));
 
   return `${head}${marker}${tail}`;
+}
+
+function normalizeToolClipMarkers(text: string) {
+  return text.replace(/^\.\.\.truncated\.\.\.$/gim, "... output truncated ...");
+}
+
+function formatToolLineClipMarker(omittedLineCount: number) {
+  return `... ${omittedLineCount} ${omittedLineCount === 1 ? "line" : "lines"} omitted ...`;
+}
+
+function trimToolClipHead(text: string) {
+  const trimmed = text.trimEnd();
+  const lastNewline = trimmed.lastIndexOf("\n");
+
+  if (lastNewline > 0) {
+    return trimmed.slice(0, lastNewline).trimEnd() || trimmed;
+  }
+
+  return trimmed;
+}
+
+function trimToolClipTail(text: string) {
+  const trimmed = text.trimStart();
+  const firstNewline = trimmed.indexOf("\n");
+
+  if (firstNewline >= 0 && firstNewline < trimmed.length - 1) {
+    return trimmed.slice(firstNewline + 1).trimStart() || trimmed;
+  }
+
+  return trimmed;
 }
 
 function hasMeaningfulToolOutput(text: string) {
@@ -1147,6 +1184,11 @@ function deriveTaskHeadline(body: string) {
   }
 
   return firstLine
+    .replace(/\s*·\s*timed out$/i, "")
+    .replace(/\s*·\s*cancelled$/i, "")
+    .replace(/\s*·\s*truncated$/i, "")
+    .replace(/\s*·\s*timed out\s*·\s*truncated$/i, "")
+    .replace(/\s*·\s*cancelled\s*·\s*truncated$/i, "")
     .replace(/\s*·\s*running$/i, "")
     .replace(/\s*·\s*completed$/i, "")
     .replace(/\s*·\s*Shell command completed$/i, "")

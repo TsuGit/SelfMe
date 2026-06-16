@@ -7,7 +7,7 @@ export interface SessionTimelineEntry {
   searchText: string;
 }
 
-const RECENT_CONVERSATION_WINDOW = 6;
+const RECENT_USER_TURN_WINDOW = 3;
 const SUMMARY_ENTRY_WINDOW = 6;
 const RECENT_TOOL_NOTE_WINDOW = 4;
 const MAX_CONTEXT_MESSAGE_CHARS = 1200;
@@ -192,17 +192,17 @@ export function summarizeTimelineEntries(entries: SessionTimelineEntry[]) {
 }
 
 function findRecentBoundaryIndex(entries: SessionTimelineEntry[]) {
-  const conversationIndexes = entries.flatMap((entry, index) =>
-    entry.kind === "user" || entry.kind === "assistant"
+  const userIndexes = entries.flatMap((entry, index) =>
+    entry.kind === "user"
       ? [index]
       : []
   );
 
-  if (conversationIndexes.length <= RECENT_CONVERSATION_WINDOW) {
+  if (userIndexes.length <= RECENT_USER_TURN_WINDOW) {
     return 0;
   }
 
-  return conversationIndexes.at(-RECENT_CONVERSATION_WINDOW) ?? 0;
+  return userIndexes.at(-RECENT_USER_TURN_WINDOW) ?? 0;
 }
 
 function clipForContext(content: string, maxChars: number) {
