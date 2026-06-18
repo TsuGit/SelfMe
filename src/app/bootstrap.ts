@@ -75,6 +75,7 @@ export async function bootstrapApp() {
     panel,
     bus,
     editor,
+    renderer,
     sessionId: session.sessionId
   });
 

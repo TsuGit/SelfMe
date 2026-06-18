@@ -22,10 +22,14 @@ const MAX_RECENT_ASSISTANT_CHARS = 1200;
 
 export function projectSessionTimeline(events: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>) {
   const entries: SessionTimelineEntry[] = [];
+  let assistantEntryOpen = false;
+  let assistantTaskId: string | undefined;
 
   for (const item of events) {
     if (item.type === "user.message.submitted") {
       const content = item.payload.content.trim();
+      assistantEntryOpen = false;
+      assistantTaskId = undefined;
 
       if (!content || content.startsWith("/")) {
         continue;
@@ -42,7 +46,7 @@ export function projectSessionTimeline(events: Awaited<ReturnType<TranscriptStor
     if (item.type === "assistant.delta.received") {
       const last = entries.at(-1);
 
-      if (last?.kind === "assistant") {
+      if (assistantEntryOpen && last?.kind === "assistant" && assistantTaskId === item.taskId) {
         last.text = `${last.text}${item.payload.delta}`;
         last.searchText = normalizeSearchText(last.text);
       } else {
@@ -53,10 +57,20 @@ export function projectSessionTimeline(events: Awaited<ReturnType<TranscriptStor
         });
       }
 
+      assistantEntryOpen = true;
+      assistantTaskId = item.taskId;
+      continue;
+    }
+
+    if (item.type === "assistant.completed") {
+      assistantEntryOpen = false;
+      assistantTaskId = undefined;
       continue;
     }
 
     if (item.type === "tool.execution.completed") {
+      assistantEntryOpen = false;
+      assistantTaskId = undefined;
       const summary = normalizePreviewText(item.payload.summary || `${item.payload.toolName} completed`);
 
       entries.push({
@@ -71,6 +85,8 @@ export function projectSessionTimeline(events: Awaited<ReturnType<TranscriptStor
     }
 
     if (item.type === "runtime.error.raised") {
+      assistantEntryOpen = false;
+      assistantTaskId = undefined;
       entries.push({
         kind: "error",
         text: normalizePreviewText(item.payload.message),

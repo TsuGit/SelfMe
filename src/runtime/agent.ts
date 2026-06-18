@@ -497,11 +497,26 @@ export class AgentRuntime {
         });
 
         if (assistantPass.kind === "message") {
+          const commitVisibleAssistantStage = async () => {
+            if (!assistantPass.messageWasEmitted) {
+              return;
+            }
+
+            const completedEvent = createAssistantCompletedEvent({
+              sessionId,
+              taskId: responseTaskId,
+              model: this.input.session.model
+            });
+            this.input.bus.emit(completedEvent);
+            await this.input.transcriptStore.appendEvent(completedEvent);
+          };
+
           if (
             proposalNarrowingCount === 0
             && shouldForceProposalNarrowing(originalRequest, assistantPass.messageText)
           ) {
             proposalNarrowingCount += 1;
+            await commitVisibleAssistantStage();
             nextPrompt = buildProposalNarrowingPrompt(
               originalRequest,
               assistantPass.messageText,
@@ -514,6 +529,7 @@ export class AgentRuntime {
             !hasAttemptedTool
             && shouldForceInitialTaskStart(originalRequest, assistantPass.messageText)
           ) {
+            await commitVisibleAssistantStage();
             nextPrompt = buildPrematureTaskStartPrompt(
               originalRequest,
               assistantPass.messageText,
@@ -526,6 +542,7 @@ export class AgentRuntime {
             lastToolResult
             && shouldForceTaskContinuation(originalRequest, assistantPass.messageText, lastToolResult)
           ) {
+            await commitVisibleAssistantStage();
             nextPrompt = buildPrematureContinuationPrompt(
               originalRequest,
               assistantPass.messageText,
@@ -539,6 +556,7 @@ export class AgentRuntime {
             lastToolResult
             && shouldForceFailureRecovery(originalRequest, assistantPass.messageText, lastToolResult)
           ) {
+            await commitVisibleAssistantStage();
             nextPrompt = buildFailureRecoveryPrompt(
               originalRequest,
               assistantPass.messageText,
@@ -552,7 +570,22 @@ export class AgentRuntime {
             lastToolResult
             && shouldForceExecutionConvergence(originalRequest, assistantPass.messageText, lastToolResult)
           ) {
+            await commitVisibleAssistantStage();
             nextPrompt = buildExecutionConvergencePrompt(
+              originalRequest,
+              assistantPass.messageText,
+              lastToolResult,
+              preferredLanguage
+            );
+            continue;
+          }
+
+          if (
+            lastToolResult
+            && shouldForceFollowUpReplyTightening(originalRequest, assistantPass.messageText, lastToolResult)
+          ) {
+            await commitVisibleAssistantStage();
+            nextPrompt = buildFollowUpReplyTighteningPrompt(
               originalRequest,
               assistantPass.messageText,
               lastToolResult,
@@ -565,6 +598,7 @@ export class AgentRuntime {
             lastToolResult
             && shouldForceCompletionTightening(originalRequest, assistantPass.messageText, lastToolResult)
           ) {
+            await commitVisibleAssistantStage();
             nextPrompt = buildCompletionTighteningPrompt(
               originalRequest,
               assistantPass.messageText,
@@ -574,7 +608,7 @@ export class AgentRuntime {
             continue;
           }
 
-          if (suppressMessageEmission && assistantPass.messageText.trim().length > 0) {
+          if (!assistantPass.messageWasEmitted && assistantPass.messageText.trim().length > 0) {
             const nextEvent = createAssistantDeltaEvent({
               sessionId,
               taskId: responseTaskId,
@@ -761,6 +795,7 @@ export class AgentRuntime {
 
     let buffer = "";
     let streamedVisible = false;
+    let visibleMessageEmitted = false;
     let pendingPrefix = "";
 
     for await (const chunk of this.input.provider.streamResponse({
@@ -782,6 +817,7 @@ export class AgentRuntime {
         });
         this.input.bus.emit(nextEvent);
         await this.input.transcriptStore.appendEvent(nextEvent);
+        visibleMessageEmitted = true;
         continue;
       }
 
@@ -803,6 +839,7 @@ export class AgentRuntime {
           });
           this.input.bus.emit(nextEvent);
           await this.input.transcriptStore.appendEvent(nextEvent);
+          visibleMessageEmitted = true;
         }
 
         pendingPrefix = "";
@@ -812,7 +849,8 @@ export class AgentRuntime {
     if (streamedVisible) {
       return {
         kind: "message" as const,
-        messageText: buffer
+        messageText: buffer,
+        messageWasEmitted: visibleMessageEmitted
       };
     }
 
@@ -831,11 +869,13 @@ export class AgentRuntime {
         });
         this.input.bus.emit(nextEvent);
         await this.input.transcriptStore.appendEvent(nextEvent);
+        visibleMessageEmitted = true;
       }
 
       return {
         kind: "message" as const,
-        messageText: buffer
+        messageText: buffer,
+        messageWasEmitted: visibleMessageEmitted
       };
     }
 
@@ -1774,6 +1814,46 @@ function buildCompletionTighteningPrompt(
   return lines.join("\n");
 }
 
+function buildFollowUpReplyTighteningPrompt(
+  originalRequest: string,
+  assistantMessage: string,
+  input: {
+    toolName: string;
+    summary: string;
+    rawOutput?: string;
+    errorMessage?: string;
+  },
+  preferredLanguage: PreferredReplyLanguage
+) {
+  const lines = [
+    `Original user request: ${originalRequest}`,
+    "",
+    "Your previous reply was too thin for an approval or continue follow-up.",
+    "Do not start with an acknowledgement like 可以, 已继续, 好的, sure, or okay.",
+    "Give one short direct answer that states the concrete work result and the current outcome.",
+    "Do not ask a broad follow-up question here.",
+    "Do not call more tools unless the latest result still does not actually satisfy the request.",
+    buildPreferredReplyLanguageInstruction(preferredLanguage),
+    "",
+    `Previous assistant message: ${assistantMessage.trim() || "(empty)"}`,
+    `Latest tool: ${input.toolName}`,
+    `Latest summary: ${input.summary}`
+  ];
+
+  const actionHint = buildToolContinuationActionHint(originalRequest, input);
+
+  if (actionHint) {
+    lines.push(`Preferred next action: ${actionHint}`);
+  }
+
+  if (input.rawOutput && input.rawOutput.trim().length > 0) {
+    lines.push("Raw output (already shown to the user):");
+    lines.push(input.rawOutput);
+  }
+
+  return lines.join("\n");
+}
+
 function buildDeniedContinuationPrompt(originalRequest: string, preferredLanguage: PreferredReplyLanguage) {
   return [
     `Original user request: ${originalRequest}`,
@@ -1843,6 +1923,7 @@ function buildAgentSystemPrompt(tools: ToolImplementation[], preferredLanguage: 
     "You are SelfMe, a terminal-first coding agent.",
     "Use tools when they materially help complete the user's request.",
     "For actionable requests such as read, create, edit, fix, inspect, run, or verify, start doing the work instead of replying with a plan or status update.",
+    "When the user message is only an approval or continue follow-up, do not answer with filler acknowledgements like 可以, 好的, sure, or okay; either do the work or report the concrete result directly.",
     "When a tool is required, respond with exactly one tool call block and no prose before or after it.",
     `${TOOL_CALL_OPEN}`,
     '{"tool":"shell","input":{"command":"pwd"}}',
@@ -1984,6 +2065,10 @@ function buildToolContinuationActionHint(originalRequest: string, input: {
     return undefined;
   }
 
+  if (looksLikeProjectInspectionRequest(originalRequest) && looksLikeProjectListingOutput(input.summary, input.rawOutput)) {
+    return "do not stop at a broad question after the listing; pick the most likely project entry from the listing and read that package.json, README, or main source file next";
+  }
+
   if (!looksLikeExactOutputRequest(originalRequest)) {
     return undefined;
   }
@@ -2107,6 +2192,14 @@ function buildToolContinuationClueLines(originalRequest: string, input: {
     clues.push(`Observed output: ${observedOutput}`);
   }
 
+  if (looksLikeProjectInspectionRequest(originalRequest) && looksLikeProjectListingOutput(input.summary, input.rawOutput)) {
+    const projectEntry = extractLikelyProjectEntryFromListing(input.rawOutput);
+
+    if (projectEntry) {
+      clues.push(`Likely project entry: ${projectEntry}`);
+    }
+  }
+
   return dedupePromptLines(clues);
 }
 
@@ -2135,6 +2228,52 @@ function extractObservedShellOutput(rawOutput?: string) {
 
   const joined = lines.join(" | ");
   return joined.length <= 160 ? joined : undefined;
+}
+
+function looksLikeProjectListingOutput(summary: string, rawOutput?: string) {
+  const command = extractShellCommandFromSummary(summary)?.toLowerCase() ?? "";
+  const output = rawOutput ?? "";
+
+  if (!output.trim()) {
+    return false;
+  }
+
+  if (/\b(ls|find|tree)\b/.test(command)) {
+    return true;
+  }
+
+  return /(?:^|\n)(?:package\.json|README\.md|src\/|app\.js|index\.(?:js|ts)|node_modules|docs\/)/m.test(output);
+}
+
+function extractLikelyProjectEntryFromListing(rawOutput?: string) {
+  if (!rawOutput) {
+    return undefined;
+  }
+
+  const lines = rawOutput
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const candidates = [
+    /(?:^|\/)([^/\s]+\/package\.json)$/i,
+    /(?:^|\/)([^/\s]+\/README\.md)$/i,
+    /(?:^|\/)([^/\s]+\/app\.js)$/i,
+    /(?:^|\/)([^/\s]+\/src\/index\.(?:js|ts|tsx))$/i,
+    /(?:^|\/)(package\.json)$/i,
+    /(?:^|\/)(README\.md)$/i,
+    /(?:^|\/)(app\.js)$/i
+  ];
+
+  for (const pattern of candidates) {
+    const match = lines.find((line) => pattern.test(line))?.match(pattern);
+
+    if (match?.[1]) {
+      return match[1];
+    }
+  }
+
+  return undefined;
 }
 
 function extractMissingPath(content: string) {
@@ -2390,6 +2529,8 @@ function resolveRunnableUserRequest(
       return [
         `The user replied "${content.trim()}" and wants to continue the most recent unfinished task.`,
         "Resume that task now instead of treating this as a discussion question.",
+        "Do not start with an acknowledgement like 可以, 可以继续, 好的, sure, or okay.",
+        "Start with the concrete work result, current finding, or the next real action.",
         "Continue from the latest task state already in context.",
         `Original task: ${previousUserTask}`
       ].join("\n");
@@ -2409,6 +2550,8 @@ function resolveRunnableUserRequest(
   return [
     `The user replied "${content.trim()}" to approve the immediately previous proposal.`,
     "Carry out that approved proposal now instead of restating it.",
+    "Do not start with an acknowledgement like 可以, 可以继续, 好的, sure, or okay.",
+    "Start with the concrete work result, current finding, or the next real action.",
     `Approved proposal: ${previousAssistantProposal}`
   ].join("\n");
 }
@@ -2602,7 +2745,33 @@ function shouldForceCompletionTightening(originalRequest: string, assistantMessa
     return !looksLikeProgressOnlyAssistantReply(assistantMessage);
   }
 
-  return !looksLikeCompletionReply(assistantMessage);
+  return !looksLikeCompletionReply(assistantMessage)
+    || looksLikeThinCompletionReply(originalRequest, assistantMessage, latestToolResult);
+}
+
+function shouldForceFollowUpReplyTightening(originalRequest: string, assistantMessage: string, latestToolResult: {
+  toolName: string;
+  summary: string;
+  rawOutput?: string;
+  errorMessage?: string;
+}) {
+  if (!isSyntheticFollowUpRequest(originalRequest)) {
+    return false;
+  }
+
+  if (looksLikeBlockingQuestion(assistantMessage)) {
+    return true;
+  }
+
+  if (looksLikeLowValueAcknowledgementPrefix(assistantMessage)) {
+    return true;
+  }
+
+  if (looksLikeThinCompletionReply(originalRequest, assistantMessage, latestToolResult)) {
+    return true;
+  }
+
+  return false;
 }
 
 function shouldForceInitialTaskStart(originalRequest: string, assistantMessage: string) {
@@ -2868,6 +3037,14 @@ function looksLikeDiscussionRequest(content: string) {
   return /(讨论|聊聊|为什么|架构|取舍|方案|计划|策略|先讨论)/u.test(content);
 }
 
+function looksLikeProjectInspectionRequest(content: string) {
+  const taskContent = extractEmbeddedTaskContent(content);
+
+  return /\b(look at|inspect|review|check|explore)\s+(the\s+)?(project|repo|repository|codebase)\b/i.test(taskContent)
+    || /(看看|检查|看下|瞅瞅).*(项目|仓库|代码)/u.test(taskContent)
+    || /(项目|仓库|代码).*(看看|检查|看下|瞅瞅)/u.test(taskContent);
+}
+
 function extractEmbeddedTaskContent(content: string) {
   const approvedProposalMatch = content.match(/\bApproved proposal:\s*([\s\S]+)$/i);
 
@@ -2941,6 +3118,53 @@ function looksLikeCompletionReply(content: string) {
 
   return /\b(done|completed|finished|verified|confirmed|exactly|updated|fixed|created)\b/i.test(normalized)
     || /(完成|已修复|已创建|已验证|已经|精确|确认|已更新)/u.test(normalized);
+}
+
+function looksLikeThinCompletionReply(
+  originalRequest: string,
+  content: string,
+  latestToolResult: {
+    toolName: string;
+    summary: string;
+    rawOutput?: string;
+    errorMessage?: string;
+  }
+) {
+  const normalized = content.trim();
+
+  if (!normalized) {
+    return true;
+  }
+
+  if (looksLikeLowValueAcknowledgementPrefix(normalized)) {
+    return true;
+  }
+
+  if (isSyntheticFollowUpRequest(originalRequest) && normalized.length < 90) {
+    return true;
+  }
+
+  if (normalized.length >= 60) {
+    return false;
+  }
+
+  const anchors = [
+    extractPathFromToolSummary(latestToolResult.summary),
+    extractExpectedExactOutput(originalRequest),
+    extractObservedShellOutput(latestToolResult.rawOutput),
+    extractShellCommandFromSummary(latestToolResult.summary)
+  ].filter(Boolean) as string[];
+
+  const hasAnchor = anchors.some((anchor) => normalized.toLowerCase().includes(anchor.toLowerCase()));
+  return !hasAnchor;
+}
+
+function isSyntheticFollowUpRequest(content: string) {
+  return /^The user replied ".+" (?:and wants to continue the most recent unfinished task\.|to approve the immediately previous proposal\.)/i.test(content.trim());
+}
+
+function looksLikeLowValueAcknowledgementPrefix(content: string) {
+  return /^(?:可以继续吗|可以继续|可以|已继续|继续了|好的|好|行|没问题|sure|okay|ok)\b[\s,，。!！:：-]*/iu.test(content.trim());
 }
 
 function looksLikeBroadProposalReply(content: string) {

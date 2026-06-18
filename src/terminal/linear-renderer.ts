@@ -63,6 +63,18 @@ export class LinearTerminalRenderer {
       body: renderWelcomeLines(this.input.session).join("\n")
     });
 
+    this.input.bus.on("runtime.busy.changed", (event) => {
+      if (event.payload.active) {
+        return;
+      }
+
+      if (!this.clearLiveRuntimeState()) {
+        return;
+      }
+
+      this.renderBottomArea();
+    });
+
     this.input.bus.on("editor.state.changed", (event) => {
       this.state.editorValue = String(event.payload.value ?? "");
       this.state.editorCursor = Number(event.payload.cursor ?? 0);
@@ -240,13 +252,15 @@ export class LinearTerminalRenderer {
     });
 
     this.input.bus.on("approval.resolved", (event) => {
+      const resolvedApproval = this.state.approvals.find((entry) => entry.approvalId === event.payload.approvalId);
       this.state.approvals = this.state.approvals.filter((entry) => entry.approvalId !== event.payload.approvalId);
       this.appendHistoryBlock({
         kind: "approval",
         title: "Approval",
         taskId: event.taskId,
         approvalId: event.payload.approvalId,
-        body: createApprovalResolvedMessage(event.payload.approvalId, event.payload.approved)
+        approvalContext: resolvedApproval?.approvalContext,
+        body: createApprovalResolvedMessage(resolvedApproval, event.payload.approved)
       }, false);
       this.renderBottomArea();
     });
@@ -335,6 +349,13 @@ export class LinearTerminalRenderer {
     process.stdout.on("resize", this.handleResize);
 
     this.renderBottomArea();
+  }
+
+  hasInterruptibleVisualState() {
+    return this.state.approvals.length > 0
+      || this.state.liveTool !== undefined
+      || this.state.liveAssistant !== undefined
+      || this.state.workingTaskId !== undefined;
   }
 
   private appendHistoryBlock(message: TerminalMessageBlock, renderBottom = true) {
@@ -463,6 +484,21 @@ export class LinearTerminalRenderer {
 
     clearInterval(this.workingTimer);
     this.workingTimer = undefined;
+  }
+
+  private clearLiveRuntimeState() {
+    const hadLiveState = this.hasInterruptibleVisualState();
+
+    if (!hadLiveState) {
+      return false;
+    }
+
+    this.stopWorkingAnimation();
+    this.state.approvals = [];
+    this.state.liveTool = undefined;
+    this.state.liveAssistant = undefined;
+    this.state.workingTaskId = undefined;
+    return true;
   }
 
   private renderWorkingLabel() {
@@ -1211,8 +1247,15 @@ function renderToolTargetLine(toolName: string, input?: unknown) {
   return "";
 }
 
-function createApprovalResolvedMessage(_approvalId: string, approved: boolean) {
-  return `Approval · ${approved ? "Approved" : "Denied"}`;
+function createApprovalResolvedMessage(message: TerminalMessageBlock | undefined, approved: boolean) {
+  const headline = `Approval · ${approved ? "Approved" : "Denied"}`;
+  const reason = message?.approvalContext?.reason?.trim();
+
+  if (!reason) {
+    return headline;
+  }
+
+  return `${headline}\n${reason}`;
 }
 
 function createTaskErrorMessage(previousBody: string | undefined, message: string) {
@@ -1369,8 +1412,16 @@ function shouldTightGroup(previous: TerminalMessageBlock | undefined, next: Term
     return false;
   }
 
+  if (previous.kind === "approval" || next.kind === "approval") {
+    return false;
+  }
+
   if (previous.kind === "user") {
     return isTaskFlowKind(next.kind);
+  }
+
+  if (previous.kind === "assistant" || next.kind === "assistant") {
+    return false;
   }
 
   return isTaskFlowKind(previous.kind) && isTaskFlowKind(next.kind);

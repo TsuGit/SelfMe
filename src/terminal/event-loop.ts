@@ -13,6 +13,7 @@ import {
 } from "../runtime/events.js";
 import type { TerminalPanelController } from "./panel-controller.js";
 import { parseTerminalInput } from "./input-parser.js";
+import type { LinearTerminalRenderer } from "./linear-renderer.js";
 
 export class TerminalEventLoop {
   private isBusy = false;
@@ -22,6 +23,7 @@ export class TerminalEventLoop {
       bus: EventBus;
       editor: EditorController;
       panel: TerminalPanelController;
+      renderer?: LinearTerminalRenderer;
       sessionId?: string;
     }
   ) {}
@@ -44,7 +46,7 @@ export class TerminalEventLoop {
         const approvalPanelOpen = panelState.mode === "approval";
 
         if (event.type === "quit") {
-          if (this.isBusy) {
+          if (this.hasInterruptibleTask()) {
             this.input.bus.emit(createRuntimeInterruptRequestedEvent({
               sessionId: this.input.sessionId ?? "local-session",
               reason: "quit"
@@ -118,7 +120,7 @@ export class TerminalEventLoop {
             continue;
           }
 
-          if (this.isBusy) {
+          if (this.hasInterruptibleTask()) {
             this.input.bus.emit(createSystemMessageAppendedEvent({
               sessionId: this.input.sessionId ?? "local-session",
               title: "Busy",
@@ -151,7 +153,7 @@ export class TerminalEventLoop {
             continue;
           }
 
-          if (this.isBusy) {
+          if (this.hasInterruptibleTask()) {
             this.input.bus.emit(createRuntimeInterruptRequestedEvent({
               sessionId: this.input.sessionId ?? "local-session",
               reason: "cancel"
@@ -260,6 +262,10 @@ export class TerminalEventLoop {
     this.input.bus.emit(createTerminalUiStateChangedEvent({
       sessionId: this.input.sessionId ?? "local-session"
     }));
+  }
+
+  private hasInterruptibleTask() {
+    return this.isBusy || this.input.renderer?.hasInterruptibleVisualState() === true;
   }
 }
 

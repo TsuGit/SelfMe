@@ -222,7 +222,7 @@
           </article>
           <article class="card">
             <h3>Approvals</h3>
-            <p>shell、write、edit 已接入风险分级审批；低风险 shell 可直通，高风险 shell 仍需审批，write / edit 已具备任务级续批边界，拒绝后也能稳定回到自然收口。</p>
+            <p>shell、write、edit 已接入风险分级审批；低风险 shell 可直通，高风险 shell 仍需审批，write / edit 已具备任务级续批边界；审批等待留在底部面板，审批结果会作为独立消息块落历史，不再和普通任务流紧贴混排。</p>
           </article>
           <article class="card">
             <h3>Storage</h3>
@@ -230,11 +230,15 @@
           </article>
           <article class="card">
             <h3>Runtime Control</h3>
-            <p>已具备单活跃任务模型、忙时拦截新消息、<code>Esc</code> / <code>Ctrl+C</code> / <code>/stop</code> 中断当前任务，以及 provider / shell abort 贯通；同时对可执行请求加入了 action-first 约束，并能把简短确认词解析为“执行上一条已获批准的提议”。</p>
+            <p>已具备单活跃任务模型、忙时拦截新消息、<code>Esc</code> / <code>Ctrl+C</code> / <code>/stop</code> 中断当前任务，以及 provider / shell abort 贯通；同时对可执行请求加入了 action-first 约束，并能把简短确认词解析为“执行上一条已获批准的提议”或“继续最近未完成任务”。</p>
           </article>
           <article class="card">
             <h3>Turn Feedback</h3>
-            <p>已接入整轮级 <code>Working</code> 计时、停止提示和结束收口线，快速完成的轮次只保留弱分隔，不强行展示耗时；同时 runtime 会对 plan-only、progress-only、affirmative follow-up、resume follow-up 和 repeated-result 空转做自动拉回。</p>
+            <p>已接入整轮级 <code>Working</code> 计时、停止提示和结束收口线，快速完成的轮次只保留弱分隔，不强行展示耗时；阶段性 assistant 总结会先落历史再继续干活，不再被后续 <code>Working</code> 覆盖；同时 runtime 会对 plan-only、progress-only、affirmative follow-up、resume follow-up、过薄 follow-up 收尾和 repeated-result 空转做自动拉回。</p>
+          </article>
+          <article class="card">
+            <h3>Project Inspection</h3>
+            <p>像“看看项目”这类请求，agent 现在会在目录 listing 之后优先继续读取最像项目入口的 <code>package.json</code>、<code>README</code> 或主源文件，而不是停在泛泛追问。</p>
           </article>
         </div>
       </section>
@@ -257,19 +261,19 @@
         <ol>
           <li>
             <strong>回到真实任务完成率</strong>
-            <p>当前不再机械扩 smoke 样本；后续只围绕真实跑出来的问题补回归，例如首轮探索走散、简单失败恢复过长、proposal follow-up 和 resume follow-up 这类 runtime 收敛问题。</p>
+            <p>当前不再机械扩 smoke 样本；后续只围绕真实跑出来的问题补回归，例如真实终端里的连续执行停顿、恢复链过长、目录勘查后重复探索、以及收尾语义不稳这类 runtime 收敛问题。</p>
           </li>
           <li>
             <strong>首轮动作更直接</strong>
-            <p>像“看看项目”“帮我优化下”这类请求，首轮应该更快锁定目标文件和真正的工作对象，减少无价值探索和把“下一步建议”再抛回给用户。</p>
+            <p>像“看看项目”“帮我优化下”这类请求，首轮应该更快锁定目标文件和真正的工作对象；这一层已经不再满足于只列项目候选，下一步要继续减少无价值探索和重复 listing。</p>
           </li>
           <li>
-            <strong>简单失败恢复更短</strong>
-            <p>重点继续压 edit 越界、轻量 shell 失败、文件范围误判这类低级失败，让 agent 在同一轮里更短路径修正，而不是白白消耗工具步数预算。</p>
+            <strong>多步连续执行更自然</strong>
+            <p>下一阶段重点不再是单点回复样式，而是让 agent 在同一任务里更自然地连续做 2 到 4 步：读、判、改、验之间少停顿，减少“一步一停、一步一答”的割裂感。</p>
           </li>
           <li>
             <strong>CLI 本体继续打磨</strong>
-            <p>下一阶段继续回到输入体验、消息结构、命令面、runtime 行为和真实工作流本身；命令系统仍维持最小集，但要继续保证 <code>/stop</code>、审批、帮助、命令补全这些入口稳定可用。</p>
+            <p>输入体验和消息结构当前已经够用，下一阶段继续聚焦 runtime 行为、审批策略和真实工作流本身；命令系统仍维持最小集，但要继续保证 <code>/stop</code>、审批、帮助、命令补全这些入口稳定可用。</p>
           </li>
         </ol>
       </section>
@@ -308,7 +312,7 @@
           </article>
           <article class="card">
             <h3>M4</h3>
-            <p>已接入首批真实 coding task 回归，覆盖成功路径、多步修正、更长链路任务、跨文件协同、嵌套目录与相对导入修复、读取配置后创建 helper 再修现有导入链、单配置源驱动两个已有文件的同步修复、读取配置后创建 shared helper 再修 nested api 入口、读取配置后创建模板文件再修 nested docs 入口、读取配置后创建数据文件再修 nested report 入口、读取配置后先得到成功但不精确的 nested docs 输出再继续收口、先读多个已有文件再对真正问题文件做定向二读和收口、先读多个已有文件再只修真正有问题的 helper 避免过修、长链 coding task 可用扩展预算继续推进、plan-only / progress-only 回复会被拉回继续执行、重复得到相同工具结果时会被强制换动作、中文长链、成功但结果不精确时的继续收口、基于两个已有文件修第三个已有文件、长输出截断后的定向跟进、直接 shell 失败、直接 shell 成功、审批拒绝、wrapped / repaired tool call 解析，以及同任务内读取后发现的 helper 文件续批；这一层基线已经足够支撑下一阶段功能开发。</p>
+            <p>已接入首批真实 coding task 回归，覆盖成功路径、多步修正、更长链路任务、跨文件协同、嵌套目录与相对导入修复、读取配置后创建 helper 再修现有导入链、单配置源驱动两个已有文件的同步修复、读取配置后创建 shared helper 再修 nested api 入口、读取配置后创建模板文件再修 nested docs 入口、读取配置后创建数据文件再修 nested report 入口、读取配置后先得到成功但不精确的 nested docs 输出再继续收口、先读多个已有文件再对真正问题文件做定向二读和收口、先读多个已有文件再只修真正有问题的 helper 避免过修、长链 coding task 可用扩展预算继续推进、plan-only / progress-only 回复会被拉回继续执行、阶段性 assistant 回复会先落历史再继续执行、过薄 follow-up / completion 回复会被强制收紧、重复得到相同工具结果时会被强制换动作、项目勘查后会继续读取更具体的项目入口、中文长链、成功但结果不精确时的继续收口、基于两个已有文件修第三个已有文件、长输出截断后的定向跟进、直接 shell 失败、直接 shell 成功、审批拒绝、wrapped / repaired tool call 解析，以及同任务内读取后发现的 helper 文件续批；这一层基线已经足够支撑下一阶段功能开发。</p>
           </article>
         </div>
       </section>
@@ -330,7 +334,7 @@
         <h2>当前建议的直接开工项</h2>
         <p>
           下一步直接做 <strong>CLI 产品能力开发</strong>。基础自动工具调用、风险分级审批、任务级续批、中断控制、整轮状态反馈、长输出收口、真实任务回归和上下文裁剪已经成立，
-          现在应该继续围绕真实任务完成率推进：优先收首轮动作选择、简单失败恢复链和多步任务连续执行感，而不是再做机械性的测试扩面。
+          现在应该继续围绕真实任务完成率推进：优先收真实交互回归、多步任务连续执行感和审批策略，而不是再做机械性的测试扩面或重新折腾 UI 壳层。
         </p>
       </section>
 

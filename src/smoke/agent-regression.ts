@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { EventBus } from "../app/event-bus.js";
+import { EditorController } from "../editor/composer.js";
 import type { ProviderClient, ProviderStreamChunk, ProviderStreamInput } from "../providers/base.js";
 import { AgentRuntime } from "../runtime/agent.js";
 import { getIncompleteSlashCommandNotice, parseToolCommand } from "../runtime/commands.js";
@@ -20,6 +21,8 @@ import {
 } from "../runtime/events.js";
 import { LogStore } from "../storage/logs.js";
 import { TranscriptStore } from "../storage/transcripts.js";
+import { TerminalEventLoop } from "../terminal/event-loop.js";
+import { TerminalPanelController } from "../terminal/panel-controller.js";
 import { InMemoryToolRegistry } from "../tools/registry.js";
 import type { RuntimeEvent, TaskStateChangedEvent } from "../types/events.js";
 
@@ -317,6 +320,7 @@ async function main() {
   const approvedTodoAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
   assert.match(approvedTodoAppContent, /process\.env\.PORT/);
   assert.match(approvedProposalResult.assistantText, /node-todo\/app\.js/);
+  assert.doesNotMatch(approvedProposalResult.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
   assert.ok(
     approvedProposalResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-6")),
     "expected approved follow-up to read the proposed file"
@@ -407,6 +411,10 @@ async function main() {
   const startupReportContent = await readFile(join(workspace, "startup-report.mjs"), "utf8");
   assert.match(startupReportContent, /app\.config\.json/);
   assert.match(initialPlanOnlyResult.assistantText, /SelfMe:3000/);
+  assert.deepEqual(initialPlanOnlyResult.assistantTurns, [
+    "I will inspect the config first, then create and verify the script.",
+    "Created startup-report.mjs and verified it prints exactly SelfMe:3000."
+  ]);
   assert.ok(
     initialPlanOnlyResult.toolSummaries.some((summary) => summary.startsWith("app.config.json:1-4")),
     "expected startup config read after initial plan-only reply"
@@ -431,6 +439,10 @@ async function main() {
   const delayedReportContent = await readFile(join(workspace, "delayed-report.mjs"), "utf8");
   assert.match(delayedReportContent, /app\.config\.json/);
   assert.match(delayedContinuationResult.assistantText, /SelfMe:3000/);
+  assert.deepEqual(delayedContinuationResult.assistantTurns, [
+    "I found the config. Next I will create the script and verify it.",
+    "Created delayed-report.mjs and verified it prints exactly SelfMe:3000."
+  ]);
   assert.ok(
     delayedContinuationResult.toolSummaries.some((summary) => summary.startsWith("app.config.json:1-4")),
     "expected config read before delayed report creation"
@@ -521,6 +533,24 @@ async function main() {
       || summary.startsWith("converge-report.mjs:1-3 · updated")
     ),
     "expected repair edit after explanation-only assistant reply"
+  );
+
+  console.log("task: continue project inspection after directory listing");
+  const projectInspectionResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "看看项目"
+  });
+
+  assert.match(projectInspectionResult.assistantText, /node-todo/i);
+  assert.ok(
+    projectInspectionResult.toolSummaries.some((summary) => summary.startsWith("pwd && ls -la && find . -maxdepth 2 -type f")),
+    "expected initial workspace listing"
+  );
+  assert.ok(
+    projectInspectionResult.toolSummaries.some((summary) => summary.startsWith("node-todo/package.json:1-13")),
+    "expected project inspection to continue into a concrete project entry"
   );
 
   console.log("task: continue after a completion-sounding reply before verification");
@@ -1422,11 +1452,13 @@ async function main() {
 
   await verifyHelpCommandAvailableWhileBusy();
   await verifyResumeFollowUpAfterStop();
+  verifyInterruptFallbackWhenWorkingUiLingers();
   console.log("task: verify context compaction");
   verifyContextCompaction();
   verifyContextCompactionSwitchesMainTask();
   verifyContextCompactionPrefersLatestVerificationCommand();
   verifyContextCompactionExtractsQuotedTargetOutput();
+  verifyContextCompactionPreservesAssistantStageBoundaries();
   verifyContextCompactionKeepsWholeTurns();
   verifyToolSummaryFormatting();
   verifyIncompleteSlashCommandHandling();
@@ -1455,6 +1487,7 @@ async function runAgentTask(input: {
   const task = await completedTask;
   const events = (await input.transcriptStore.readEventsBySession(input.sessionId)).slice(beforeEvents.length);
   const assistantText = collectAssistantText(events, task.taskId ?? "");
+  const assistantTurns = collectAssistantTurns(events, task.taskId ?? "");
   const toolSummaries = events
     .filter((event): event is Extract<RuntimeEvent, { type: "tool.execution.completed" }> =>
       event.type === "tool.execution.completed" && event.taskId !== task.taskId
@@ -1475,6 +1508,7 @@ async function runAgentTask(input: {
   return {
     taskId: task.taskId ?? "",
     assistantText,
+    assistantTurns,
     toolSummaries,
     runtimeErrors
   };
@@ -1659,10 +1693,59 @@ async function verifyResumeFollowUpAfterStop() {
   const resumedContent = await readFile(join(workspace, "resume.txt"), "utf8");
   assert.equal(resumedContent, "keep-going\n");
   assert.match(resumedResult.assistantText, /continued the interrupted task/i);
+  assert.doesNotMatch(resumedResult.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
   assert.ok(
     resumedResult.toolSummaries.some((summary) => summary.startsWith("resume.txt · created")),
     "resume follow-up should continue the stopped task instead of only answering the question"
   );
+}
+
+function verifyInterruptFallbackWhenWorkingUiLingers() {
+  const bus = new EventBus();
+  const editor = new EditorController();
+  const panel = new TerminalPanelController();
+  const sessionId = "terminal-interrupt-fallback";
+  const interruptReasons: string[] = [];
+  const originalExit = process.exit;
+  const existingDataListeners = process.stdin.listeners("data") as Array<(...args: any[]) => void>;
+
+  const terminal = new TerminalEventLoop({
+    bus,
+    editor,
+    panel,
+    renderer: {
+      hasInterruptibleVisualState: () => true
+    } as never,
+    sessionId
+  });
+
+  bus.on("runtime.interrupt.requested", (event) => {
+    if (event.sessionId === sessionId) {
+      interruptReasons.push(event.payload.reason);
+    }
+  });
+
+  (process as typeof process & {
+    exit: (code?: number) => never;
+  }).exit = ((code?: number) => {
+    throw new Error(`process.exit(${code ?? 0}) should not be called while interruptible UI is still visible`);
+  }) as typeof process.exit;
+
+  try {
+    terminal.start();
+    process.stdin.emit("data", "\u001b");
+    process.stdin.emit("data", "\u0003");
+
+    assert.deepEqual(interruptReasons, ["cancel", "quit"]);
+  } finally {
+    process.exit = originalExit;
+
+    for (const listener of process.stdin.listeners("data") as Array<(...args: any[]) => void>) {
+      if (!existingDataListeners.includes(listener)) {
+        process.stdin.off("data", listener);
+      }
+    }
+  }
 }
 
 function waitForAssistantTaskCompletion(bus: EventBus, sessionId: string) {
@@ -1734,6 +1817,35 @@ function collectAssistantText(events: RuntimeEvent[], taskId: string) {
     )
     .map((event) => event.payload.delta)
     .join("");
+}
+
+function collectAssistantTurns(events: RuntimeEvent[], taskId: string) {
+  const turns: string[] = [];
+  let current = "";
+
+  for (const event of events) {
+    if (event.taskId !== taskId) {
+      continue;
+    }
+
+    if (event.type === "assistant.delta.received") {
+      current += event.payload.delta;
+      continue;
+    }
+
+    if (event.type === "assistant.completed") {
+      if (current.trim().length > 0) {
+        turns.push(current);
+        current = "";
+      }
+    }
+  }
+
+  if (current.trim().length > 0) {
+    turns.push(current);
+  }
+
+  return turns;
 }
 
 function verifyToolSummaryFormatting() {
@@ -2033,6 +2145,51 @@ function verifyContextCompactionExtractsQuotedTargetOutput() {
   assert.match(recentTaskStateMessage, /Last observed output: Scoped/);
 }
 
+function verifyContextCompactionPreservesAssistantStageBoundaries() {
+  const sessionId = "compaction-assistant-stages";
+  const events: RuntimeEvent[] = [];
+
+  events.push(createUserMessageSubmittedEvent({
+    sessionId,
+    content: "Fix the startup script and keep working until it is correct."
+  }));
+  events.push(createAssistantDeltaEvent({
+    sessionId,
+    taskId: "stage-turn",
+    delta: "I will inspect the config first."
+  }));
+  events.push(createAssistantCompletedEvent({
+    sessionId,
+    taskId: "stage-turn",
+    model: "regression-stub"
+  }));
+  events.push(createToolExecutionCompletedEvent({
+    sessionId,
+    taskId: "stage-tool",
+    toolName: "files",
+    summary: "app.config.json:1-4",
+    rawOutput: '{ "name": "SelfMe", "port": 3000 }'
+  }));
+  events.push(createAssistantDeltaEvent({
+    sessionId,
+    taskId: "stage-turn",
+    delta: "I found the issue and verified the final output."
+  }));
+  events.push(createAssistantCompletedEvent({
+    sessionId,
+    taskId: "stage-turn",
+    model: "regression-stub"
+  }));
+
+  const messages = buildContextMessages(events);
+  const recentAssistants = messages.filter((message) => message.role === "assistant").map((message) => message.content);
+
+  assert.deepEqual(recentAssistants, [
+    "I will inspect the config first.",
+    "I found the issue and verified the final output."
+  ]);
+}
+
 function verifyContextCompactionKeepsWholeTurns() {
   const sessionId = "compaction-pending-session";
   const events: RuntimeEvent[] = [];
@@ -2233,6 +2390,12 @@ function resolveProviderResponse(content: string) {
       path: "node-todo/app.js",
       startLine: 1,
       endLine: 20
+    });
+  }
+
+  if (content === "看看项目") {
+    return toolCall("shell", {
+      command: "pwd && ls -la && find . -maxdepth 2 -type f | sed 's#^./##' | sort | head -200"
     });
   }
 
@@ -2593,8 +2756,8 @@ function resolveProviderResponse(content: string) {
   }
 
   if (/^Original user request: The user replied ".+" to approve the immediately previous proposal\./.test(content)) {
-    const toolName = extractLine(content, "Tool:");
-    const summary = extractLine(content, "Summary:") ?? "";
+    const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
+    const summary = extractLine(content, "Summary:") ?? extractLine(content, "Latest summary:") ?? "";
 
     if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
       return toolCall("edit", {
@@ -2606,7 +2769,11 @@ function resolveProviderResponse(content: string) {
     }
 
     if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
-      return "I updated node-todo/app.js and improved the port configuration in the approved next step.";
+      if (/Your previous reply was too thin for an approval or continue follow-up\./.test(content)) {
+        return "I updated node-todo/app.js and improved the port configuration in the approved next step.";
+      }
+
+      return "已继续，node-todo/app.js 已更新。";
     }
   }
 
@@ -3000,6 +3167,24 @@ function resolveProviderResponse(content: string) {
           'console.log(`${config.name}:${config.port}`);'
         ].join("\n")
       });
+    }
+  }
+
+  if (content.startsWith("Original user request: 看看项目")) {
+    const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
+    const summary = extractLine(content, "Summary:") ?? extractLine(content, "Latest summary:") ?? "";
+
+    if (toolName === "shell") {
+      assert.match(content, /Likely project entry: node-todo\/package\.json/);
+      return toolCall("files", {
+        path: "node-todo/package.json",
+        startLine: 1,
+        endLine: 20
+      });
+    }
+
+    if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+      return "我先看了工作区列表，然后继续读了 node-todo/package.json；当前最像可继续分析的项目是 node-todo。";
     }
   }
 
