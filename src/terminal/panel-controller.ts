@@ -19,6 +19,7 @@ export interface TerminalPanelState {
   title?: string;
   subtitle?: string;
   description?: string;
+  confirmLabel?: string;
   query?: string;
   options: TerminalPanelOption[];
   selectedIndex: number;
@@ -75,7 +76,7 @@ export class TerminalPanelController {
       }
     }
 
-    const commandPanel = buildCommandPanel(editorValue);
+    const commandPanel = buildCommandPanel(editorValue, this.selectedCommandKey);
 
     if (!commandPanel) {
       this.selectedCommandKey = undefined;
@@ -93,7 +94,7 @@ export class TerminalPanelController {
   }
 
   getState(editorValue: string): TerminalPanelState {
-    const commandPanel = buildCommandPanel(editorValue);
+    const commandPanel = buildCommandPanel(editorValue, this.selectedCommandKey);
 
     if (commandPanel && this.suppressedCommandValue !== editorValue) {
       return {
@@ -114,6 +115,7 @@ export class TerminalPanelController {
         title: "Approval Required",
         subtitle: current?.toolName,
         description: descriptionLines.join("\n"),
+        confirmLabel: current?.label.toLowerCase(),
         options: this.approvals.map((item) => ({
           key: item.key,
           label: item.label,
@@ -262,14 +264,15 @@ export class TerminalPanelController {
   }
 }
 
-function buildCommandPanel(editorValue: string): TerminalPanelState | undefined {
+function buildCommandPanel(editorValue: string, selectedKey?: string): TerminalPanelState | undefined {
   const query = deriveSlashQuery(editorValue);
 
   if (query === undefined) {
     return undefined;
   }
 
-  const options = filterCommandItems(query).map((item) => ({
+  const items = filterCommandItems(query);
+  const options = items.map((item) => ({
     key: item.key,
     label: item.display,
     detail: item.summary,
@@ -280,13 +283,22 @@ function buildCommandPanel(editorValue: string): TerminalPanelState | undefined 
     return undefined;
   }
 
+  const selectedIndex = getSelectedIndex(options, selectedKey);
+  const selectedItem = items[selectedIndex] ?? items[0];
+  const descriptionLines = [
+    selectedItem?.usage ? `Usage · ${selectedItem.usage}` : undefined,
+    selectedItem?.hint
+  ].filter(Boolean);
+
   return {
     mode: "command",
     title: "Commands",
-    subtitle: "Enter to run or insert",
+    subtitle: undefined,
+    description: descriptionLines.join("\n"),
+    confirmLabel: selectedItem?.requiresInput ? "insert" : "run",
     query,
     options,
-    selectedIndex: 0
+    selectedIndex
   };
 }
 

@@ -2,8 +2,10 @@ import { randomUUID } from "node:crypto";
 
 import type { EventBus } from "../app/event-bus.js";
 import type { EditorController } from "../editor/composer.js";
+import { getIncompleteSlashCommandNotice } from "../runtime/commands.js";
 import {
   createMessageViewportChangedEvent,
+  createRuntimeErrorRaisedEvent,
   createRuntimeInterruptRequestedEvent,
   createSystemMessageAppendedEvent,
   createTerminalCommandInvokedEvent,
@@ -37,6 +39,10 @@ export class TerminalEventLoop {
     process.stdin.resume();
     process.stdin.on("data", (chunk) => {
       for (const event of parseTerminalInput(chunk)) {
+        const currentValue = this.input.editor.getState().value;
+        const panelState = this.input.panel.getState(currentValue);
+        const approvalPanelOpen = panelState.mode === "approval";
+
         if (event.type === "quit") {
           if (this.isBusy) {
             this.input.bus.emit(createRuntimeInterruptRequestedEvent({
@@ -51,7 +57,7 @@ export class TerminalEventLoop {
         }
 
         if (event.type === "newline") {
-          if (this.input.panel.hasOpenPanel(this.input.editor.getState().value)) {
+          if (approvalPanelOpen || panelState.mode === "command") {
             continue;
           }
 
@@ -61,7 +67,6 @@ export class TerminalEventLoop {
         }
 
         if (event.type === "submit") {
-          const currentValue = this.input.editor.getState().value;
           const commandInsertion = this.input.panel.getCommandInsertion(currentValue);
 
           if (commandInsertion && commandInsertion !== currentValue) {
@@ -71,8 +76,6 @@ export class TerminalEventLoop {
             this.emitUiState();
             continue;
           }
-
-          const panelState = this.input.panel.getState(currentValue);
 
           if (this.input.panel.submit(this.input.bus, this.input.sessionId ?? "local-session", currentValue)) {
             if (panelState.mode === "command") {
@@ -84,7 +87,17 @@ export class TerminalEventLoop {
             continue;
           }
 
-          if (isSlashCommand(currentValue)) {
+          if (looksLikeSlashCommand(currentValue)) {
+            const incompleteNotice = getIncompleteSlashCommandNotice(currentValue);
+
+            if (incompleteNotice) {
+              this.input.bus.emit(createRuntimeErrorRaisedEvent({
+                sessionId: this.input.sessionId ?? "local-session",
+                message: incompleteNotice.message
+              }));
+              continue;
+            }
+
             const panel = this.input.panel.getState(currentValue);
 
             if (
@@ -97,7 +110,7 @@ export class TerminalEventLoop {
 
             this.input.bus.emit(createTerminalCommandInvokedEvent({
               sessionId: this.input.sessionId ?? "local-session",
-              content: currentValue.trim()
+              content: currentValue
             }));
             this.input.editor.setValue("");
             this.emitEditorState();
@@ -119,22 +132,20 @@ export class TerminalEventLoop {
         }
 
         if (event.type === "action-next") {
-          if (this.input.panel.focusNext(this.input.editor.getState().value)) {
+          if (this.input.panel.focusNext(currentValue)) {
             this.emitUiState();
             continue;
           }
         }
 
         if (event.type === "action-prev") {
-          if (this.input.panel.focusPrevious(this.input.editor.getState().value)) {
+          if (this.input.panel.focusPrevious(currentValue)) {
             this.emitUiState();
             continue;
           }
         }
 
         if (event.type === "action-cancel") {
-          const currentValue = this.input.editor.getState().value;
-
           if (this.input.panel.clear(currentValue)) {
             this.emitUiState();
             continue;
@@ -159,13 +170,17 @@ export class TerminalEventLoop {
         }
 
         if (event.type === "backspace") {
+          if (approvalPanelOpen) {
+            continue;
+          }
+
           this.input.editor.handleBackspace();
           this.emitEditorState();
           continue;
         }
 
         if (event.type === "move-left") {
-          if (this.input.panel.hasOpenPanel(this.input.editor.getState().value)) {
+          if (approvalPanelOpen || panelState.mode === "command") {
             continue;
           }
 
@@ -175,7 +190,7 @@ export class TerminalEventLoop {
         }
 
         if (event.type === "move-right") {
-          if (this.input.panel.hasOpenPanel(this.input.editor.getState().value)) {
+          if (approvalPanelOpen || panelState.mode === "command") {
             continue;
           }
 
@@ -185,8 +200,8 @@ export class TerminalEventLoop {
         }
 
         if (event.type === "move-up") {
-          if (this.input.panel.hasOpenPanel(this.input.editor.getState().value)) {
-            if (this.input.panel.focusPrevious(this.input.editor.getState().value)) {
+          if (panelState.mode === "approval" || panelState.mode === "command") {
+            if (this.input.panel.focusPrevious(currentValue)) {
               this.emitUiState();
             }
             continue;
@@ -198,8 +213,8 @@ export class TerminalEventLoop {
         }
 
         if (event.type === "move-down") {
-          if (this.input.panel.hasOpenPanel(this.input.editor.getState().value)) {
-            if (this.input.panel.focusNext(this.input.editor.getState().value)) {
+          if (panelState.mode === "approval" || panelState.mode === "command") {
+            if (this.input.panel.focusNext(currentValue)) {
               this.emitUiState();
             }
             continue;
@@ -211,6 +226,10 @@ export class TerminalEventLoop {
         }
 
         if (event.type === "text") {
+          if (approvalPanelOpen) {
+            continue;
+          }
+
           this.input.editor.handlePrintable(event.value);
           this.emitEditorState();
         }
@@ -254,9 +273,9 @@ function disableExtendedKeyboardReporting() {
   process.stdout.write("\u001b[>4m");
 }
 
-function isSlashCommand(value: string) {
+function looksLikeSlashCommand(value: string) {
   const trimmed = value.trim();
-  return trimmed.startsWith("/") && !trimmed.includes("\n");
+  return trimmed.startsWith("/");
 }
 
 function hasSlashArguments(value: string) {

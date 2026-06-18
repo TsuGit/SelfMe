@@ -3,6 +3,7 @@ export interface TerminalMessageBlock {
   title: string;
   body: string;
   taskId?: string;
+  stepIndex?: number;
   approvalId?: string;
   approvalContext?: {
     toolName: string;

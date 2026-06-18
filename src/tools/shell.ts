@@ -20,6 +20,15 @@ export const shellTool: ToolImplementation<ShellToolInput> = {
   description: "Execute shell commands in the current workspace",
   inputSchema: shellToolSchema,
   approvalPolicy: "on-risk",
+  buildApproval(input) {
+    const parsed = shellToolSchema.parse(input);
+    const risk = classifyShellRisk(parsed.command);
+    return {
+      title: `Run shell · ${createCommandPreview(parsed.command, 96)}`,
+      reason: `Run shell: ${createCommandPreview(parsed.command, 96)}`,
+      risk
+    };
+  },
   async invoke(input, context): Promise<ToolResult> {
     const shell = platform() === "win32" ? "powershell.exe" : process.env.SHELL || "/bin/zsh";
     const args = platform() === "win32" ? ["-Command", input.command] : ["-lc", input.command];
@@ -218,6 +227,34 @@ function createCommandPreview(command: string, maxLength: number) {
   }
 
   return `${normalized.slice(0, maxLength - 3).trimEnd()}...`;
+}
+
+function classifyShellRisk(command: string) {
+  const normalized = command.replace(/\s+/g, " ").trim();
+
+  if (!normalized) {
+    return "medium" as const;
+  }
+
+  if (
+    /(^|[^\w])(rm|mv|cp|chmod|chown|dd|mkfs|diskutil|launchctl|shutdown|reboot|kill|pkill|xargs)\b/i.test(normalized)
+    || /\b(sudo|ssh|scp|rsync|curl|wget)\b/i.test(normalized)
+    || /[<>]|>>|\||&&|\|\||;\s*|\$\(|`/.test(normalized)
+  ) {
+    return "high" as const;
+  }
+
+  if (
+    /^(pwd|ls|cat|head|tail|wc|stat|file|tree)\b/i.test(normalized)
+    || /^(rg|find|sed)\b/i.test(normalized)
+    || /^git\s+(status|diff|log|show)\b/i.test(normalized)
+    || /^(node|tsx|bun|deno|python|python3)\s+[^\s-][^\s]*$/i.test(normalized)
+    || /^(pnpm|npm|yarn|bun)\s+(test|run\s+test|exec\s+vitest)\b/i.test(normalized)
+  ) {
+    return "low" as const;
+  }
+
+  return "medium" as const;
 }
 
 function createTextCapture(maxBytes: number) {

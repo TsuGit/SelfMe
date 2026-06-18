@@ -10,6 +10,7 @@ const terminalTheme = {
   accentPrimary: "60;200;255",
   accentSecondary: "99;184;255",
   accentWarm: "216;193;143",
+  stateSuccess: "112;214;168",
   stateError: "255;122;144"
 } as const;
 

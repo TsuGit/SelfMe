@@ -6,6 +6,7 @@ import type { TerminalMessageBlock } from "./message-types.js";
 import type { TerminalPanelController, TerminalPanelState } from "./panel-controller.js";
 import { clearLine, hideCursor, showCursor } from "./screen.js";
 import { fg, paint } from "./theme.js";
+import { formatToolSummaryLine } from "./tool-message.js";
 
 interface BottomAreaSnapshot {
   lineCount: number;
@@ -42,6 +43,7 @@ export class LinearTerminalRenderer {
   private bottomArea?: BottomAreaSnapshot;
   private hasCommittedHistory = false;
   private lastCommitted?: TerminalMessageBlock;
+  private readonly taskToolSteps = new Map<string, number>();
   private readonly handleResize = () => {
     this.renderBottomArea();
   };
@@ -81,6 +83,9 @@ export class LinearTerminalRenderer {
       this.state.activeTurnStartedAt = Date.now();
       this.state.editorValue = "";
       this.state.editorCursor = 0;
+      if (event.taskId) {
+        this.taskToolSteps.delete(event.taskId);
+      }
       this.appendHistoryBlock({
         kind: "user",
         title: "",
@@ -157,10 +162,12 @@ export class LinearTerminalRenderer {
     });
 
     this.input.bus.on("tool.execution.requested", (event) => {
+      const stepIndex = this.nextToolStepIndex(event.taskId);
       this.state.liveTool = {
         kind: "tool",
         title: "Tool",
         taskId: event.taskId,
+        stepIndex,
         body: createToolRunningMessage(event.payload.toolName, event.payload.input)
       };
       this.state.notice = undefined;
@@ -177,6 +184,7 @@ export class LinearTerminalRenderer {
         kind: "tool",
         title: "Tool",
         taskId: event.taskId,
+        stepIndex: liveTool?.stepIndex,
         body: appendToolOutput(currentBody, event.payload.toolName, event.payload.chunk)
       };
       this.renderBottomArea();
@@ -191,6 +199,7 @@ export class LinearTerminalRenderer {
         kind: "tool" as const,
         title: "Tool",
         taskId: event.taskId,
+        stepIndex: liveTool?.stepIndex,
         body: finalizeToolMessage(currentBody, event.payload.toolName, event.payload.summary, event.payload.rawOutput)
       };
 
@@ -300,11 +309,19 @@ export class LinearTerminalRenderer {
         return;
       }
 
+      const toolSteps = event.taskId
+        ? (this.taskToolSteps.get(event.taskId) ?? 0)
+        : 0;
+
+      if (event.taskId) {
+        this.taskToolSteps.delete(event.taskId);
+      }
+
       this.appendHistoryBlock({
         kind: "divider",
         title: "",
         taskId: event.taskId,
-        body: buildTurnSummaryLabel(event.payload.state, startedAt)
+        body: buildTurnSummaryLabel(event.payload.state, startedAt, toolSteps)
       }, false);
       this.renderBottomArea();
     });
@@ -341,6 +358,16 @@ export class LinearTerminalRenderer {
     if (renderBottom) {
       this.renderBottomArea();
     }
+  }
+
+  private nextToolStepIndex(taskId?: string) {
+    if (!taskId) {
+      return undefined;
+    }
+
+    const next = (this.taskToolSteps.get(taskId) ?? 0) + 1;
+    this.taskToolSteps.set(taskId, next);
+    return next;
   }
 
   private renderBottomArea() {
@@ -707,10 +734,6 @@ function renderPanelFooter(panel: TerminalPanelState, viewportWidth: number) {
     }
   }
 
-  if (panel.mode === "command" && panel.query !== undefined) {
-    lines.push(truncateAnsiLine(ansiPanelQuery(`/${panel.query}`), viewportWidth));
-  }
-
   const visibleOptions = panel.options;
 
   for (const [index, option] of visibleOptions.entries()) {
@@ -722,7 +745,7 @@ function renderPanelFooter(panel: TerminalPanelState, viewportWidth: number) {
   }
 
   lines.push(truncateAnsiLine(
-    `${ansiActionHint("↑↓")} ${ansiPanelHelp("select")}  ${ansiActionHint("Enter")} ${ansiPanelHelp("confirm")}  ${ansiActionHint("Esc")} ${ansiPanelHelp("close")}`,
+    `${ansiActionHint("↑↓")} ${ansiPanelHelp("select")}  ${ansiActionHint("Enter")} ${ansiPanelHelp(panel.confirmLabel ?? "confirm")}  ${ansiActionHint("Esc")} ${ansiPanelHelp("close")}`,
     viewportWidth
   ));
 
@@ -786,33 +809,144 @@ function renderStructuredMetaBlock(
 ) {
   const lines = body.split("\n");
   const [headline = "", ...rest] = lines;
-  const headlineRenderer = tone === "tool"
-    ? ansiToolHeadline
-    : tone === "approval"
-      ? ansiApprovalHeadline
-      : ansiErrorHeadline;
+  const headlineRenderer = tone === "error"
+    ? ansiErrorHeadline
+    : (text: string) => text;
   const bodyRenderer = tone === "tool"
     ? ansiToolText
     : tone === "approval"
       ? ansiApprovalText
       : ansiErrorText;
-  const wrappedHeadline = wrapLine(headline, width)
-    .map((line, index) => `${index === 0 ? ansiMuted("• ") : ansiMuted("  ")}${headlineRenderer(line)}`);
-  const wrappedBody = rest.flatMap((line) => renderStructuredMetaBodyLine(line, width, bodyRenderer));
+  const bulletRenderer = tone === "tool"
+    ? ansiToolBullet
+    : tone === "approval"
+      ? ansiApprovalBullet
+      : tone === "error"
+        ? ansiErrorBullet
+        : ansiMuted;
+  const wrappedHeadline = wrapLine(renderStructuredHeadline(headline, tone), width)
+    .map((line, index) => `${index === 0 ? bulletRenderer("• ") : ansiMuted("  ")}${headlineRenderer(line)}`);
+  const wrappedBody = rest.flatMap((line) => renderStructuredMetaBodyLine(line, width, tone, bodyRenderer));
 
   return [...wrappedHeadline, ...wrappedBody].filter(Boolean);
+}
+
+function renderStructuredHeadline(
+  headline: string,
+  tone: "tool" | "approval" | "error"
+) {
+  if (tone === "tool") {
+    return renderToolHeadline(headline);
+  }
+
+  if (tone === "approval") {
+    return renderApprovalHeadline(headline);
+  }
+
+  if (tone === "error") {
+    return renderErrorHeadline(headline);
+  }
+
+  return headline;
+}
+
+function renderToolHeadline(headline: string) {
+  const match = headline.match(/^([A-Z][A-Za-z]+)(\s+·\s+)([\s\S]+)$/);
+
+  if (!match) {
+    return headline;
+  }
+
+  const [, prefix = "", separator = "", rest = ""] = match;
+  return `${paint(prefix, { fg: "accentPrimary", bold: true })}${ansiToolHeadline(separator)}${ansiToolHeadline(rest)}`;
+}
+
+function renderApprovalHeadline(headline: string) {
+  const match = headline.match(/^(Approval)(\s+·\s+)(Approved|Denied)([\s\S]*)$/);
+
+  if (!match) {
+    return headline;
+  }
+
+  const [, prefix = "", separator = "", result = "", suffix = ""] = match;
+  const resultColor = result === "Approved" ? "stateSuccess" : "stateError";
+
+  return [
+    paint(prefix, { fg: "accentWarm", bold: true }),
+    ansiApprovalHeadline(separator),
+    paint(result, { fg: resultColor, bold: true }),
+    ansiApprovalHeadline(suffix)
+  ].join("");
+}
+
+function renderErrorHeadline(headline: string) {
+  const match = headline.match(/^([A-Z][A-Za-z]+)(\s+·\s+)(Failed)([\s\S]*)$/);
+
+  if (!match) {
+    return headline;
+  }
+
+  const [, prefix = "", separator = "", result = "", suffix = ""] = match;
+
+  return [
+    paint(prefix, { fg: "stateError", bold: true }),
+    ansiErrorHeadline(separator),
+    paint(result, { fg: "stateError", bold: true }),
+    ansiErrorHeadline(suffix)
+  ].join("");
 }
 
 function renderStructuredMetaBodyLine(
   line: string,
   width: number,
+  tone: "tool" | "approval" | "error",
   renderer: (text: string) => string
 ) {
+  if (tone === "tool") {
+    const decoratedToolLine = renderToolMetaLine(line, renderer);
+
+    if (decoratedToolLine) {
+      const prefix = "  ";
+      const wrapped = wrapLine(decoratedToolLine, Math.max(1, width - prefix.length));
+      return wrapped.map((segment) => `${ansiMuted(prefix)}${segment}`);
+    }
+  }
+
   const isCodeLike = /^[ \t]*\d+[ \t]*\|/.test(line) || /^[ \t]*\.\.\./.test(line);
   const prefix = isCodeLike ? "    " : "  ";
   const wrapped = wrapLine(line, Math.max(1, width - prefix.length));
 
   return wrapped.map((segment) => `${ansiMuted(prefix)}${renderer(segment)}`);
+}
+
+function renderToolMetaLine(
+  line: string,
+  renderer: (text: string) => string
+) {
+  const targetMatch = line.match(/^(target)(\s+·\s+)([\s\S]+)$/i);
+
+  if (targetMatch) {
+    const [, label = "", separator = "", value = ""] = targetMatch;
+    return `${paint(capitalizeWord(label), { fg: "accentSecondary", bold: true })}${ansiMuted(separator)}${renderer(value)}`;
+  }
+
+  const streamMatch = line.match(/^(stdout|stderr)(:\s*)([\s\S]*)$/i);
+
+  if (streamMatch) {
+    const [, label = "", separator = "", value = ""] = streamMatch;
+    const labelColor = label.toLowerCase() === "stderr" ? "accentWarm" : "accentSecondary";
+    return `${paint(capitalizeWord(label), { fg: labelColor, bold: true })}${ansiMuted(separator)}${renderer(value)}`;
+  }
+
+  return undefined;
+}
+
+function capitalizeWord(value: string) {
+  if (!value) {
+    return value;
+  }
+
+  return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
 function wrapLine(line: string, width: number) {
@@ -1015,7 +1149,8 @@ function renderWelcomeLines(session: SessionRecord) {
 
 function createToolRunningMessage(toolName: string, input?: unknown) {
   const target = renderToolTargetLine(toolName, input);
-  return target ? `${toolName} · running\n${target}` : `${toolName} · running`;
+  const headline = formatToolSummaryLine(toolName, "running");
+  return target ? `${headline}\n${target}` : headline;
 }
 
 function appendToolOutput(current: string, toolName: string, chunk: string) {
@@ -1032,7 +1167,7 @@ function finalizeToolMessage(current: string, toolName: string, summary: string,
   const sanitizedOutput = sanitizeToolChunk(rawOutput ?? "");
   const meaningfulOutput = hasMeaningfulToolOutput(sanitizedOutput) ? sanitizedOutput : "";
   const lines = current ? current.split("\n").filter(Boolean) : [];
-  const header = summary.trim() || `${toolName} · completed`;
+  const header = formatToolSummaryLine(toolName, summary);
   const hasStructuredOutput = /^(stdout:|stderr:)/m.test(meaningfulOutput);
 
   if (lines.length === 0) {
@@ -1077,12 +1212,13 @@ function renderToolTargetLine(toolName: string, input?: unknown) {
 }
 
 function createApprovalResolvedMessage(_approvalId: string, approved: boolean) {
-  return `approval · ${approved ? "approved" : "denied"}`;
+  return `Approval · ${approved ? "Approved" : "Denied"}`;
 }
 
 function createTaskErrorMessage(previousBody: string | undefined, message: string) {
-  const headline = previousBody ? deriveTaskHeadline(previousBody) : "task · failed";
-  return [headline.endsWith("failed") ? headline : `${headline} · failed`, message].join("\n");
+  const headline = previousBody ? deriveTaskHeadline(previousBody) : "Error";
+  const normalizedHeadline = capitalizeWord(headline);
+  return [normalizedHeadline.endsWith("Failed") ? normalizedHeadline : `${normalizedHeadline} · Failed`, message].join("\n");
 }
 
 function sanitizeToolChunk(chunk: string) {
@@ -1196,23 +1332,24 @@ function deriveTaskHeadline(body: string) {
     .trim();
 }
 
-function buildTurnSummaryLabel(state: "completed" | "failed" | "cancelled", startedAt: number) {
+function buildTurnSummaryLabel(state: "completed" | "failed" | "cancelled", startedAt: number, toolSteps = 0) {
   const elapsedSeconds = getElapsedSeconds(startedAt);
   const duration = formatElapsedDuration(startedAt);
+  const stepLabel = toolSteps > 0 ? `${toolSteps} ${toolSteps === 1 ? "step" : "steps"}` : "";
 
   if (state === "failed") {
-    return `failed after ${duration}`;
+    return joinSummaryParts(`Failed after ${duration}`, stepLabel);
   }
 
   if (state === "cancelled") {
-    return `stopped after ${duration}`;
+    return joinSummaryParts(`Stopped after ${duration}`, stepLabel);
   }
 
   if (elapsedSeconds < 5) {
-    return "";
+    return stepLabel;
   }
 
-  return `done in ${duration}`;
+  return joinSummaryParts(`Done in ${duration}`, stepLabel);
 }
 
 function getElapsedSeconds(startedAt?: number) {
@@ -1221,6 +1358,10 @@ function getElapsedSeconds(startedAt?: number) {
   }
 
   return Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+}
+
+function joinSummaryParts(...parts: string[]) {
+  return parts.filter(Boolean).join(" · ");
 }
 
 function shouldTightGroup(previous: TerminalMessageBlock | undefined, next: TerminalMessageBlock) {
@@ -1248,7 +1389,11 @@ function isTransientSystemNotice(title: string) {
 }
 
 function isTransientRuntimeNotice(message: string) {
-  return message.startsWith("Unknown command:") || message.startsWith("Unknown approval id:");
+  return message.startsWith("Unknown command:") ||
+    message.startsWith("Unknown approval id:") ||
+    message.startsWith("Command requires ") ||
+    message.startsWith("Command does not take ") ||
+    message.startsWith("Invalid /");
 }
 
 function ansiComposerPrefix(text: string) {
@@ -1282,12 +1427,20 @@ function ansiToolHeadline(text: string) {
   return fg("textPrimary", text);
 }
 
+function ansiToolBullet(text: string) {
+  return paint(text, { fg: "accentPrimary", bold: true });
+}
+
 function ansiApprovalText(text: string) {
   return fg("accentWarm", text);
 }
 
 function ansiApprovalHeadline(text: string) {
-  return fg("accentWarm", text);
+  return fg("textPrimary", text);
+}
+
+function ansiApprovalBullet(text: string) {
+  return paint(text, { fg: "accentWarm", bold: true });
 }
 
 function ansiErrorText(text: string) {
@@ -1296,6 +1449,10 @@ function ansiErrorText(text: string) {
 
 function ansiErrorHeadline(text: string) {
   return fg("stateError", text);
+}
+
+function ansiErrorBullet(text: string) {
+  return paint(text, { fg: "stateError", bold: true });
 }
 
 function ansiSystemText(text: string) {
@@ -1377,7 +1534,7 @@ function ansiActionMenuItem(text: string, style?: "primary" | "secondary" | "dan
 }
 
 function ansiNoticeTitle(text: string) {
-  return fg("textMuted", text);
+  return paint(text, { fg: "textPrimary", bold: true });
 }
 
 function ansiNoticeBody(text: string) {
@@ -1385,7 +1542,7 @@ function ansiNoticeBody(text: string) {
 }
 
 function ansiNoticeErrorTitle(text: string) {
-  return fg("stateError", text);
+  return paint(text, { fg: "stateError", bold: true });
 }
 
 function ansiNoticeErrorBody(text: string) {
