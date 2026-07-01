@@ -1,61 +1,105 @@
-# SelfMe CLI
+# SelfMe
 
-SelfMe 是一个本地运行的 TypeScript agent CLI。
+Local-first agent CLI for real terminal work.
 
-当前仓库只做一件事：把 CLI agent 的执行闭环做扎实，包括输入、消息流、工具调用、审批、安全边界、会话存储，以及真实 coding task 的持续收敛能力。
+SelfMe is a TypeScript + Node.js agent runtime focused on one surface only: the command line. It is being built to stay on task, survive interruptions, respect approvals, use real tools, and keep improving through regression pressure instead of demo-only patches.
 
-这不是一个 Web 产品壳，也不是一个多端共享后端项目。当前阶段只关注单体 CLI。
+## At A Glance
 
-## Current Scope
+- Local CLI only
+- TypeScript + Node.js runtime
+- File and shell tools built in
+- OpenAI-compatible, Anthropic-compatible, and local provider support
+- Explicit approvals for risky actions
+- Resume and recovery oriented task loop
+- Regression suite treated as core product infrastructure
 
-- 单进程、本地运行
-- TypeScript + Node.js
-- 本地文件工具与 shell 工具
-- 风险分级审批
-- 会话 transcript / tool log 存储
-- 多轮任务恢复、失败点续跑、project-level follow-up 收敛
+## Why This Exists
 
-## Repository Layout
+Most agent CLIs do not fail because the UI is missing features. They fail because the runtime breaks under ordinary work:
 
-```text
-src/
-  app/        bootstrap、生命周期、事件总线
-  editor/     输入缓冲、多行编辑、光标控制
-  providers/  local / openai / anthropic provider
-  runtime/    agent runtime、任务意图、上下文压缩、命令解析、事件定义
-  smoke/      agent regression 回归
-  storage/    settings、transcripts、tool logs
-  terminal/   终端事件循环、渲染、面板、主题
-  tools/      files / shell / registry
-  types/      approval、task、event、session、tool
-```
+- the agent stops after one tool call
+- it explains instead of continuing execution
+- it loses context after interruption
+- it cannot recover from approval waits or near-miss outputs
+- it drifts away from the real working file after the task has already narrowed
 
-## Requirements
+SelfMe is being developed directly against those failure modes.
+
+## Product Boundary
+
+SelfMe is intentionally narrow.
+
+In scope:
+
+- a strong terminal-native agent experience
+- reliable local tool execution
+- resumable multi-step task handling
+- clear storage, config, and approval behavior
+
+Out of scope for the current product:
+
+- web UI
+- shared backend architecture
+- multi-surface sync complexity
+- broad platform expansion before the CLI is solid
+
+## Core Capabilities
+
+### Runtime
+
+- Multi-step agent loop with follow-up handling
+- Resume-aware task lifecycle
+- Interrupt, stop, and recovery flows
+- Context compaction for longer sessions
+
+### Tools
+
+- File reads and targeted edits
+- File writes
+- Shell execution
+- Risk-based approval gates
+
+### Terminal Experience
+
+- Command menu driven slash commands
+- Multiline input
+- Structured tool/result rendering
+- Transcript-oriented session flow
+
+### Storage
+
+- Workspace-isolated settings and runtime state
+- Transcript persistence
+- Tool log persistence
+- Startup migration from older workspace-local state
+
+## Quick Start
+
+Requirements:
 
 - Node.js 20+
 - pnpm 11+
 
-## Install
+Install dependencies:
 
 ```bash
 pnpm install
 ```
 
-## Run
-
-开发模式：
+Run in development:
 
 ```bash
 pnpm dev
 ```
 
-构建：
+Build:
 
 ```bash
 pnpm build
 ```
 
-运行构建产物：
+Run the built CLI:
 
 ```bash
 pnpm start
@@ -63,15 +107,29 @@ pnpm start
 
 ## Configuration
 
-首次启动会在当前工作区生成：
+SelfMe stores runtime state outside your repository by default.
+
+Example paths:
 
 ```text
-.selfme/settings.json
-.selfme/runtime/transcripts.jsonl
-.selfme/runtime/tool-logs.jsonl
+~/.selfme/workspaces/<workspace-name>-<hash>/settings.json
+~/.selfme/workspaces/<workspace-name>-<hash>/runtime/transcripts.jsonl
+~/.selfme/workspaces/<workspace-name>-<hash>/runtime/tool-logs.jsonl
 ```
 
-`settings.json` 结构：
+This means:
+
+- your project can live anywhere on disk
+- SelfMe state is centralized under `~/.selfme`
+- each workspace still gets isolated config and logs
+
+Supported providers:
+
+- `local`
+- `openai`
+- `anthropic`
+
+Example `settings.json`:
 
 ```json
 {
@@ -82,21 +140,25 @@ pnpm start
 }
 ```
 
-支持的 `provider`：
+Environment variables:
 
-- `local`
-- `openai`
-- `anthropic`
+- `SELFME_WORKSPACE_ROOT`
+  Override the workspace root that SelfMe treats as the active project
+- `SELFME_HOME`
+  Override the root directory used for SelfMe state
 
-工作区根目录默认取：
+## Safety And Migration
 
-1. `SELFME_WORKSPACE_ROOT`
-2. `INIT_CWD`
-3. 当前进程目录
+On startup, SelfMe will:
 
-## Commands
+- migrate legacy workspace `.selfme/settings.json` into the user-level state directory
+- keep transcript and tool log history per workspace
+- warn if workspace `.selfme` is tracked by git
+- warn if workspace `.selfme` is not ignored by git
 
-内建命令：
+The goal is simple: local keys and runtime artifacts should not leak into the repository by accident.
+
+## Built-In Commands
 
 - `/help`
 - `/stop`
@@ -105,47 +167,69 @@ pnpm start
 - `/edit <path[:start-end]>`
 - `/shell <command>`
 
-说明：
+Interaction notes:
 
-- 输入 `/` 会打开命令菜单
-- `Esc`、`Ctrl+C`、`/stop` 会停止当前任务
-- `/write` 和 `/edit` 的正文从下一行开始
+- type `/` to open the command menu
+- use `Esc`, `Ctrl+C`, or `/stop` to stop the current task
+- `/write` and `/edit` take their body on the next line
 
-## Development
+## Development Workflow
 
-类型检查：
+Typecheck:
 
 ```bash
 pnpm typecheck
 ```
 
-agent smoke 回归：
+Run the runtime regression suite:
 
 ```bash
 pnpm smoke:agent
 ```
 
-当前主开发策略不是先加功能，而是先提高真实任务完成率，再把失败沉淀成可重复回归。
+The working rule for this repository is strict:
 
-## Docs
+1. find a real runtime failure
+2. turn it into a repeatable regression
+3. fix the runtime behavior
+4. keep the fix at the state, loop, or decision level when possible
+
+The goal is not to patch isolated demos. The goal is to harden the runtime.
+
+## Repository Layout
+
+```text
+src/
+  app/        bootstrap, lifecycle, event bus
+  editor/     input buffer, multiline composition, cursor handling
+  providers/  local / openai / anthropic integrations
+  runtime/    agent runtime, task intent, context, compaction, commands
+  smoke/      regression coverage for runtime behavior
+  storage/    settings, transcripts, tool logs
+  terminal/   screen, renderer, panels, theme
+  tools/      files, shell, tool registry
+  types/      task, event, session, approval, tool types
+```
+
+## Project Documents
 
 - `docs/agent-cli-roadmap.html`
-  当前 CLI 产品边界、基线能力、路线图
+  Product boundary, current baseline, and roadmap
 - `docs/agent-eval-strategy.html`
-  开发方法、能力分层、回归策略
+  Evaluation method, regression strategy, and failure taxonomy
 - `docs/brand-color-system.html`
-  视觉配色系统
+  Brand and color rules
 
-## Status
+## Current Status
 
-这个仓库仍在高频迭代中。
+SelfMe is still under active iteration. The important questions right now are not about feature count.
 
-当前重点不在功能数量，而在下面这些底层能力是否稳定：
+They are about runtime quality:
 
-- 中断后继续执行
-- 审批后不断链
-- 宽 follow-up 回到正确任务上下文
-- 多文件任务不提前收尾
-- verify / exact-output 链持续收敛
+- can it keep working after interruption?
+- can it continue after approval waits?
+- can it recover from verify and exact-output near-misses?
+- can it stay anchored to the real working file?
+- can it finish multi-step project tasks without stopping early?
 
-如果这些基础语义不稳定，后面继续扩工具和产品壳层都没有意义。
+Until those answers are consistently yes, adding more surface area is noise.

@@ -1,5 +1,4 @@
 node_modules
 dist
 .pnpm-store
-.selfme/settings.json
-.selfme/runtime
+.selfme/
