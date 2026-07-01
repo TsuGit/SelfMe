@@ -5,6 +5,12 @@ export function extractExpectedOutputFromTaskRequest(request: string) {
     return quotedMatch[1].trim();
   }
 
+  const plainExactMatch = request.match(/\b(?:print|prints|output|outputs|return|returns)\b[\s\S]{0,80}?\bexact(?:ly)?\b\s+([A-Za-z0-9._-]+)/i);
+
+  if (plainExactMatch?.[1]?.trim()) {
+    return plainExactMatch[1].trim();
+  }
+
   const backtickValues = [...request.matchAll(/`([^`]+)`/g)]
     .map((match) => match[1]?.trim())
     .filter((value): value is string => Boolean(value));

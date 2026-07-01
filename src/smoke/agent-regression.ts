@@ -12,6 +12,8 @@ import { createDefaultSessionRecord } from "../runtime/context.js";
 import { buildContextMessages } from "../runtime/context-compaction.js";
 import { formatToolSummaryLine } from "../terminal/tool-message.js";
 import {
+  createApprovalRequestedEvent,
+  createApprovalResolvedEvent,
   createAssistantCompletedEvent,
   createAssistantDeltaEvent,
   createRuntimeInterruptRequestedEvent,
@@ -33,6 +35,10 @@ class RegressionProvider implements ProviderClient {
 
   async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
     const output = resolveProviderResponse(input.content);
+
+    if (output.trim().length === 0) {
+      throw new Error(`Regression provider produced an empty response for prompt:\n${input.content}`);
+    }
 
     for (const delta of chunkText(output, output.startsWith("<tool_call>") ? 400 : 24)) {
       yield { delta };
@@ -94,6 +100,7 @@ async function main() {
   await writeFile(join(workspace, "serve.mjs"), 'import config from "./app.conf.json" with { type: "json" };\nconsole.log(`${config.name} on ${config.port}`);\n', "utf8");
   await writeFile(join(workspace, "report.mjs"), 'import config from "./app.config.json" with { type: "json" };\nconsole.log(`name=${config.name}`);\nconsole.log(`port=${config.port}`);\n', "utf8");
   await writeFile(join(workspace, "failure-stop-report.mjs"), 'import config from "./app.conf.json" with { type: "json" };\nconsole.log(`${config.name}:${config.port}`);\n', "utf8");
+  await writeFile(join(workspace, "failure-question-report.mjs"), 'import config from "./app.conf.json" with { type: "json" };\nconsole.log(`${config.name}:${config.port}`);\n', "utf8");
   await writeFile(join(workspace, "converge-report.mjs"), 'import config from "./app.config.json" with { type: "json" };\nconsole.log(`${config.name}:${config.port}`);\nconsole.log("done");\n', "utf8");
   await writeFile(join(workspace, "converge-question-report.mjs"), 'import config from "./app.config.json" with { type: "json" };\nconsole.log(`${config.name}:${config.port}`);\nconsole.log("done");\n', "utf8");
   await writeFile(join(workspace, "premature-edit-report.mjs"), 'import config from "./app.config.json" with { type: "json" };\nconsole.log(`${config.name}-${config.port}`);\n', "utf8");
@@ -444,7 +451,7 @@ async function main() {
     "expected vague rewrite follow-up to anchor to the recently inspected project entry"
   );
   assert.ok(
-    rewriteFollowUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-20")),
+    rewriteFollowUpResult.toolSummaries.some((summary) => /^node-todo\/app\.js:1-\d+/.test(summary)),
     "expected vague rewrite follow-up to continue into a concrete work file"
   );
   assert.ok(
@@ -489,7 +496,7 @@ async function main() {
   assert.match(approvedRewriteResult.assistantText, /node-todo/i);
   assert.doesNotMatch(approvedRewriteResult.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
   assert.ok(
-    approvedRewriteResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-20")),
+    approvedRewriteResult.toolSummaries.some((summary) => /^node-todo\/app\.js:1-\d+/.test(summary)),
     "expected approved rewrite flow to read app.js"
   );
   assert.ok(
@@ -557,7 +564,7 @@ async function main() {
   assert.match(proposalDrivenRewriteFollowUpResult.assistantText, /node-todo/i);
   assert.doesNotMatch(proposalDrivenRewriteFollowUpResult.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
   assert.ok(
-    proposalDrivenRewriteFollowUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-20")),
+    proposalDrivenRewriteFollowUpResult.toolSummaries.some((summary) => /^node-todo\/app\.js:1-\d+/.test(summary)),
     "expected broad rewrite follow-up to execute the rewrite proposal from app.js"
   );
   assert.ok(
@@ -1029,6 +1036,29 @@ async function main() {
     "expected repair edit after failure-only assistant reply"
   );
 
+  console.log("task: continue after a blocking question on a failed verification");
+  const failureQuestionRecoveryResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Read app.config.json and fix failure-question-report.mjs so running `node failure-question-report.mjs` prints exactly `SelfMe:3000` on one line. Keep working until the output is exact."
+  });
+
+  const failureQuestionReportContent = await readFile(join(workspace, "failure-question-report.mjs"), "utf8");
+  assert.match(failureQuestionReportContent, /app\.config\.json/);
+  assert.match(failureQuestionRecoveryResult.assistantText, /SelfMe:3000/);
+  assert.ok(
+    failureQuestionRecoveryResult.toolSummaries.some((summary) => summary.startsWith("node failure-question-report.mjs · failed (1)")),
+    "expected failed verification before runtime forced continued repair after the blocking question"
+  );
+  assert.ok(
+    failureQuestionRecoveryResult.toolSummaries.some((summary) =>
+      summary.startsWith("failure-question-report.mjs:1-2 · updated")
+      || summary.startsWith("failure-question-report.mjs:1-3 · updated")
+    ),
+    "expected repair edit after failure-question assistant reply"
+  );
+
   console.log("task: keep repairing across a failure and then a near-miss verification");
   const stubbornRecoveryResult = await runAgentTask({
     bus,
@@ -1250,7 +1280,7 @@ async function main() {
     "expected direct whole-project inspection to read the project entry"
   );
   assert.ok(
-    directWholeProjectInspectionResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-20")),
+    directWholeProjectInspectionResult.toolSummaries.some((summary) => /^node-todo\/app\.js:1-\d+/.test(summary)),
     "expected direct whole-project inspection to continue into a core implementation file"
   );
 
@@ -1271,7 +1301,7 @@ async function main() {
     "expected whole-project follow-up to anchor back to the recent project entry once"
   );
   assert.ok(
-    wholeProjectInspectionFollowUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-20")),
+    wholeProjectInspectionFollowUpResult.toolSummaries.some((summary) => /^node-todo\/app\.js:1-\d+/.test(summary)),
     "expected whole-project follow-up to continue into a core implementation file"
   );
 
@@ -1298,7 +1328,7 @@ async function main() {
     "expected vague optimization follow-up to anchor to the recently inspected project entry"
   );
   assert.ok(
-    vagueOptimizationFollowUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-20")),
+    vagueOptimizationFollowUpResult.toolSummaries.some((summary) => /^node-todo\/app\.js:1-\d+/.test(summary)),
     "expected vague optimization follow-up to continue into the concrete work file"
   );
   assert.ok(
@@ -1332,7 +1362,7 @@ async function main() {
     "expected broad project improvement flow to inspect a concrete project entry first"
   );
   assert.ok(
-    broadProjectImprovementResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-20")),
+    broadProjectImprovementResult.toolSummaries.some((summary) => /^node-todo\/app\.js:1-\d+/.test(summary)),
     "expected broad project improvement flow to continue from project entry into a concrete work file"
   );
   assert.ok(
@@ -1375,7 +1405,7 @@ async function main() {
     "expected project-driven multi-target flow to inspect the package entry once"
   );
   assert.ok(
-    projectDrivenMultiTargetResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-20")),
+    projectDrivenMultiTargetResult.toolSummaries.some((summary) => /^node-todo\/app\.js:1-\d+/.test(summary)),
     "expected project-driven multi-target flow to reach app.js first"
   );
   assert.ok(
@@ -1659,7 +1689,7 @@ async function main() {
     "expected recent-working-file optimization follow-up to skip re-reading the package entry"
   );
   assert.ok(
-    recentWorkingFileOptimizationResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-20")),
+    recentWorkingFileOptimizationResult.toolSummaries.some((summary) => /^node-todo\/app\.js:1-\d+/.test(summary)),
     "expected recent-working-file optimization follow-up to jump straight to the latest editable working file"
   );
   assert.ok(
@@ -1682,7 +1712,7 @@ async function main() {
     "expected vague inspection follow-up to skip re-reading the package entry"
   );
   assert.ok(
-    recentWorkingFileInspectionResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-20")),
+    recentWorkingFileInspectionResult.toolSummaries.some((summary) => /^node-todo\/app\.js:1-\d+/.test(summary)),
     "expected vague inspection follow-up to jump straight to the latest editable working file"
   );
 
@@ -1704,7 +1734,7 @@ async function main() {
   assert.match(optimizedTodoAppContent, /process\.env\.PORT/);
   assert.match(optimizationContinuationResult.assistantText, /process\.env\.PORT/);
   assert.ok(
-    optimizationContinuationResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-20")),
+    optimizationContinuationResult.toolSummaries.some((summary) => /^node-todo\/app\.js:1-\d+/.test(summary)),
     "expected initial file inspection before optimization"
   );
   assert.ok(
@@ -1730,7 +1760,7 @@ async function main() {
   assert.match(refactoredTodoAppContent, /process\.env\.PORT/);
   assert.match(explanationOnlyOptimizationResult.assistantText, /process\.env\.PORT/);
   assert.ok(
-    explanationOnlyOptimizationResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-20")),
+    explanationOnlyOptimizationResult.toolSummaries.some((summary) => /^node-todo\/app\.js:1-\d+/.test(summary)),
     "expected file inspection before non-verify mutation refactor"
   );
   assert.ok(
@@ -1802,7 +1832,7 @@ async function main() {
   assert.match(multiTargetOptimizationResult.assistantText, /process\.env\.PORT/);
   assert.match(multiTargetOptimizationResult.assistantText, /maxlength/i);
   assert.ok(
-    multiTargetOptimizationResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-20")),
+    multiTargetOptimizationResult.toolSummaries.some((summary) => /^node-todo\/app\.js:1-\d+/.test(summary)),
     "expected multi-target optimization to inspect app.js first"
   );
   assert.ok(
@@ -1841,7 +1871,7 @@ async function main() {
   assert.match(confirmedTodoAppContent, /process\.env\.PORT/);
   assert.match(unnecessaryConfirmationResult.assistantText, /process\.env\.PORT/);
   assert.ok(
-    unnecessaryConfirmationResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-20")),
+    unnecessaryConfirmationResult.toolSummaries.some((summary) => /^node-todo\/app\.js:1-\d+/.test(summary)),
     "expected file inspection before unnecessary-confirmation recovery"
   );
   assert.ok(
@@ -3014,6 +3044,37 @@ async function main() {
   await verifyBareAffirmativeResumesInterruptedTask();
   await verifyBareAffirmativeResumesInterruptedProposalExecution();
   await verifyVagueRewriteResumesInterruptedProposalExecution();
+  await verifyVagueOptimizationExecutesPreviousProposal();
+  await verifyEnglishPlanningStyleOptimizationProposalExecutesPreviousProposal();
+  await verifyChineseOptimizationProposalExecutesPreviousProposal();
+  await verifyDirectEditFollowUpExecutesPreviousProposal();
+  await verifyFollowPreviousPlanExecutesPreviousProposal();
+  await verifyFollowPreviousPlanVariantExecutesPreviousProposal();
+  await verifyFollowPreviousPlanComeVariantExecutesPreviousProposal();
+  await verifyFollowPreviousPlanComeSoftVariantExecutesPreviousProposal();
+  await verifyProposalAcceptanceResumesInterruptedProposalExecution();
+  await verifyMultiTargetProposalReplyContinuesExecution();
+  await verifyVerificationProposalReplyContinuesExecution();
+  await verifyGenericVerificationStageSummaryStillContinues();
+  await verifyGenericVerificationQuestionStillContinues();
+  await verifyGenericVerificationProposalStillContinues();
+  await verifyGenericVerificationCompletionToneStillContinues();
+  await verifyProjectInspectionProposalReplyContinuesExecution();
+  await verifyWholeProjectInspectionProposalReplyContinuesExecution();
+  await verifyProjectWorkfileProposalReplyContinuesExecution();
+  await verifyThinTerminalCompletionReplyGetsTightened();
+  await verifyThinChineseTerminalCompletionReplyGetsTightened();
+  await verifyMismatchedExactOutputCompletionReplyGetsTightened();
+  await verifyMismatchedChineseExactOutputCompletionReplyGetsTightened();
+  await verifyFileVerificationCompletionReplyWithoutTargetAnchorGetsTightened();
+  await verifyShellVerificationCompletionReplyWithoutAnchorGetsTightened();
+  await verifyVagueInspectionExecutesPreviousProposal();
+  await verifyEnglishPlanningStyleInspectionProposalExecutesPreviousProposal();
+  await verifyPlanningStyleInspectionProposalExecutesPreviousProposal();
+  await verifyChineseInspectionProposalExecutesPreviousProposal();
+  await verifyPlanningStyleRewriteProposalExecutesPreviousProposal();
+  await verifyChineseRewriteProposalExecutesPreviousProposal();
+  await verifyVagueInspectionResumesInterruptedProposalExecution();
   await verifyVagueOptimizationResumesInterruptedProposalExecution();
   await verifyResumeFollowUpAtLatestFailurePoint();
   await verifyResumeFollowUpPullsExplanationBackIntoLatestFailurePoint();
@@ -3022,16 +3083,46 @@ async function main() {
   await verifyVagueOptimizationInProjectVerificationChain();
   await verifyVagueInspectionInProjectVerificationChain();
   await verifyResumeFollowUpInProjectStageSummaryChain();
+  await verifyResumeFollowUpInImplicitProjectStageSummaryChain();
+  await verifyResumeFollowUpInImplicitGenericVerificationStageSummaryChain();
+  await verifyResumeFollowUpInImplicitGenericVerificationCompletionToneChain();
+  await verifyBareAffirmativeInImplicitGenericVerificationStageSummaryChain();
+  await verifyVagueOptimizationInImplicitGenericVerificationStageSummaryChain();
+  await verifyVagueInspectionInImplicitGenericVerificationStageSummaryChain();
+  await verifyVagueOptimizationInImplicitBroadProjectProposalChain();
+  await verifyBroadProjectEditRangeFailureCarriesForward();
+  await verifyBroadProjectStageSummaryDoesNotConsumeToolBudget();
+  await verifyResumeFollowUpInImplicitMultiTargetProposalChain();
+  await verifyBareAffirmativeInImplicitMultiTargetProposalChain();
+  await verifyVagueOptimizationInImplicitMultiTargetProposalChain();
+  await verifyVagueInspectionInImplicitMultiTargetProposalChain();
+  await verifyResumeFollowUpInImplicitMultiTargetCompletionToneChain();
+  await verifyResumeFollowUpInImplicitMultiTargetQuestionChain();
+  await verifyResumeFollowUpDoesNotLeakStalePendingNextTarget();
+  await verifyResumeFollowUpDoesNotLeakStaleEditableWorkingFile();
+  await verifyResumeFollowUpDoesNotLeakStaleToolAnchor();
+  await verifyResumeFollowUpDoesNotLeakStaleInterruptedApproval();
+  await verifyApproveFollowUpDoesNotLeakOldProposalIntoInterruptedTask();
   await verifyResumeFollowUpAfterApprovalWaitInProjectChain();
   await verifyBareAffirmativeAfterApprovalWaitInProjectChain();
   await verifyVagueOptimizationAfterApprovalWaitInProjectChain();
   await verifyNaturalLanguageApprovalShortcuts();
+  await verifyPendingNextStepContextGuidesMultiTargetContinuation();
+  await verifyAssistantStageSummaryPromotesExplicitNextTarget();
+  await verifyLongCompletionToneWithPendingWorkStillContinues();
+  await verifyPathScopedCompletionDoesNotEndDualFileExecution();
+  await verifyImplicitRemainingChainDoesNotEndAtHelperCompletion();
+  await verifyNearMissShellCompletionToneStillRepairsRemainingHelper();
   verifyInterruptFallbackWhenWorkingUiLingers();
   console.log("task: verify context compaction");
   verifyContextCompaction();
   verifyContextCompactionSwitchesMainTask();
   verifyContextCompactionPrefersLatestVerificationCommand();
   verifyContextCompactionExtractsQuotedTargetOutput();
+  verifyContextCompactionPreservesPendingApproval();
+  verifyContextCompactionClearsResolvedPendingApproval();
+  verifyContextCompactionPreservesPendingNextStep();
+  verifyContextCompactionDropsOlderPendingNextStepAfterNewRequest();
   verifyContextCompactionPreservesAssistantStageBoundaries();
   verifyContextCompactionKeepsWholeTurns();
   verifyToolSummaryFormatting();
@@ -3896,6 +3987,4415 @@ async function verifyVagueRewriteResumesInterruptedProposalExecution() {
   assert.ok(
     resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1 · updated")),
     "vague rewrite resume after proposal execution should finish the pending view edit"
+  );
+}
+
+async function verifyVagueOptimizationExecutesPreviousProposal() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-vague-optimize-proposal-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const PORT = 3000;\nconsole.log(PORT);\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<input name="title" />\n',
+    "utf8"
+  );
+
+  class VagueOptimizeProposalProvider implements ProviderClient {
+    readonly name = "vague-optimize-proposal-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const proposalPrompt = "看看项目，但先别改，告诉我如果优化 node-todo 你会怎么做。";
+      const executeProposalPrompt = 'The user replied "帮我优化下" and wants you to execute the immediately previous optimize proposal now.';
+
+      if (input.content === proposalPrompt) {
+        yield {
+          delta: [
+            "If you want, I can optimize node-todo by updating node-todo/app.js and node-todo/views/index.ejs.",
+            "I would first switch node-todo/app.js to process.env.PORT, then add maxlength 100 in node-todo/views/index.ejs."
+          ].join(" ")
+        };
+        return;
+      }
+
+      if (input.content.startsWith(executeProposalPrompt)) {
+        assert.match(input.content, /Approved proposal:/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/app.js",
+            startLine: 1,
+            endLine: 2
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${executeProposalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1,
+              replacement: '<input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield { delta: "Optimized node-todo by updating app.js and views/index.ejs from the previous proposal." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new VagueOptimizeProposalProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const proposalResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "看看项目，但先别改，告诉我如果优化 node-todo 你会怎么做。"
+  });
+  assert.match(proposalResult.assistantText, /node-todo\/app\.js/i);
+  assert.match(proposalResult.assistantText, /node-todo\/views\/index\.ejs/i);
+
+  const followUpResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "帮我优化下"
+  });
+
+  const optimizedAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const optimizedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(optimizedAppContent, /process\.env\.PORT/);
+  assert.match(optimizedViewContent, /maxlength="100"/);
+  assert.match(followUpResult.assistantText, /node-todo/i);
+  assert.doesNotMatch(followUpResult.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-2")),
+    "expected vague optimization follow-up to execute the previous optimize proposal from app.js"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1")),
+    "expected vague optimization follow-up to continue the previous optimize proposal into views/index.ejs"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1 · updated")),
+    "expected vague optimization follow-up to finish the view edit from the previous optimize proposal"
+  );
+}
+
+async function verifyEnglishPlanningStyleOptimizationProposalExecutesPreviousProposal() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-english-planning-optimize-proposal-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const PORT = 3000;\nconsole.log(PORT);\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<input name="title" />\n',
+    "utf8"
+  );
+
+  class EnglishPlanningStyleOptimizeProposalProvider implements ProviderClient {
+    readonly name = "english-planning-style-optimize-proposal-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const proposalPrompt = "看看项目，但先别改，告诉我如果优化 node-todo 你会怎么做。";
+      const executeProposalPrompt = 'The user replied "帮我优化下" and wants you to execute the immediately previous optimize proposal now.';
+
+      if (input.content === proposalPrompt) {
+        yield {
+          delta: "I would first switch node-todo/app.js to process.env.PORT, then add maxlength 100 in node-todo/views/index.ejs."
+        };
+        return;
+      }
+
+      if (input.content.startsWith(executeProposalPrompt)) {
+        assert.match(input.content, /Approved proposal:/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/app.js",
+            startLine: 1,
+            endLine: 2
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${executeProposalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1,
+              replacement: '<input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield { delta: "I followed the previous optimization plan and updated app.js and views/index.ejs." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new EnglishPlanningStyleOptimizeProposalProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const proposalResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "看看项目，但先别改，告诉我如果优化 node-todo 你会怎么做。"
+  });
+  assert.match(proposalResult.assistantText, /app\.js/i);
+  assert.match(proposalResult.assistantText, /views\/index\.ejs/i);
+
+  const followUpResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "帮我优化下"
+  });
+
+  const optimizedAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const optimizedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(optimizedAppContent, /process\.env\.PORT/);
+  assert.match(optimizedViewContent, /maxlength="100"/);
+  assert.match(followUpResult.assistantText, /optimization plan|node-todo/i);
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-2")),
+    "expected English planning-style optimize proposal follow-up to execute from app.js"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1")),
+    "expected English planning-style optimize proposal follow-up to continue into views/index.ejs"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1 · updated")),
+    "expected English planning-style optimize proposal follow-up to finish the view edit"
+  );
+}
+
+async function verifyChineseOptimizationProposalExecutesPreviousProposal() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-chinese-optimize-proposal-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const PORT = 3000;\nconsole.log(PORT);\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<input name="title" />\n',
+    "utf8"
+  );
+
+  class ChineseOptimizeProposalProvider implements ProviderClient {
+    readonly name = "chinese-optimize-proposal-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const proposalPrompt = "看看项目，但先别改，告诉我如果优化 node-todo 你会怎么做。";
+      const executeProposalPrompt = 'The user replied "帮我优化下" and wants you to execute the immediately previous optimize proposal now.';
+
+      if (input.content === proposalPrompt) {
+        yield {
+          delta: "如果你愿意，我下一步可以先把 node-todo/app.js 改成读取 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 补上 maxlength 100。"
+        };
+        return;
+      }
+
+      if (input.content.startsWith(executeProposalPrompt)) {
+        assert.match(input.content, /Approved proposal:/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/app.js",
+            startLine: 1,
+            endLine: 2
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${executeProposalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1,
+              replacement: '<input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield { delta: "已按上一条优化方案更新 node-todo/app.js 和 node-todo/views/index.ejs。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ChineseOptimizeProposalProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const proposalResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "看看项目，但先别改，告诉我如果优化 node-todo 你会怎么做。"
+  });
+  assert.match(proposalResult.assistantText, /app\.js/i);
+  assert.match(proposalResult.assistantText, /views\/index\.ejs/i);
+
+  const followUpResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "帮我优化下"
+  });
+
+  const optimizedAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const optimizedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(optimizedAppContent, /process\.env\.PORT/);
+  assert.match(optimizedViewContent, /maxlength="100"/);
+  assert.match(followUpResult.assistantText, /上一条优化方案|node-todo/i);
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-2")),
+    "expected Chinese optimize proposal follow-up to execute from app.js"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1")),
+    "expected Chinese optimize proposal follow-up to continue into views/index.ejs"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1 · updated")),
+    "expected Chinese optimize proposal follow-up to finish the view edit"
+  );
+}
+
+async function verifyDirectEditFollowUpExecutesPreviousProposal() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-direct-edit-follow-up-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const PORT = 3000;\nconsole.log(PORT);\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<input name="title" />\n',
+    "utf8"
+  );
+
+  class DirectEditFollowUpProvider implements ProviderClient {
+    readonly name = "direct-edit-follow-up-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const proposalPrompt = "看看项目，但先别改，告诉我如果优化 node-todo 你会怎么做。";
+      const executeProposalPrompt = 'The user replied "直接改" to approve the immediately previous proposal.';
+
+      if (input.content === proposalPrompt) {
+        yield {
+          delta: "如果你愿意，我可以直接优化 node-todo：先改 node-todo/app.js，再改 node-todo/views/index.ejs。"
+        };
+        return;
+      }
+
+      if (input.content.startsWith(executeProposalPrompt)) {
+        assert.match(input.content, /Approved proposal:/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/app.js",
+            startLine: 1,
+            endLine: 2
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${executeProposalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1,
+              replacement: '<input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield { delta: "已直接按上一条方案完成 node-todo 优化。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new DirectEditFollowUpProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const proposalResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "看看项目，但先别改，告诉我如果优化 node-todo 你会怎么做。"
+  });
+  assert.match(proposalResult.assistantText, /app\.js/i);
+  assert.match(proposalResult.assistantText, /views\/index\.ejs/i);
+
+  const followUpResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "直接改"
+  });
+
+  const optimizedAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const optimizedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(optimizedAppContent, /process\.env\.PORT/);
+  assert.match(optimizedViewContent, /maxlength="100"/);
+  assert.match(followUpResult.assistantText, /node-todo/i);
+  assert.doesNotMatch(followUpResult.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-2")),
+    "expected direct-edit follow-up to execute the previous proposal from app.js"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1")),
+    "expected direct-edit follow-up to continue the previous proposal into views/index.ejs"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1 · updated")),
+    "expected direct-edit follow-up to finish the previous proposal"
+  );
+}
+
+async function verifyFollowPreviousPlanExecutesPreviousProposal() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-follow-plan-follow-up-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const PORT = 3000;\nconsole.log(PORT);\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<input name="title" />\n',
+    "utf8"
+  );
+
+  class FollowPreviousPlanProvider implements ProviderClient {
+    readonly name = "follow-previous-plan-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const proposalPrompt = "看看项目，但先别改，告诉我如果优化 node-todo 你会怎么做。";
+      const executeProposalPrompt = 'The user replied "按你说的改" to approve the immediately previous proposal.';
+
+      if (input.content === proposalPrompt) {
+        yield {
+          delta: "如果你愿意，我可以先把 node-todo/app.js 改成读取 process.env.PORT，再把 node-todo/views/index.ejs 的 input 补上 maxlength 100。"
+        };
+        return;
+      }
+
+      if (input.content.startsWith(executeProposalPrompt)) {
+        assert.match(input.content, /Approved proposal:/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/app.js",
+            startLine: 1,
+            endLine: 2
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${executeProposalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1,
+              replacement: '<input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield { delta: "已按上一条方案完成 node-todo 优化。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new FollowPreviousPlanProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const proposalResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "看看项目，但先别改，告诉我如果优化 node-todo 你会怎么做。"
+  });
+  assert.match(proposalResult.assistantText, /app\.js/i);
+  assert.match(proposalResult.assistantText, /views\/index\.ejs/i);
+
+  const followUpResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "按你说的改"
+  });
+
+  const optimizedAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const optimizedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(optimizedAppContent, /process\.env\.PORT/);
+  assert.match(optimizedViewContent, /maxlength="100"/);
+  assert.match(followUpResult.assistantText, /node-todo/i);
+  assert.doesNotMatch(followUpResult.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-2")),
+    "expected follow-previous-plan follow-up to execute the previous proposal from app.js"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1")),
+    "expected follow-previous-plan follow-up to continue the previous proposal into views/index.ejs"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1 · updated")),
+    "expected follow-previous-plan follow-up to finish the previous proposal"
+  );
+}
+
+async function verifyFollowPreviousPlanVariantExecutesPreviousProposal() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-follow-plan-variant-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const PORT = 3000;\nconsole.log(PORT);\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<input name="title" />\n',
+    "utf8"
+  );
+
+  class FollowPreviousPlanVariantProvider implements ProviderClient {
+    readonly name = "follow-previous-plan-variant-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const proposalPrompt = "看看项目，但先别改，告诉我如果优化 node-todo 你会怎么做。";
+      const executeProposalPrompt = 'The user replied "就按这个改吧" to approve the immediately previous proposal.';
+
+      if (input.content === proposalPrompt) {
+        yield {
+          delta: "如果你愿意，我可以先把 node-todo/app.js 改成读取 process.env.PORT，再把 node-todo/views/index.ejs 的 input 补上 maxlength 100。"
+        };
+        return;
+      }
+
+      if (input.content.startsWith(executeProposalPrompt)) {
+        assert.match(input.content, /Approved proposal:/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/app.js",
+            startLine: 1,
+            endLine: 2
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${executeProposalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1,
+              replacement: '<input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield { delta: "已按这个方案完成 node-todo 优化。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new FollowPreviousPlanVariantProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const proposalResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "看看项目，但先别改，告诉我如果优化 node-todo 你会怎么做。"
+  });
+  assert.match(proposalResult.assistantText, /app\.js/i);
+  assert.match(proposalResult.assistantText, /views\/index\.ejs/i);
+
+  const followUpResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "就按这个改吧"
+  });
+
+  const optimizedAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const optimizedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(optimizedAppContent, /process\.env\.PORT/);
+  assert.match(optimizedViewContent, /maxlength="100"/);
+  assert.match(followUpResult.assistantText, /node-todo/i);
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-2")),
+    "expected follow-previous-plan variant to execute the previous proposal from app.js"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1")),
+    "expected follow-previous-plan variant to continue the previous proposal into views/index.ejs"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1 · updated")),
+    "expected follow-previous-plan variant to finish the previous proposal"
+  );
+}
+
+async function verifyFollowPreviousPlanComeVariantExecutesPreviousProposal() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-follow-plan-come-variant-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const PORT = 3000;\nconsole.log(PORT);\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<input name="title" />\n',
+    "utf8"
+  );
+
+  class FollowPreviousPlanComeVariantProvider implements ProviderClient {
+    readonly name = "follow-previous-plan-come-variant-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const proposalPrompt = "看看项目，但先别改，告诉我如果优化 node-todo 你会怎么做。";
+      const executeProposalPrompt = 'The user replied "按这个来" to approve the immediately previous proposal.';
+
+      if (input.content === proposalPrompt) {
+        yield {
+          delta: "如果你愿意，我可以先把 node-todo/app.js 改成读取 process.env.PORT，再把 node-todo/views/index.ejs 的 input 补上 maxlength 100。"
+        };
+        return;
+      }
+
+      if (input.content.startsWith(executeProposalPrompt)) {
+        assert.match(input.content, /Approved proposal:/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/app.js",
+            startLine: 1,
+            endLine: 2
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${executeProposalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1,
+              replacement: '<input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield { delta: "已按这个方案完成 node-todo 优化。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new FollowPreviousPlanComeVariantProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const proposalResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "看看项目，但先别改，告诉我如果优化 node-todo 你会怎么做。"
+  });
+  assert.match(proposalResult.assistantText, /app\.js/i);
+  assert.match(proposalResult.assistantText, /views\/index\.ejs/i);
+
+  const followUpResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "按这个来"
+  });
+
+  const optimizedAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const optimizedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(optimizedAppContent, /process\.env\.PORT/);
+  assert.match(optimizedViewContent, /maxlength="100"/);
+  assert.match(followUpResult.assistantText, /node-todo/i);
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-2")),
+    "expected follow-previous-plan come variant to execute the previous proposal from app.js"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1")),
+    "expected follow-previous-plan come variant to continue the previous proposal into views/index.ejs"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1 · updated")),
+    "expected follow-previous-plan come variant to finish the previous proposal"
+  );
+}
+
+async function verifyFollowPreviousPlanComeSoftVariantExecutesPreviousProposal() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-follow-plan-come-soft-variant-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const PORT = 3000;\nconsole.log(PORT);\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<input name="title" />\n',
+    "utf8"
+  );
+
+  class FollowPreviousPlanComeSoftVariantProvider implements ProviderClient {
+    readonly name = "follow-previous-plan-come-soft-variant-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const proposalPrompt = "看看项目，但先别改，告诉我如果优化 node-todo 你会怎么做。";
+      const executeProposalPrompt = 'The user replied "按这个来吧" to approve the immediately previous proposal.';
+
+      if (input.content === proposalPrompt) {
+        yield {
+          delta: "如果你愿意，我可以先把 node-todo/app.js 改成读取 process.env.PORT，再把 node-todo/views/index.ejs 的 input 补上 maxlength 100。"
+        };
+        return;
+      }
+
+      if (input.content.startsWith(executeProposalPrompt)) {
+        assert.match(input.content, /Approved proposal:/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/app.js",
+            startLine: 1,
+            endLine: 2
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${executeProposalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1,
+              replacement: '<input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield { delta: "已按这个方案完成 node-todo 优化。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new FollowPreviousPlanComeSoftVariantProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const proposalResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "看看项目，但先别改，告诉我如果优化 node-todo 你会怎么做。"
+  });
+  assert.match(proposalResult.assistantText, /app\.js/i);
+  assert.match(proposalResult.assistantText, /views\/index\.ejs/i);
+
+  const followUpResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "按这个来吧"
+  });
+
+  const optimizedAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const optimizedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(optimizedAppContent, /process\.env\.PORT/);
+  assert.match(optimizedViewContent, /maxlength="100"/);
+  assert.match(followUpResult.assistantText, /node-todo/i);
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-2")),
+    "expected follow-previous-plan come soft variant to execute the previous proposal from app.js"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1")),
+    "expected follow-previous-plan come soft variant to continue the previous proposal into views/index.ejs"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1 · updated")),
+    "expected follow-previous-plan come soft variant to finish the previous proposal"
+  );
+}
+
+async function verifyProposalAcceptanceResumesInterruptedProposalExecution() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-proposal-acceptance-resume-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const PORT = 3000;\nconsole.log(PORT);\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<input name="title" />\n',
+    "utf8"
+  );
+
+  class ProposalAcceptanceResumeProvider implements ProviderClient {
+    readonly name = "proposal-acceptance-resume-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const proposalPrompt = "看看项目，但先别改，告诉我如果优化 node-todo 你会怎么做。";
+      const executeProposalPrompt = 'The user replied "可以" to approve the immediately previous proposal.';
+      const resumePrompt = 'The user replied "就按这个改吧" and wants to continue the most recent unfinished task.';
+
+      if (input.content === proposalPrompt) {
+        yield {
+          delta: "如果你愿意，我可以先把 node-todo/app.js 改成读取 process.env.PORT，再把 node-todo/views/index.ejs 的 input 补上 maxlength 100。"
+        };
+        return;
+      }
+
+      if (input.content.startsWith(executeProposalPrompt)) {
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/app.js",
+            startLine: 1,
+            endLine: 2
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${executeProposalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          await waitForProviderDelay(input.signal, 300);
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1
+            })
+          };
+          return;
+        }
+      }
+
+      if (input.content.startsWith(resumePrompt)) {
+        assert.match(input.content, /Resume that task now instead of treating this as a generic acknowledgement\./);
+        assert.match(input.content, /Original task: 看看项目，但先别改，告诉我如果优化 node-todo 你会怎么做。/);
+        assert.match(input.content, /Latest tool in context: edit/);
+        assert.match(input.content, /Latest tool summary in context: node-todo\/app\.js:1-1 · updated/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/views/index.ejs",
+            startLine: 1,
+            endLine: 1
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${resumePrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1,
+              replacement: '<input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield { delta: "Completed the interrupted proposal execution by continuing directly with node-todo/views/index.ejs." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ProposalAcceptanceResumeProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const proposalResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "看看项目，但先别改，告诉我如果优化 node-todo 你会怎么做。"
+  });
+  assert.match(proposalResult.assistantText, /app\.js/i);
+  assert.match(proposalResult.assistantText, /views\/index\.ejs/i);
+
+  const firstRunCompletion = waitForAssistantTaskCompletion(bus, session.sessionId);
+  const firstEditCompleted = new Promise<void>((resolve) => {
+    const off = bus.on("tool.execution.completed", (event) => {
+      if (event.sessionId !== session.sessionId || !event.payload.summary.startsWith("node-todo/app.js:1-1 · updated")) {
+        return;
+      }
+
+      off();
+      resolve();
+    });
+  });
+
+  bus.emit(createUserMessageSubmittedEvent({
+    sessionId: session.sessionId,
+    content: "可以"
+  }));
+
+  await firstEditCompleted;
+  bus.emit(createRuntimeInterruptRequestedEvent({
+    sessionId: session.sessionId,
+    reason: "cancel"
+  }));
+
+  const cancelledTask = await firstRunCompletion;
+  assert.equal(cancelledTask.payload.state, "cancelled");
+
+  const resumedResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "就按这个改吧"
+  });
+
+  const resumedAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const resumedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(resumedAppContent, /process\.env\.PORT/);
+  assert.match(resumedViewContent, /maxlength="100"/);
+  assert.doesNotMatch(resumedResult.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-2")),
+    false,
+    "proposal-acceptance resume should not reread app.js from the original proposal"
+  );
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-1 · updated")),
+    false,
+    "proposal-acceptance resume should not reapply the app.js edit"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1")),
+    "proposal-acceptance resume should continue into the pending view file"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1 · updated")),
+    "proposal-acceptance resume should finish the pending view edit"
+  );
+}
+
+async function verifyMultiTargetProposalReplyContinuesExecution() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-multi-target-proposal-reply-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const PORT = 3000;\nconsole.log(PORT);\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<input name="title" />\n',
+    "utf8"
+  );
+
+  class MultiTargetProposalReplyProvider implements ProviderClient {
+    readonly name = "multi-target-proposal-reply-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "直接优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100。";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/app.js",
+            startLine: 1,
+            endLine: 2
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          if (/The original request contains multiple concrete file changes\./.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/views/index.ejs",
+                startLine: 1,
+                endLine: 1
+              })
+            };
+            return;
+          }
+
+          yield {
+            delta: "如果你愿意，我下一步可以继续更新 node-todo/views/index.ejs。"
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1,
+              replacement: '<input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield { delta: "已完成 node-todo/app.js 和 node-todo/views/index.ejs 的优化。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new MultiTargetProposalReplyProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "直接优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100。"
+  });
+
+  const optimizedAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const optimizedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(optimizedAppContent, /process\.env\.PORT/);
+  assert.match(optimizedViewContent, /maxlength="100"/);
+  assert.match(result.assistantText, /node-todo/i);
+  assert.doesNotMatch(result.assistantText, /如果你愿意，我下一步可以继续更新/u);
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1")),
+    "expected multi-target proposal reply to continue into the pending view file"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1 · updated")),
+    "expected multi-target proposal reply to finish the pending view edit"
+  );
+}
+
+async function verifyVerificationProposalReplyContinuesExecution() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-verification-proposal-reply-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const PORT = 3000;\nconsole.log(PORT);\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<input name="title" />\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "verify-setup.mjs"),
+    [
+      'import fs from "node:fs";',
+      'const app = fs.readFileSync(new URL("./app.js", import.meta.url), "utf8");',
+      'const view = fs.readFileSync(new URL("./views/index.ejs", import.meta.url), "utf8");',
+      'if (/process\\.env\\.PORT/.test(app) && /maxlength="100"/.test(view)) {',
+      '  console.log("ready");',
+      '} else {',
+      '  console.log("app-only");',
+      '}',
+      ""
+    ].join("\n"),
+    "utf8"
+  );
+
+  class VerificationProposalReplyProvider implements ProviderClient {
+    readonly name = "verification-proposal-reply-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100，并运行 `node node-todo/verify-setup.mjs` 验证，直到输出 exactly `ready`。";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/app.js",
+            startLine: 1,
+            endLine: 2
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-setup.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /verify-setup\.mjs/.test(summary) && /app-only/.test(input.content)) {
+          if (/You are already inside the execution phase of a concrete task\./.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/views/index.ejs",
+                startLine: 1,
+                endLine: 1
+              })
+            };
+            return;
+          }
+
+          yield {
+            delta: "如果你愿意，我下一步可以继续更新 node-todo/views/index.ejs，然后重新运行 node node-todo/verify-setup.mjs。"
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1,
+              replacement: '<input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-setup.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /verify-setup\.mjs/.test(summary) && /\bready\b/.test(input.content)) {
+          yield { delta: "已完成 node-todo 优化，并重新验证得到 ready。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new VerificationProposalReplyProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100，并运行 `node node-todo/verify-setup.mjs` 验证，直到输出 exactly `ready`。"
+  });
+
+  const optimizedAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const optimizedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(optimizedAppContent, /process\.env\.PORT/);
+  assert.match(optimizedViewContent, /maxlength="100"/);
+  assert.match(result.assistantText, /ready|node-todo/i);
+  assert.doesNotMatch(result.assistantText, /如果你愿意，我下一步可以继续更新/u);
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node node-todo/verify-setup.mjs · completed")),
+    "expected verification proposal reply flow to rerun verification"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1")),
+    "expected verification proposal reply flow to continue into the pending view file"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1 · updated")),
+    "expected verification proposal reply flow to finish the pending view edit"
+  );
+}
+
+async function verifyGenericVerificationStageSummaryStillContinues() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-generic-verify-stage-summary-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const PORT = 3000;\nconsole.log(PORT);\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<input name="title" />\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "verify-generic.mjs"),
+    [
+      'import fs from "node:fs";',
+      'const app = fs.readFileSync(new URL("./app.js", import.meta.url), "utf8");',
+      'const view = fs.readFileSync(new URL("./views/index.ejs", import.meta.url), "utf8");',
+      'if (/process\\.env\\.PORT/.test(app) && /maxlength="100"/.test(view)) {',
+      '  console.log("ready");',
+      '} else if (/process\\.env\\.PORT/.test(app)) {',
+      '  console.log("app-only");',
+      '} else {',
+      '  console.log("not-ready");',
+      '}',
+      ""
+    ].join("\n"),
+    "utf8"
+  );
+
+  class GenericVerificationStageSummaryProvider implements ProviderClient {
+    readonly name = "generic-verification-stage-summary-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100，并运行 `node node-todo/verify-generic.mjs` 验证，直到它正确为止。";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/app.js",
+            startLine: 1,
+            endLine: 2
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-generic.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /verify-generic\.mjs/.test(summary) && /app-only/.test(input.content)) {
+          if (/You are already inside the execution phase of a concrete task\./.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/views/index.ejs",
+                startLine: 1,
+                endLine: 1
+              })
+            };
+            return;
+          }
+
+          yield {
+            delta: "I updated node-todo/app.js and will continue with node-todo/views/index.ejs before rerunning node node-todo/verify-generic.mjs."
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1,
+              replacement: '<input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-generic.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /verify-generic\.mjs/.test(summary) && /\bready\b/.test(input.content)) {
+          yield { delta: "Completed the generic verification flow and verified that node-todo is now correct." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new GenericVerificationStageSummaryProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100，并运行 `node node-todo/verify-generic.mjs` 验证，直到它正确为止。"
+  });
+
+  const optimizedAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const optimizedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(optimizedAppContent, /process\.env\.PORT/);
+  assert.match(optimizedViewContent, /maxlength="100"/);
+  assert.match(result.assistantText, /correct|node-todo|ready/i);
+  assert.doesNotMatch(result.assistantText, /will continue with node-todo\/views\/index\.ejs/i);
+  assert.ok(
+    result.toolSummaries.filter((summary) => summary.startsWith("node node-todo/verify-generic.mjs · completed")).length >= 2,
+    "expected generic verification flow to rerun verification after the pending-work stage summary"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1")),
+    "expected generic verification flow to continue into the pending view file after the shell stage summary"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1 · updated")),
+    "expected generic verification flow to finish the pending view edit"
+  );
+}
+
+async function verifyGenericVerificationQuestionStillContinues() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-generic-verify-question-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const PORT = 3000;\nconsole.log(PORT);\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<input name="title" />\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "verify-generic-question.mjs"),
+    [
+      'import fs from "node:fs";',
+      'const app = fs.readFileSync(new URL("./app.js", import.meta.url), "utf8");',
+      'const view = fs.readFileSync(new URL("./views/index.ejs", import.meta.url), "utf8");',
+      'if (/process\\.env\\.PORT/.test(app) && /maxlength="100"/.test(view)) {',
+      '  console.log("ready");',
+      '} else if (/process\\.env\\.PORT/.test(app)) {',
+      '  console.log("app-only");',
+      '} else {',
+      '  console.log("not-ready");',
+      '}',
+      ""
+    ].join("\n"),
+    "utf8"
+  );
+
+  class GenericVerificationQuestionProvider implements ProviderClient {
+    readonly name = "generic-verification-question-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100，并运行 `node node-todo/verify-generic-question.mjs` 验证，直到它正确为止。";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/app.js",
+            startLine: 1,
+            endLine: 2
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-generic-question.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /verify-generic-question\.mjs/.test(summary) && /app-only/.test(input.content)) {
+          if (/You are already inside the execution phase of a concrete task\./.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/views/index.ejs",
+                startLine: 1,
+                endLine: 1
+              })
+            };
+            return;
+          }
+
+          yield {
+            delta: "I updated node-todo/app.js. Do you want me to keep going with node-todo/views/index.ejs or stop here?"
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1,
+              replacement: '<input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-generic-question.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /verify-generic-question\.mjs/.test(summary) && /\bready\b/.test(input.content)) {
+          yield { delta: "Completed the generic verification question flow and verified that node-todo is now correct." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new GenericVerificationQuestionProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100，并运行 `node node-todo/verify-generic-question.mjs` 验证，直到它正确为止。"
+  });
+
+  const optimizedAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const optimizedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(optimizedAppContent, /process\.env\.PORT/);
+  assert.match(optimizedViewContent, /maxlength="100"/);
+  assert.match(result.assistantText, /correct|node-todo|ready/i);
+  assert.doesNotMatch(result.assistantText, /Do you want me to keep going/i);
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1")),
+    "expected generic verification question flow to continue into the pending view file after the blocking question"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1 · updated")),
+    "expected generic verification question flow to complete the pending view edit"
+  );
+  assert.ok(
+    result.toolSummaries.filter((summary) => summary.startsWith("node node-todo/verify-generic-question.mjs · completed")).length >= 2,
+    "expected generic verification question flow to rerun verification after the resumed edit"
+  );
+}
+
+async function verifyGenericVerificationProposalStillContinues() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-generic-verify-proposal-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const PORT = 3000;\nconsole.log(PORT);\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<input name="title" />\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "verify-generic-proposal.mjs"),
+    [
+      'import fs from "node:fs";',
+      'const app = fs.readFileSync(new URL("./app.js", import.meta.url), "utf8");',
+      'const view = fs.readFileSync(new URL("./views/index.ejs", import.meta.url), "utf8");',
+      'if (/process\\.env\\.PORT/.test(app) && /maxlength="100"/.test(view)) {',
+      '  console.log("ready");',
+      '} else if (/process\\.env\\.PORT/.test(app)) {',
+      '  console.log("app-only");',
+      '} else {',
+      '  console.log("not-ready");',
+      '}',
+      ""
+    ].join("\n"),
+    "utf8"
+  );
+
+  class GenericVerificationProposalProvider implements ProviderClient {
+    readonly name = "generic-verification-proposal-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100，并运行 `node node-todo/verify-generic-proposal.mjs` 验证，直到它正确为止。";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/app.js",
+            startLine: 1,
+            endLine: 2
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-generic-proposal.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /verify-generic-proposal\.mjs/.test(summary) && /app-only/.test(input.content)) {
+          if (/You are already inside the execution phase of a concrete task\./.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/views/index.ejs",
+                startLine: 1,
+                endLine: 1
+              })
+            };
+            return;
+          }
+
+          yield {
+            delta: "If you want, I can continue by updating node-todo/views/index.ejs and then rerunning node node-todo/verify-generic-proposal.mjs."
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1,
+              replacement: '<input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-generic-proposal.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /verify-generic-proposal\.mjs/.test(summary) && /\bready\b/.test(input.content)) {
+          yield { delta: "Completed the generic verification proposal flow and verified that node-todo is now correct." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new GenericVerificationProposalProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100，并运行 `node node-todo/verify-generic-proposal.mjs` 验证，直到它正确为止。"
+  });
+
+  const optimizedAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const optimizedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(optimizedAppContent, /process\.env\.PORT/);
+  assert.match(optimizedViewContent, /maxlength="100"/);
+  assert.match(result.assistantText, /correct|node-todo|ready/i);
+  assert.doesNotMatch(result.assistantText, /If you want, I can continue/i);
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1")),
+    "expected generic verification proposal flow to continue into the pending view file after the proposal"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1 · updated")),
+    "expected generic verification proposal flow to complete the pending view edit"
+  );
+  assert.ok(
+    result.toolSummaries.filter((summary) => summary.startsWith("node node-todo/verify-generic-proposal.mjs · completed")).length >= 2,
+    "expected generic verification proposal flow to rerun verification after the resumed edit"
+  );
+}
+
+async function verifyGenericVerificationCompletionToneStillContinues() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-generic-verify-completion-tone-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const PORT = 3000;\nconsole.log(PORT);\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<input name="title" />\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "verify-generic-completion-tone.mjs"),
+    [
+      'import fs from "node:fs";',
+      'const app = fs.readFileSync(new URL("./app.js", import.meta.url), "utf8");',
+      'const view = fs.readFileSync(new URL("./views/index.ejs", import.meta.url), "utf8");',
+      'if (/process\\.env\\.PORT/.test(app) && /maxlength="100"/.test(view)) {',
+      '  console.log("ready");',
+      '} else if (/process\\.env\\.PORT/.test(app)) {',
+      '  console.log("app-only");',
+      '} else {',
+      '  console.log("not-ready");',
+      '}',
+      ""
+    ].join("\n"),
+    "utf8"
+  );
+
+  class GenericVerificationCompletionToneProvider implements ProviderClient {
+    readonly name = "generic-verification-completion-tone-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100，并运行 `node node-todo/verify-generic-completion-tone.mjs` 验证，直到它正确为止。";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/app.js",
+            startLine: 1,
+            endLine: 2
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-generic-completion-tone.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /verify-generic-completion-tone\.mjs/.test(summary) && /app-only/.test(input.content)) {
+          if (
+            /You are already inside the execution phase of a concrete task\./.test(input.content)
+            || /Pending next step target: node-todo\/views\/index\.ejs/.test(input.content)
+          ) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/views/index.ejs",
+                startLine: 1,
+                endLine: 1
+              })
+            };
+            return;
+          }
+
+          yield {
+            delta: "node-todo/app.js is fixed and verification now reaches app-only, but node-todo/views/index.ejs still needs maxlength=\"100\" before the task can finish."
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1,
+              replacement: '<input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-generic-completion-tone.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /verify-generic-completion-tone\.mjs/.test(summary) && /\bready\b/.test(input.content)) {
+          yield { delta: "Completed the generic verification completion-tone flow and verified that node-todo is now correct." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new GenericVerificationCompletionToneProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100，并运行 `node node-todo/verify-generic-completion-tone.mjs` 验证，直到它正确为止。"
+  });
+
+  const optimizedAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const optimizedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(optimizedAppContent, /process\.env\.PORT/);
+  assert.match(optimizedViewContent, /maxlength="100"/);
+  assert.match(result.assistantText, /correct|node-todo|ready/i);
+  assert.doesNotMatch(result.assistantText, /still needs maxlength="100" before the task can finish/i);
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1")),
+    "expected generic verification completion-tone flow to continue into the pending view file"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1 · updated")),
+    "expected generic verification completion-tone flow to complete the pending view edit"
+  );
+  assert.ok(
+    result.toolSummaries.filter((summary) => summary.startsWith("node node-todo/verify-generic-completion-tone.mjs · completed")).length >= 2,
+    "expected generic verification completion-tone flow to rerun verification after the resumed edit"
+  );
+}
+
+async function verifyProjectInspectionProposalReplyContinuesExecution() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-project-inspection-proposal-reply-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "package.json"),
+    '{\n  "name": "node-todo",\n  "version": "1.0.0"\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const app = {};\nmodule.exports = app;\n',
+    "utf8"
+  );
+
+  class ProjectInspectionProposalReplyProvider implements ProviderClient {
+    readonly name = "project-inspection-proposal-reply-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "看看项目";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "pwd && ls -la && find . -maxdepth 2 -type f | sed 's#^./##' | sort | head -200"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell" && /pwd && ls -la && find \. -maxdepth 2 -type f/.test(summary)) {
+          if (/You are in the middle of a concrete project inspection request\./.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/package.json",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+
+          yield {
+            delta: "如果你愿意，我下一步可以先读 node-todo/package.json。"
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield { delta: "我已经读完 node-todo/package.json 和 node-todo/app.js。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ProjectInspectionProposalReplyProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "看看项目"
+  });
+
+  assert.match(result.assistantText, /node-todo|package\.json/i);
+  assert.doesNotMatch(result.assistantText, /如果你愿意，我下一步可以先读/u);
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/package.json:1-3")),
+    "expected project inspection proposal reply flow to continue into package.json"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-2")),
+    "expected project inspection proposal reply flow to continue into app.js"
+  );
+}
+
+async function verifyWholeProjectInspectionProposalReplyContinuesExecution() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-whole-project-proposal-reply-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "package.json"),
+    '{\n  "name": "node-todo",\n  "version": "1.0.0"\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const app = {};\nmodule.exports = app;\n',
+    "utf8"
+  );
+
+  class WholeProjectInspectionProposalReplyProvider implements ProviderClient {
+    readonly name = "whole-project-inspection-proposal-reply-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "你能一次性都帮我看完整个项目吗";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "pwd && ls -la && find . -maxdepth 2 -type f | sed 's#^./##' | sort | head -200"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell" && /pwd && ls -la && find \. -maxdepth 2 -type f/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/package.json",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          if (/Treat this as a whole-project inspection follow-up, not a single-file peek\./.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/app.js",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+
+          yield {
+            delta: "如果你愿意，我下一步可以继续看 node-todo/app.js。"
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield { delta: "我已经继续看完 node-todo/app.js。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new WholeProjectInspectionProposalReplyProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "你能一次性都帮我看完整个项目吗"
+  });
+
+  assert.match(result.assistantText, /node-todo|app\.js/i);
+  assert.doesNotMatch(result.assistantText, /如果你愿意，我下一步可以继续看/u);
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/package.json:1-3")),
+    "expected whole-project inspection proposal reply flow to inspect the project entry"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-2")),
+    "expected whole-project inspection proposal reply flow to continue into app.js"
+  );
+}
+
+async function verifyProjectWorkfileProposalReplyContinuesExecution() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-project-workfile-proposal-reply-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "package.json"),
+    '{\n  "name": "node-todo",\n  "version": "1.0.0"\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const PORT = 3000;\nconsole.log(PORT);\n',
+    "utf8"
+  );
+
+  class ProjectWorkfileProposalReplyProvider implements ProviderClient {
+    readonly name = "project-workfile-proposal-reply-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "看看项目然后帮我优化下";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "pwd && ls -la && find . -maxdepth 2 -type f | sed 's#^./##' | sort | head -200"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell" && /pwd && ls -la && find \. -maxdepth 2 -type f/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/package.json",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          if (/You are in the middle of a project improvement task\./.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/app.js",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+
+          yield {
+            delta: "如果你愿意，我下一步可以先看 node-todo/app.js。"
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield { delta: "已完成 node-todo/app.js 的优化。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ProjectWorkfileProposalReplyProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "看看项目然后帮我优化下"
+  });
+
+  const optimizedAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  assert.match(optimizedAppContent, /process\.env\.PORT/);
+  assert.match(result.assistantText, /node-todo|app\.js/i);
+  assert.doesNotMatch(result.assistantText, /如果你愿意，我下一步可以先看/u);
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/package.json:1-3")),
+    "expected project workfile proposal reply flow to inspect the project entry"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-2")),
+    "expected project workfile proposal reply flow to continue into app.js"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-1 · updated")),
+    "expected project workfile proposal reply flow to continue into a concrete edit"
+  );
+}
+
+async function verifyThinTerminalCompletionReplyGetsTightened() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-thin-terminal-completion-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+
+  await writeFile(
+    join(workspace, "exact-report.mjs"),
+    'console.log("SelfMe-3000");\n',
+    "utf8"
+  );
+
+  class ThinTerminalCompletionProvider implements ProviderClient {
+    readonly name = "thin-terminal-completion-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "Run `node exact-report.mjs`, fix the existing files so it prints exactly `SelfMe:3000`, and keep verifying until it is correct.";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "node exact-report.mjs"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell" && /node exact-report\.mjs/.test(summary) && /SelfMe-3000/.test(input.content)) {
+          yield {
+            delta: toolCall("files", {
+              path: "exact-report.mjs",
+              startLine: 1,
+              endLine: 1
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /exact-report\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "exact-report.mjs",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'console.log("SelfMe:3000");'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /exact-report\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node exact-report.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /node exact-report\.mjs/.test(summary) && /SelfMe:3000/.test(input.content)) {
+          yield { delta: "Done." };
+          return;
+        }
+      }
+
+      if (/The latest tool result appears to satisfy the task, but your previous reply did not close it clearly\./.test(input.content)) {
+        assert.match(input.content, /Preferred next action: answer directly in one short sentence that clearly states the completed outcome/);
+        yield { delta: "exact-report.mjs now prints exactly SelfMe:3000." };
+        return;
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ThinTerminalCompletionProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Run `node exact-report.mjs`, fix the existing files so it prints exactly `SelfMe:3000`, and keep verifying until it is correct."
+  });
+
+  const exactReportContent = await readFile(join(workspace, "exact-report.mjs"), "utf8");
+  assert.match(exactReportContent, /SelfMe:3000/);
+  assert.match(result.assistantText, /exact-report\.mjs now prints exactly SelfMe:3000/i);
+  assert.doesNotMatch(result.assistantText, /^Done\.$/);
+  assert.ok(
+    result.toolSummaries.filter((summary) => summary.startsWith("node exact-report.mjs · completed")).length >= 2,
+    "expected repeated successful verification before tightening the terminal completion reply"
+  );
+}
+
+async function verifyThinChineseTerminalCompletionReplyGetsTightened() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-thin-terminal-completion-zh-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+
+  await writeFile(
+    join(workspace, "exact-report-zh.mjs"),
+    'console.log("SelfMe-3000");\n',
+    "utf8"
+  );
+
+  class ThinChineseTerminalCompletionProvider implements ProviderClient {
+    readonly name = "thin-chinese-terminal-completion-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "运行 `node exact-report-zh.mjs`，修好现有文件，让它精确输出 `SelfMe:3000`，并持续验证直到正确。";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "node exact-report-zh.mjs"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell" && /node exact-report-zh\.mjs/.test(summary) && /SelfMe-3000/.test(input.content)) {
+          yield {
+            delta: toolCall("files", {
+              path: "exact-report-zh.mjs",
+              startLine: 1,
+              endLine: 1
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /exact-report-zh\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "exact-report-zh.mjs",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'console.log("SelfMe:3000");'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /exact-report-zh\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node exact-report-zh.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /node exact-report-zh\.mjs/.test(summary) && /SelfMe:3000/.test(input.content)) {
+          yield { delta: "好的，已完成。" };
+          return;
+        }
+      }
+
+      if (/The latest tool result appears to satisfy the task, but your previous reply did not close it clearly\./.test(input.content)) {
+        yield { delta: "exact-report-zh.mjs 现在已经精确输出 SelfMe:3000。" };
+        return;
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ThinChineseTerminalCompletionProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "运行 `node exact-report-zh.mjs`，修好现有文件，让它精确输出 `SelfMe:3000`，并持续验证直到正确。"
+  });
+
+  const exactReportContent = await readFile(join(workspace, "exact-report-zh.mjs"), "utf8");
+  assert.match(exactReportContent, /SelfMe:3000/);
+  assert.match(result.assistantText, /exact-report-zh\.mjs .*SelfMe:3000/u);
+  assert.doesNotMatch(result.assistantText, /^好的，已完成。$/u);
+  assert.ok(
+    result.toolSummaries.filter((summary) => summary.startsWith("node exact-report-zh.mjs · completed")).length >= 2,
+    "expected repeated successful verification before tightening the Chinese terminal completion reply"
+  );
+}
+
+async function verifyMismatchedExactOutputCompletionReplyGetsTightened() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-mismatched-exact-output-completion-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+
+  await writeFile(
+    join(workspace, "exact-report-mismatch.mjs"),
+    'console.log("SelfMe-3000");\n',
+    "utf8"
+  );
+
+  class MismatchedExactOutputCompletionProvider implements ProviderClient {
+    readonly name = "mismatched-exact-output-completion-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "Run `node exact-report-mismatch.mjs`, fix the existing files so it prints exactly `SelfMe:3000`, and keep verifying until it is correct.";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "node exact-report-mismatch.mjs"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell" && /node exact-report-mismatch\.mjs/.test(summary) && /SelfMe-3000/.test(input.content)) {
+          yield {
+            delta: toolCall("files", {
+              path: "exact-report-mismatch.mjs",
+              startLine: 1,
+              endLine: 1
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /exact-report-mismatch\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "exact-report-mismatch.mjs",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'console.log("SelfMe:3000");'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /exact-report-mismatch\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node exact-report-mismatch.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /node exact-report-mismatch\.mjs/.test(summary) && /SelfMe:3000/.test(input.content)) {
+          yield { delta: "exact-report-mismatch.mjs now prints exactly SelfMe:3001." };
+          return;
+        }
+      }
+
+      if (/The latest tool result appears to satisfy the task, but your previous reply did not close it clearly\./.test(input.content)) {
+        assert.match(input.content, /Expected output: SelfMe:3000/);
+        yield { delta: "exact-report-mismatch.mjs now prints exactly SelfMe:3000." };
+        return;
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new MismatchedExactOutputCompletionProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Run `node exact-report-mismatch.mjs`, fix the existing files so it prints exactly `SelfMe:3000`, and keep verifying until it is correct."
+  });
+
+  const exactReportContent = await readFile(join(workspace, "exact-report-mismatch.mjs"), "utf8");
+  assert.match(exactReportContent, /SelfMe:3000/);
+  assert.match(result.assistantText, /exact-report-mismatch\.mjs now prints exactly SelfMe:3000/i);
+  assert.doesNotMatch(result.assistantText, /SelfMe:3001/);
+  assert.ok(
+    result.toolSummaries.filter((summary) => summary.startsWith("node exact-report-mismatch.mjs · completed")).length >= 2,
+    "expected repeated successful verification before tightening the mismatched exact-output completion reply"
+  );
+}
+
+async function verifyMismatchedChineseExactOutputCompletionReplyGetsTightened() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-mismatched-exact-output-completion-zh-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+
+  await writeFile(
+    join(workspace, "exact-report-mismatch-zh.mjs"),
+    'console.log("SelfMe-3000");\n',
+    "utf8"
+  );
+
+  class MismatchedChineseExactOutputCompletionProvider implements ProviderClient {
+    readonly name = "mismatched-chinese-exact-output-completion-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "运行 `node exact-report-mismatch-zh.mjs`，修好现有文件，让它精确输出 `SelfMe:3000`，并持续验证直到正确。";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "node exact-report-mismatch-zh.mjs"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell" && /node exact-report-mismatch-zh\.mjs/.test(summary) && /SelfMe-3000/.test(input.content)) {
+          yield {
+            delta: toolCall("files", {
+              path: "exact-report-mismatch-zh.mjs",
+              startLine: 1,
+              endLine: 1
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /exact-report-mismatch-zh\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "exact-report-mismatch-zh.mjs",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'console.log("SelfMe:3000");'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /exact-report-mismatch-zh\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node exact-report-mismatch-zh.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /node exact-report-mismatch-zh\.mjs/.test(summary) && /SelfMe:3000/.test(input.content)) {
+          yield { delta: "exact-report-mismatch-zh.mjs 现在已经精确输出 SelfMe:3001。" };
+          return;
+        }
+      }
+
+      if (/The latest tool result appears to satisfy the task, but your previous reply did not close it clearly\./.test(input.content)) {
+        yield { delta: "exact-report-mismatch-zh.mjs 现在已经精确输出 SelfMe:3000。" };
+        return;
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new MismatchedChineseExactOutputCompletionProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "运行 `node exact-report-mismatch-zh.mjs`，修好现有文件，让它精确输出 `SelfMe:3000`，并持续验证直到正确。"
+  });
+
+  const exactReportContent = await readFile(join(workspace, "exact-report-mismatch-zh.mjs"), "utf8");
+  assert.match(exactReportContent, /SelfMe:3000/);
+  assert.match(result.assistantText, /exact-report-mismatch-zh\.mjs .*SelfMe:3000/u);
+  assert.doesNotMatch(result.assistantText, /SelfMe:3001/u);
+  assert.ok(
+    result.toolSummaries.filter((summary) => summary.startsWith("node exact-report-mismatch-zh.mjs · completed")).length >= 2,
+    "expected repeated successful verification before tightening the mismatched Chinese exact-output completion reply"
+  );
+}
+
+async function verifyFileVerificationCompletionReplyWithoutTargetAnchorGetsTightened() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-file-verification-anchor-tightening-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+
+  class FileVerificationAnchorTighteningProvider implements ProviderClient {
+    readonly name = "file-verification-anchor-tightening-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "Create checklist.md with exactly three bullet points: buy milk, ship cli, test tools. Then verify the file.";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("write", {
+            path: "checklist.md",
+            content: "- buy milk\n- ship cli\n- test tools\n"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "write" && /checklist\.md/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "checklist.md",
+              startLine: 1,
+              endLine: 3
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /checklist\.md/.test(summary)) {
+          yield { delta: "I verified that all three requested bullet points are present and the requested content is correct." };
+          return;
+        }
+      }
+
+      if (/The latest tool result appears to satisfy the task, but your previous reply did not close it clearly\./.test(input.content)) {
+        yield { delta: "checklist.md contains the three requested bullet points: buy milk, ship cli, and test tools." };
+        return;
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new FileVerificationAnchorTighteningProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Create checklist.md with exactly three bullet points: buy milk, ship cli, test tools. Then verify the file."
+  });
+
+  const checklistContent = await readFile(join(workspace, "checklist.md"), "utf8");
+  assert.equal(checklistContent, "- buy milk\n- ship cli\n- test tools\n");
+  assert.match(result.assistantText, /checklist\.md/i);
+  assert.doesNotMatch(result.assistantText, /^I verified that all three requested bullet points are present/u);
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("checklist.md:1-3")),
+    "expected checklist file verification before tightening the terminal reply"
+  );
+}
+
+async function verifyShellVerificationCompletionReplyWithoutAnchorGetsTightened() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-shell-verification-anchor-tightening-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+
+  await writeFile(
+    join(workspace, "greet.mjs"),
+    'console.log("Hello");\n',
+    "utf8"
+  );
+
+  class ShellVerificationAnchorTighteningProvider implements ProviderClient {
+    readonly name = "shell-verification-anchor-tightening-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = 'Fix greet.mjs so it prints exactly "Scoped". Verify it.';
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("edit", {
+            path: "greet.mjs",
+            startLine: 1,
+            endLine: 1,
+            replacement: 'console.log("Scoped");'
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "edit" && /greet\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node greet.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /node greet\.mjs/.test(summary) && /Scoped/.test(input.content)) {
+          yield { delta: "I verified the requested behavior and the script is correct now." };
+          return;
+        }
+      }
+
+      if (/The latest tool result appears to satisfy the task, but your previous reply did not close it clearly\./.test(input.content)) {
+        yield { delta: 'greet.mjs now prints exactly "Scoped".' };
+        return;
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ShellVerificationAnchorTighteningProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: 'Fix greet.mjs so it prints exactly "Scoped". Verify it.'
+  });
+
+  const greetContent = await readFile(join(workspace, "greet.mjs"), "utf8");
+  assert.equal(greetContent, 'console.log("Scoped");\n');
+  assert.match(result.assistantText, /greet\.mjs|Scoped/);
+  assert.doesNotMatch(result.assistantText, /^I verified the requested behavior and the script is correct now\.$/);
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node greet.mjs · completed")),
+    "expected greet verification before tightening the terminal reply"
+  );
+}
+
+async function verifyVagueInspectionExecutesPreviousProposal() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-vague-inspect-proposal-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "package.json"),
+    '{\n  "name": "node-todo",\n  "version": "1.0.0",\n  "scripts": {\n    "start": "node app.js"\n  }\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const express = require("express");\nconst app = express();\napp.listen(3000);\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<input name="title" />\n',
+    "utf8"
+  );
+
+  class VagueInspectProposalProvider implements ProviderClient {
+    readonly name = "vague-inspect-proposal-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const proposalPrompt = "看看项目，但先别改，告诉我你会怎么检查 node-todo。";
+      const executeProposalPrompt = 'The user replied "帮我看看" and wants you to execute the immediately previous inspect proposal now.';
+
+      if (input.content === proposalPrompt) {
+        yield {
+          delta: [
+            "If you want, I can inspect node-todo by reading node-todo/package.json first, then node-todo/app.js,",
+            "and finally node-todo/views/index.ejs so I can summarize both structure and UI-related issues."
+          ].join(" ")
+        };
+        return;
+      }
+
+      if (input.content.startsWith(executeProposalPrompt)) {
+        assert.match(input.content, /Approved proposal:/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/package.json",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${executeProposalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield { delta: "I inspected node-todo/package.json, node-todo/app.js, and node-todo/views/index.ejs from the previous inspection proposal." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new VagueInspectProposalProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const proposalResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "看看项目，但先别改，告诉我你会怎么检查 node-todo。"
+  });
+  assert.match(proposalResult.assistantText, /node-todo\/package\.json/i);
+  assert.match(proposalResult.assistantText, /node-todo\/app\.js/i);
+  assert.match(proposalResult.assistantText, /node-todo\/views\/index\.ejs/i);
+
+  const followUpResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "帮我看看"
+  });
+
+  assert.match(followUpResult.assistantText, /node-todo/i);
+  assert.doesNotMatch(followUpResult.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/package.json:1-5")),
+    "expected vague inspection follow-up to execute the previous inspect proposal from package.json"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => /^node-todo\/app\.js:1-\d+/.test(summary)),
+    "expected vague inspection follow-up to continue the previous inspect proposal into app.js"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-20")),
+    "expected vague inspection follow-up to continue the previous inspect proposal into views/index.ejs"
+  );
+}
+
+async function verifyEnglishPlanningStyleInspectionProposalExecutesPreviousProposal() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-english-planning-inspect-proposal-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "package.json"),
+    '{\n  "name": "node-todo",\n  "version": "1.0.0"\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const app = {};\nmodule.exports = app;\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<input name="title" />\n',
+    "utf8"
+  );
+
+  class EnglishPlanningStyleInspectProposalProvider implements ProviderClient {
+    readonly name = "english-planning-style-inspect-proposal-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const proposalPrompt = "看看项目，但先别改，告诉我你会怎么检查 node-todo。";
+      const executeProposalPrompt = 'The user replied "帮我看看" and wants you to execute the immediately previous inspect proposal now.';
+
+      if (input.content === proposalPrompt) {
+        yield {
+          delta: "I would first read node-todo/package.json, then node-todo/app.js, and finally node-todo/views/index.ejs."
+        };
+        return;
+      }
+
+      if (input.content.startsWith(executeProposalPrompt)) {
+        assert.match(input.content, /Approved proposal:/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/package.json",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${executeProposalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield { delta: "I followed the previous inspection order and finished reading package.json, app.js, and views/index.ejs." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new EnglishPlanningStyleInspectProposalProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const proposalResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "看看项目，但先别改，告诉我你会怎么检查 node-todo。"
+  });
+  assert.match(proposalResult.assistantText, /package\.json/i);
+  assert.match(proposalResult.assistantText, /app\.js/i);
+  assert.match(proposalResult.assistantText, /views\/index\.ejs/i);
+
+  const followUpResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "帮我看看"
+  });
+
+  assert.match(followUpResult.assistantText, /inspection order|package\.json|node-todo/i);
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/package.json:1-3")),
+    "expected English planning-style inspect proposal follow-up to execute from package.json"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-2")),
+    "expected English planning-style inspect proposal follow-up to continue into app.js"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1")),
+    "expected English planning-style inspect proposal follow-up to continue into views/index.ejs"
+  );
+}
+
+async function verifyPlanningStyleInspectionProposalExecutesPreviousProposal() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-planning-inspect-proposal-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "package.json"),
+    '{\n  "name": "node-todo",\n  "version": "1.0.0"\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const app = {};\nmodule.exports = app;\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<input name="title" />\n',
+    "utf8"
+  );
+
+  class PlanningStyleInspectProposalProvider implements ProviderClient {
+    readonly name = "planning-style-inspect-proposal-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const proposalPrompt = "看看项目，但先别改，告诉我你会怎么检查 node-todo。";
+      const executeProposalPrompt = 'The user replied "帮我看看" and wants you to execute the immediately previous inspect proposal now.';
+
+      if (input.content === proposalPrompt) {
+        yield {
+          delta: "我会先读 node-todo/package.json，再看 node-todo/app.js，最后看 node-todo/views/index.ejs。"
+        };
+        return;
+      }
+
+      if (input.content.startsWith(executeProposalPrompt)) {
+        assert.match(input.content, /Approved proposal:/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/package.json",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${executeProposalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield { delta: "已按刚才的检查顺序读完 node-todo/package.json、node-todo/app.js 和 node-todo/views/index.ejs。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new PlanningStyleInspectProposalProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const proposalResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "看看项目，但先别改，告诉我你会怎么检查 node-todo。"
+  });
+  assert.match(proposalResult.assistantText, /package\.json/i);
+  assert.match(proposalResult.assistantText, /app\.js/i);
+  assert.match(proposalResult.assistantText, /views\/index\.ejs/i);
+
+  const followUpResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "帮我看看"
+  });
+
+  assert.match(followUpResult.assistantText, /检查顺序|node-todo/i);
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/package.json:1-3")),
+    "expected planning-style inspect proposal follow-up to execute from package.json"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-2")),
+    "expected planning-style inspect proposal follow-up to continue into app.js"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1")),
+    "expected planning-style inspect proposal follow-up to continue into views/index.ejs"
+  );
+}
+
+async function verifyChineseInspectionProposalExecutesPreviousProposal() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-chinese-inspect-proposal-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "package.json"),
+    '{\n  "name": "node-todo",\n  "version": "1.0.0"\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const app = {};\nmodule.exports = app;\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<input name="title" />\n',
+    "utf8"
+  );
+
+  class ChineseInspectProposalProvider implements ProviderClient {
+    readonly name = "chinese-inspect-proposal-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const proposalPrompt = "看看项目，但先别改，告诉我你会怎么检查 node-todo。";
+      const executeProposalPrompt = 'The user replied "帮我看看" and wants you to execute the immediately previous inspect proposal now.';
+
+      if (input.content === proposalPrompt) {
+        yield {
+          delta: "如果你愿意，我下一步可以先读 node-todo/package.json，再看 node-todo/app.js，最后看 node-todo/views/index.ejs。"
+        };
+        return;
+      }
+
+      if (input.content.startsWith(executeProposalPrompt)) {
+        assert.match(input.content, /Approved proposal:/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/package.json",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${executeProposalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield { delta: "已按上一条检查方案读完 node-todo/package.json、node-todo/app.js 和 node-todo/views/index.ejs。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ChineseInspectProposalProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const proposalResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "看看项目，但先别改，告诉我你会怎么检查 node-todo。"
+  });
+  assert.match(proposalResult.assistantText, /package\.json/i);
+  assert.match(proposalResult.assistantText, /app\.js/i);
+  assert.match(proposalResult.assistantText, /views\/index\.ejs/i);
+
+  const followUpResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "帮我看看"
+  });
+
+  assert.match(followUpResult.assistantText, /上一条检查方案|node-todo/i);
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/package.json:1-3")),
+    "expected Chinese inspect proposal follow-up to execute from package.json"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-2")),
+    "expected Chinese inspect proposal follow-up to continue into app.js"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1")),
+    "expected Chinese inspect proposal follow-up to continue into views/index.ejs"
+  );
+}
+
+async function verifyPlanningStyleRewriteProposalExecutesPreviousProposal() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-planning-rewrite-proposal-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const PORT = 3000;\nconsole.log(PORT);\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<input name="title" />\n',
+    "utf8"
+  );
+
+  class PlanningStyleRewriteProposalProvider implements ProviderClient {
+    readonly name = "planning-style-rewrite-proposal-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const proposalPrompt = "看看项目，但先别改，告诉我如果重写 node-todo 你会怎么做。";
+      const executeProposalPrompt = 'The user replied "你能帮我重新写个项目吗" and wants you to execute the immediately previous rewrite proposal now.';
+
+      if (input.content === proposalPrompt) {
+        yield {
+          delta: "我会先重写 node-todo/app.js 的端口逻辑，再重写 node-todo/views/index.ejs 的输入限制。"
+        };
+        return;
+      }
+
+      if (input.content.startsWith(executeProposalPrompt)) {
+        assert.match(input.content, /Approved proposal:/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/app.js",
+            startLine: 1,
+            endLine: 2
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${executeProposalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1,
+              replacement: '<input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield { delta: "已按刚才的重写顺序完成 node-todo/app.js 和 node-todo/views/index.ejs 的改写。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new PlanningStyleRewriteProposalProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const proposalResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "看看项目，但先别改，告诉我如果重写 node-todo 你会怎么做。"
+  });
+  assert.match(proposalResult.assistantText, /app\.js/i);
+  assert.match(proposalResult.assistantText, /views\/index\.ejs/i);
+
+  const followUpResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "你能帮我重新写个项目吗"
+  });
+
+  const rewrittenAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const rewrittenViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(rewrittenAppContent, /process\.env\.PORT/);
+  assert.match(rewrittenViewContent, /maxlength="100"/);
+  assert.match(followUpResult.assistantText, /重写顺序|node-todo/i);
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-2")),
+    "expected planning-style rewrite proposal follow-up to execute from app.js"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1")),
+    "expected planning-style rewrite proposal follow-up to continue into views/index.ejs"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1 · updated")),
+    "expected planning-style rewrite proposal follow-up to finish the view edit"
+  );
+}
+
+async function verifyChineseRewriteProposalExecutesPreviousProposal() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-chinese-rewrite-proposal-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const PORT = 3000;\nconsole.log(PORT);\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<input name="title" />\n',
+    "utf8"
+  );
+
+  class ChineseRewriteProposalProvider implements ProviderClient {
+    readonly name = "chinese-rewrite-proposal-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const proposalPrompt = "看看项目，但先别改，告诉我如果重写 node-todo 你会怎么做。";
+      const executeProposalPrompt = 'The user replied "你能帮我重新写个项目吗" and wants you to execute the immediately previous rewrite proposal now.';
+
+      if (input.content === proposalPrompt) {
+        yield {
+          delta: "如果你愿意，我下一步可以先重写 node-todo/app.js 的端口逻辑，再重写 node-todo/views/index.ejs 的输入框限制。"
+        };
+        return;
+      }
+
+      if (input.content.startsWith(executeProposalPrompt)) {
+        assert.match(input.content, /Approved proposal:/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/app.js",
+            startLine: 1,
+            endLine: 2
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${executeProposalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1,
+              replacement: '<input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield { delta: "已按上一条重写方案完成 node-todo/app.js 和 node-todo/views/index.ejs 的改写。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ChineseRewriteProposalProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const proposalResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "看看项目，但先别改，告诉我如果重写 node-todo 你会怎么做。"
+  });
+  assert.match(proposalResult.assistantText, /app\.js/i);
+  assert.match(proposalResult.assistantText, /views\/index\.ejs/i);
+
+  const followUpResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "你能帮我重新写个项目吗"
+  });
+
+  const rewrittenAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const rewrittenViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(rewrittenAppContent, /process\.env\.PORT/);
+  assert.match(rewrittenViewContent, /maxlength="100"/);
+  assert.match(followUpResult.assistantText, /上一条重写方案|node-todo/i);
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-2")),
+    "expected Chinese rewrite proposal follow-up to execute from app.js"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1")),
+    "expected Chinese rewrite proposal follow-up to continue into views/index.ejs"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1 · updated")),
+    "expected Chinese rewrite proposal follow-up to finish the view edit"
+  );
+}
+
+async function verifyVagueInspectionResumesInterruptedProposalExecution() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-vague-inspect-proposal-stop-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "package.json"),
+    '{\n  "name": "node-todo",\n  "version": "1.0.0"\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const app = {};\nmodule.exports = app;\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<input name="title" />\n',
+    "utf8"
+  );
+
+  class VagueInspectProposalResumeProvider implements ProviderClient {
+    readonly name = "vague-inspect-proposal-resume-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const proposalPrompt = "看看项目，但先别改，告诉我你会怎么检查 node-todo。";
+      const executeProposalPrompt = 'The user replied "可以" to approve the immediately previous proposal.';
+      const resumePrompt = 'The user replied "帮我看看" and wants to continue the most recent unfinished task.';
+
+      if (input.content === proposalPrompt) {
+        yield {
+          delta: "If you want, I can inspect node-todo by reading node-todo/package.json, then node-todo/app.js, then node-todo/views/index.ejs."
+        };
+        return;
+      }
+
+      if (input.content.startsWith(executeProposalPrompt)) {
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/package.json",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${executeProposalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          await waitForProviderDelay(input.signal, 300);
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+      }
+
+      if (input.content.startsWith(resumePrompt)) {
+        assert.match(input.content, /Resume that task now instead of treating this as a broad inspection follow-up\./);
+        assert.match(input.content, /Original task: 看看项目，但先别改，告诉我你会怎么检查 node-todo。/);
+        assert.match(input.content, /Latest tool in context: files/);
+        assert.match(input.content, /Latest tool summary in context: node-todo\/app\.js:1-2/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/views/index.ejs",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${resumePrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield { delta: "Completed the interrupted inspection by continuing directly with node-todo/views/index.ejs." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new VagueInspectProposalResumeProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const proposalResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "看看项目，但先别改，告诉我你会怎么检查 node-todo。"
+  });
+  assert.match(proposalResult.assistantText, /node-todo\/package\.json/i);
+  assert.match(proposalResult.assistantText, /node-todo\/app\.js/i);
+  assert.match(proposalResult.assistantText, /node-todo\/views\/index\.ejs/i);
+
+  const firstRunCompletion = waitForAssistantTaskCompletion(bus, session.sessionId);
+  const secondReadCompleted = new Promise<void>((resolve) => {
+    const off = bus.on("tool.execution.completed", (event) => {
+      if (event.sessionId !== session.sessionId || !event.payload.summary.startsWith("node-todo/app.js:1-2")) {
+        return;
+      }
+
+      off();
+      resolve();
+    });
+  });
+
+  bus.emit(createUserMessageSubmittedEvent({
+    sessionId: session.sessionId,
+    content: "可以"
+  }));
+
+  await secondReadCompleted;
+  bus.emit(createRuntimeInterruptRequestedEvent({
+    sessionId: session.sessionId,
+    reason: "cancel"
+  }));
+
+  const cancelledTask = await firstRunCompletion;
+  assert.equal(cancelledTask.payload.state, "cancelled");
+
+  const resumedResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "帮我看看"
+  });
+
+  assert.doesNotMatch(resumedResult.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/package.json:1-3")),
+    false,
+    "vague inspect resume after proposal execution should not reread package.json from the original proposal"
+  );
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-2")),
+    false,
+    "vague inspect resume after proposal execution should not reread app.js from the original proposal"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1")),
+    "vague inspect resume after proposal execution should continue into the pending view file"
   );
 }
 
@@ -5348,6 +9848,3328 @@ async function verifyResumeFollowUpInProjectStageSummaryChain() {
   );
 }
 
+async function verifyResumeFollowUpInImplicitProjectStageSummaryChain() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-implicit-project-stage-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "package.json"),
+    '{\n  "name": "node-todo",\n  "version": "1.0.0",\n  "scripts": {\n    "start": "node app.js"\n  }\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const express = require("express");\nconst app = express();\nconst PORT = 3000;\napp.listen(PORT, () => {\n  console.log(`Todo app is running at http://localhost:${PORT}`);\n});\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<!DOCTYPE html>\n<form action="/add" method="post">\n  <input name="title" />\n</form>\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "verify-setup.mjs"),
+    [
+      'import { readFileSync } from "node:fs";',
+      'const app = readFileSync(new URL("./app.js", import.meta.url), "utf8");',
+      'const view = readFileSync(new URL("./views/index.ejs", import.meta.url), "utf8");',
+      'const appReady = /process\\.env\\.PORT/.test(app);',
+      'const viewReady = /maxlength="100"/.test(view);',
+      'if (appReady && viewReady) {',
+      '  console.log("ready");',
+      '} else if (appReady) {',
+      '  console.log("app-only");',
+      '} else if (viewReady) {',
+      '  console.log("view-only");',
+      '} else {',
+      '  console.log("not-ready");',
+      '}'
+    ].join("\n") + "\n",
+    "utf8"
+  );
+
+  class ResumeImplicitProjectStageProvider implements ProviderClient {
+    readonly name = "resume-implicit-project-stage-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "看看项目，然后直接把 node-todo 优化到 ready。你自己判断需要改什么，并运行 `node node-todo/verify-setup.mjs` 验证，直到输出 exactly `ready`。";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "pwd && ls -la && find . -maxdepth 2 -type f | sed 's#^./##' | sort | head -200"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell") {
+          if (/You are in the middle of a concrete project inspection request\./.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/package.json",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+
+          if (/app-only/.test(input.content)) {
+            if (
+              /You are already inside the execution phase of a concrete task\./.test(input.content)
+              || /You are still inside the same multi-step task\./.test(input.content)
+            ) {
+              yield {
+                delta: toolCall("files", {
+                  path: "node-todo/views/index.ejs",
+                  startLine: 1,
+                  endLine: 4
+                })
+              };
+              return;
+            }
+
+            yield {
+              delta: [
+                "我已经把 node-todo/app.js 的端口配置改成了 process.env.PORT。",
+                "接下来我会继续更新 node-todo/views/index.ejs，然后重新运行 node node-todo/verify-setup.mjs 验证。"
+              ].join("\n")
+            };
+            return;
+          }
+
+          assert.match(input.content, /ready/);
+          yield { delta: "Completed the implicit project stage-summary chain and verified the final output is ready." };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 3,
+              endLine: 3,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-setup.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 3,
+              endLine: 3,
+              replacement: '  <input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-setup.mjs"
+            })
+          };
+          return;
+        }
+      }
+
+      if (input.content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+        assert.match(input.content, /Original task: 看看项目，然后直接把 node-todo 优化到 ready/);
+        assert.match(input.content, /Recent editable working file: node-todo\/app\.js/);
+        assert.match(input.content, /Pending next step target: node-todo\/views\/index\.ejs/);
+        assert.match(input.content, /Latest tool in context: shell/);
+        assert.match(input.content, /Latest tool summary in context: node node-todo\/verify-setup\.mjs · completed/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/views/index.ejs",
+            startLine: 1,
+            endLine: 4
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 3,
+              endLine: 3,
+              replacement: '  <input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-setup.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell") {
+          assert.match(input.content, /ready/);
+          yield { delta: "Completed the implicit project stage-summary chain and verified the final output is ready." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ResumeImplicitProjectStageProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  let approvalCount = 0;
+  bus.on("approval.requested", (event) => {
+    approvalCount += 1;
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const originalPrompt = "看看项目，然后直接把 node-todo 优化到 ready。你自己判断需要改什么，并运行 `node node-todo/verify-setup.mjs` 验证，直到输出 exactly `ready`。";
+  const completionPromise = waitForAssistantTaskCompletion(bus, session.sessionId);
+  const firstVerifyPromise = waitForToolExecutionCompleted(bus, session.sessionId, (summary) => summary.startsWith("node node-todo/verify-setup.mjs · completed"));
+
+  bus.emit(createUserMessageSubmittedEvent({
+    sessionId: session.sessionId,
+    content: originalPrompt
+  }));
+
+  await firstVerifyPromise;
+  await waitForBusyPhase(bus, session.sessionId, "assistant");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  bus.emit(createRuntimeInterruptRequestedEvent({
+    sessionId: session.sessionId,
+    reason: "cancel"
+  }));
+
+  const cancelledTask = await completionPromise;
+  assert.equal(cancelledTask.payload.state, "cancelled");
+
+  const resumedResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "还能继续吗"
+  });
+
+  const resumedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(resumedViewContent, /maxlength="100"/);
+  assert.match(resumedResult.assistantText, /ready/);
+  assert.doesNotMatch(resumedResult.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/package.json:1-")),
+    false,
+    "implicit resume follow-up should not restart from package.json"
+  );
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-")),
+    false,
+    "implicit resume follow-up should not reread app.js after the pending next target is already known"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-4")),
+    "implicit resume follow-up should continue directly into the pending view read"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:3-3 · updated")),
+    "implicit resume follow-up should complete the pending view edit"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node node-todo/verify-setup.mjs · completed")),
+    "implicit resume follow-up should finish the project verification after the resumed view edit"
+  );
+  assert.equal(
+    approvalCount,
+    2,
+    "expected one approval before interruption and one approval for the resumed implicit project stage-summary edit"
+  );
+}
+
+async function verifyResumeFollowUpInImplicitGenericVerificationStageSummaryChain() {
+  await verifyImplicitGenericVerificationStageSummaryResume("还能继续吗");
+}
+
+async function verifyResumeFollowUpInImplicitGenericVerificationCompletionToneChain() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-implicit-generic-completion-tone-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "package.json"),
+    '{\n  "name": "node-todo",\n  "version": "1.0.0",\n  "scripts": {\n    "start": "node app.js"\n  }\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const express = require("express");\nconst app = express();\nconst PORT = 3000;\napp.listen(PORT, () => {\n  console.log(`Todo app is running at http://localhost:${PORT}`);\n});\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<!DOCTYPE html>\n<form action="/add" method="post">\n  <input name="title" />\n</form>\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "verify-generic-resume-tone.mjs"),
+    [
+      'import { readFileSync } from "node:fs";',
+      'const app = readFileSync(new URL("./app.js", import.meta.url), "utf8");',
+      'const view = readFileSync(new URL("./views/index.ejs", import.meta.url), "utf8");',
+      'const appReady = /process\\.env\\.PORT/.test(app);',
+      'const viewReady = /maxlength="100"/.test(view);',
+      'if (appReady && viewReady) {',
+      '  console.log("ready");',
+      '} else if (appReady) {',
+      '  console.log("app-only");',
+      '} else if (viewReady) {',
+      '  console.log("view-only");',
+      '} else {',
+      '  console.log("not-ready");',
+      '}'
+    ].join("\n") + "\n",
+    "utf8"
+  );
+
+  class ResumeImplicitGenericCompletionToneProvider implements ProviderClient {
+    readonly name = "resume-implicit-generic-completion-tone-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "看看项目，然后直接把 node-todo 优化到正确。你自己判断需要改什么，并运行 `node node-todo/verify-generic-resume-tone.mjs` 验证，直到它正确为止。";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "pwd && ls -la && find . -maxdepth 2 -type f | sed 's#^./##' | sort | head -200"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell") {
+          if (/You are in the middle of a concrete project inspection request\./.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/package.json",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+
+          if (/app-only/.test(input.content)) {
+            if (
+              /You are already inside the execution phase of a concrete task\./.test(input.content)
+              || /Pending next step target: node-todo\/views\/index\.ejs/.test(input.content)
+            ) {
+              yield {
+                delta: toolCall("files", {
+                  path: "node-todo/views/index.ejs",
+                  startLine: 1,
+                  endLine: 4
+                })
+              };
+              return;
+            }
+
+            yield {
+              delta: "node-todo/app.js is fixed and verification now reaches app-only, but node-todo/views/index.ejs still needs maxlength=\"100\" before the task can finish."
+            };
+            return;
+          }
+
+          assert.match(input.content, /ready/);
+          yield { delta: "Completed the implicit generic completion-tone chain and verified the project is now correct." };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 3,
+              endLine: 3,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-generic-resume-tone.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 3,
+              endLine: 3,
+              replacement: '  <input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-generic-resume-tone.mjs"
+            })
+          };
+          return;
+        }
+      }
+
+      if (input.content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+        assert.match(input.content, /Original task: 看看项目，然后直接把 node-todo 优化到正确/);
+        assert.match(input.content, /Recent editable working file: node-todo\/app\.js/);
+        assert.match(input.content, /Pending next step target: node-todo\/views\/index\.ejs/);
+        assert.match(input.content, /Latest tool in context: shell/);
+        assert.match(input.content, /Latest tool summary in context: node node-todo\/verify-generic-resume-tone\.mjs · completed/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/views/index.ejs",
+            startLine: 1,
+            endLine: 4
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 3,
+              endLine: 3,
+              replacement: '  <input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-generic-resume-tone.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell") {
+          assert.match(input.content, /ready/);
+          yield { delta: "Completed the implicit generic completion-tone chain and verified the project is now correct." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ResumeImplicitGenericCompletionToneProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  let approvalCount = 0;
+  bus.on("approval.requested", (event) => {
+    approvalCount += 1;
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const originalPrompt = "看看项目，然后直接把 node-todo 优化到正确。你自己判断需要改什么，并运行 `node node-todo/verify-generic-resume-tone.mjs` 验证，直到它正确为止。";
+  const completionPromise = waitForAssistantTaskCompletion(bus, session.sessionId);
+  const firstVerifyPromise = waitForToolExecutionCompleted(bus, session.sessionId, (summary) => summary.startsWith("node node-todo/verify-generic-resume-tone.mjs · completed"));
+
+  bus.emit(createUserMessageSubmittedEvent({
+    sessionId: session.sessionId,
+    content: originalPrompt
+  }));
+
+  await firstVerifyPromise;
+  await waitForBusyPhase(bus, session.sessionId, "assistant");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  bus.emit(createRuntimeInterruptRequestedEvent({
+    sessionId: session.sessionId,
+    reason: "cancel"
+  }));
+
+  const cancelledTask = await completionPromise;
+  assert.equal(cancelledTask.payload.state, "cancelled");
+
+  const resumedResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "还能继续吗"
+  });
+
+  const resumedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(resumedViewContent, /maxlength="100"/);
+  assert.match(resumedResult.assistantText, /correct|ready/i);
+  assert.doesNotMatch(resumedResult.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/package.json:1-")),
+    false,
+    "implicit generic completion-tone resume follow-up should not restart from package.json"
+  );
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-")),
+    false,
+    "implicit generic completion-tone resume follow-up should not reread app.js after the pending next target is already known"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-4")),
+    "implicit generic completion-tone resume follow-up should continue directly into the pending view read"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:3-3 · updated")),
+    "implicit generic completion-tone resume follow-up should complete the pending view edit"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node node-todo/verify-generic-resume-tone.mjs · completed")),
+    "implicit generic completion-tone resume follow-up should finish the generic verification after the resumed view edit"
+  );
+  assert.equal(
+    approvalCount,
+    2,
+    "expected one approval before interruption and one approval for the resumed implicit generic completion-tone edit"
+  );
+}
+
+async function verifyBareAffirmativeInImplicitGenericVerificationStageSummaryChain() {
+  await verifyImplicitGenericVerificationStageSummaryResume("可以");
+}
+
+async function verifyVagueOptimizationInImplicitGenericVerificationStageSummaryChain() {
+  await verifyImplicitGenericVerificationStageSummaryResume("帮我优化下");
+}
+
+async function verifyVagueInspectionInImplicitGenericVerificationStageSummaryChain() {
+  await verifyImplicitGenericVerificationStageSummaryResume("帮我看看");
+}
+
+async function verifyVagueOptimizationInImplicitBroadProjectProposalChain() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-implicit-broad-project-proposal-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "package.json"),
+    '{\n  "name": "node-todo",\n  "version": "1.0.0",\n  "scripts": {\n    "start": "node app.js"\n  }\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const express = require("express");\nconst app = express();\nconst PORT = 3000;\napp.listen(PORT, () => {\n  console.log(`Todo app is running at http://localhost:${PORT}`);\n});\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<!DOCTYPE html>\n<form action="/add" method="post">\n  <input name="title" />\n</form>\n',
+    "utf8"
+  );
+
+  class ResumeImplicitBroadProjectProposalProvider implements ProviderClient {
+    readonly name = "resume-implicit-broad-project-proposal-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "看看项目，然后直接把 node-todo 优化到更完整。你自己判断需要改什么，不要停在建议或计划上。";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "pwd && ls -la && find . -maxdepth 2 -type f | sed 's#^./##' | sort | head -200"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell") {
+          if (/You are in the middle of a concrete project inspection request\./.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/package.json",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+        }
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          if (/You are in the middle of a project improvement task\./.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/app.js",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+        }
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 3,
+              endLine: 3,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          if (
+            /You are already inside the execution phase of a concrete task\./.test(input.content)
+            || /Pending next step target: node-todo\/views\/index\.ejs/.test(input.content)
+          ) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/views/index.ejs",
+                startLine: 1,
+                endLine: 4
+              })
+            };
+            return;
+          }
+
+          yield {
+            delta: "If you want, I can continue by updating node-todo/views/index.ejs next so the title input gets maxlength=\"100\"."
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 3,
+              endLine: 3,
+              replacement: '  <input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: "Completed the node-todo optimization across app.js and views/index.ejs."
+          };
+          return;
+        }
+      }
+
+      if (input.content.startsWith('The user replied "帮我优化下" and wants to continue the most recent unfinished task.')) {
+        assert.match(input.content, /Resume that task now instead of treating this as a broad optimization follow-up\./);
+        assert.match(input.content, /Original task: 看看项目，然后直接把 node-todo 优化到更完整/);
+        assert.match(input.content, /Recent editable working file: node-todo\/app\.js/);
+        assert.match(input.content, /Pending next step target: node-todo\/views\/index\.ejs/);
+        assert.match(input.content, /Latest tool in context: files/);
+        assert.match(input.content, /Latest tool summary in context: node-todo\/views\/index\.ejs:1-4/);
+        yield {
+          delta: toolCall("edit", {
+            path: "node-todo/views/index.ejs",
+            startLine: 3,
+            endLine: 3,
+            replacement: '  <input name="title" maxlength="100" />'
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith('Original user request: The user replied "帮我优化下" and wants to continue the most recent unfinished task.')) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: "Completed the interrupted node-todo optimization by finishing views/index.ejs."
+          };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ResumeImplicitBroadProjectProposalProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  let approvalCount = 0;
+  bus.on("approval.requested", (event) => {
+    approvalCount += 1;
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const originalPrompt = "看看项目，然后直接把 node-todo 优化到更完整。你自己判断需要改什么，不要停在建议或计划上。";
+  const completionPromise = waitForAssistantTaskCompletion(bus, session.sessionId);
+  const viewReadPromise = waitForToolExecutionCompleted(bus, session.sessionId, (summary) => summary.startsWith("node-todo/views/index.ejs:1-4"));
+
+  bus.emit(createUserMessageSubmittedEvent({
+    sessionId: session.sessionId,
+    content: originalPrompt
+  }));
+
+  await viewReadPromise;
+  bus.emit(createRuntimeInterruptRequestedEvent({
+    sessionId: session.sessionId,
+    reason: "cancel"
+  }));
+
+  const cancelledTask = await completionPromise;
+  assert.equal(cancelledTask.payload.state, "cancelled");
+
+  const resumedResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "帮我优化下"
+  });
+
+  const resumedAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const resumedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(resumedAppContent, /process\.env\.PORT/);
+  assert.match(resumedViewContent, /maxlength="100"/);
+  assert.match(resumedResult.assistantText, /views\/index\.ejs|maxlength|optimization/i);
+  assert.doesNotMatch(resumedResult.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/package.json:1-")),
+    false,
+    "implicit broad project proposal resume should not restart from package.json"
+  );
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-")),
+    false,
+    "implicit broad project proposal resume should not reread app.js after the pending next target is already known"
+  );
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-4")),
+    false,
+    "implicit broad project proposal resume should not reread the view file after the interrupted read"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:3-3 · updated")),
+    "implicit broad project proposal resume should continue directly into the pending view edit"
+  );
+  assert.equal(
+    approvalCount,
+    2,
+    "expected one approval for the original app.js edit and one approval for the resumed view edit in the broad project chain"
+  );
+}
+
+async function verifyBroadProjectEditRangeFailureCarriesForward() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-broad-project-edit-range-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "package.json"),
+    '{\n  "name": "node-todo",\n  "version": "1.0.0",\n  "scripts": {\n    "start": "node app.js"\n  }\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const express = require("express");\nconst app = express();\nconst PORT = 3000;\napp.listen(PORT, () => {\n  console.log(`Todo app is running at http://localhost:${PORT}`);\n});\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<!DOCTYPE html>\n<form action="/add" method="post">\n  <input name="title" />\n</form>\n',
+    "utf8"
+  );
+
+  class BroadProjectEditRangeProvider implements ProviderClient {
+    readonly name = "broad-project-edit-range-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "看看项目，然后直接优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100。";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "pwd && ls -la && find . -maxdepth 2 -type f | sed 's#^./##' | sort | head -200"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell") {
+          if (/You are in the middle of a concrete project inspection request\./.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/package.json",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+        }
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 3,
+              endLine: 3,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 4
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          if (/Continue the same task after a failed edit range attempt\./.test(input.content)) {
+            assert.match(input.content, /Requested edit range: 9-9/);
+            yield {
+              delta: toolCall("edit", {
+                path: "node-todo/views/index.ejs",
+                startLine: 3,
+                endLine: 3,
+                replacement: '  <input name="title" maxlength="100" />'
+              })
+            };
+            return;
+          }
+
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 9,
+              endLine: 9,
+              replacement: '  <input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /failure/i.test(summary) && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 4
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: "Completed the node-todo optimization after recovering from the view edit range failure."
+          };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new BroadProjectEditRangeProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  bus.on("approval.requested", (event) => {
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "看看项目，然后直接优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100。"
+  });
+
+  const optimizedAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const optimizedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(optimizedAppContent, /process\.env\.PORT/);
+  assert.match(optimizedViewContent, /maxlength="100"/);
+  assert.match(result.assistantText, /recovered|optimization|maxlength/i);
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:9-9 · failed")),
+    "expected broad project flow to surface the initial invalid view edit range"
+  );
+  assert.equal(
+    result.toolSummaries.filter((summary) => summary.startsWith("node-todo/views/index.ejs:1-4")).length,
+    2,
+    "expected broad project flow to reread the same view file after the invalid edit range failure"
+  );
+  assert.equal(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/package.json:1-")),
+    true,
+    "expected broad project flow to inspect the package entry once"
+  );
+  assert.equal(
+    result.toolSummaries.filter((summary) => summary.startsWith("node-todo/package.json:1-")).length,
+    1,
+    "expected broad project flow not to restart from package.json after the invalid edit range failure"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:3-3 · updated")),
+    "expected broad project flow to recover with the smallest valid edit range on the view file"
+  );
+  assert.ok(
+    result.toolSummaries.length > 6,
+    "expected broad project flow to exceed the standard six-tool budget while still finishing"
+  );
+}
+
+async function verifyBroadProjectStageSummaryDoesNotConsumeToolBudget() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-broad-project-stage-budget-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "package.json"),
+    '{\n  "name": "node-todo",\n  "version": "1.0.0",\n  "scripts": {\n    "start": "node app.js"\n  }\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const express = require("express");\nconst app = express();\nconst PORT = 3000;\napp.listen(PORT, () => {\n  console.log(`Todo app is running at http://localhost:${PORT}`);\n});\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<!DOCTYPE html>\n<form action="/add" method="post">\n  <input name="title" />\n</form>\n',
+    "utf8"
+  );
+
+  class BroadProjectStageBudgetProvider implements ProviderClient {
+    readonly name = "broad-project-stage-budget-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "看看项目，然后直接优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100。";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "pwd && ls -la && find . -maxdepth 2 -type f | sed 's#^./##' | sort | head -200"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell") {
+          if (/You are in the middle of a concrete project inspection request\./.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/package.json",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+        }
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 3,
+              endLine: 3,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          if (/Pending next step target: node-todo\/views\/index\.ejs/.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/views/index.ejs",
+                startLine: 1,
+                endLine: 4
+              })
+            };
+            return;
+          }
+
+          yield {
+            delta: "I updated node-todo/app.js and will continue with node-todo/views/index.ejs next."
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 3,
+              endLine: 3,
+              replacement: '  <input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield { delta: "Completed the node-todo optimization across app.js and views/index.ejs." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new BroadProjectStageBudgetProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  bus.on("approval.requested", (event) => {
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "看看项目，然后直接优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100。"
+  });
+
+  const optimizedAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const optimizedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(optimizedAppContent, /process\.env\.PORT/);
+  assert.match(optimizedViewContent, /maxlength="100"/);
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-4")),
+    "expected broad project stage-summary flow to continue into the pending view read"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:3-3 · updated")),
+    "expected broad project stage-summary flow to finish the pending view edit"
+  );
+  assert.equal(
+    result.runtimeErrors.some((message) => message.includes("Agent stopped after 6 tool steps")),
+    false,
+    "stage-summary turns should not consume the six-tool budget"
+  );
+}
+
+async function verifyResumeFollowUpInImplicitMultiTargetProposalChain() {
+  await verifyImplicitMultiTargetProposalResume("还能继续吗");
+}
+
+async function verifyBareAffirmativeInImplicitMultiTargetProposalChain() {
+  await verifyImplicitMultiTargetProposalResume("可以");
+}
+
+async function verifyVagueOptimizationInImplicitMultiTargetProposalChain() {
+  await verifyImplicitMultiTargetProposalResume("帮我优化下");
+}
+
+async function verifyVagueInspectionInImplicitMultiTargetProposalChain() {
+  await verifyImplicitMultiTargetProposalResume("帮我看看");
+}
+
+async function verifyResumeFollowUpInImplicitMultiTargetCompletionToneChain() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-implicit-multi-target-tone-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const express = require("express");\nconst app = express();\nconst PORT = 3000;\napp.listen(PORT, () => {\n  console.log(`Todo app is running at http://localhost:${PORT}`);\n});\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<!DOCTYPE html>\n<form action="/add" method="post">\n  <input name="title" />\n</form>\n',
+    "utf8"
+  );
+
+  class ResumeImplicitMultiTargetCompletionToneProvider implements ProviderClient {
+    readonly name = "resume-implicit-multi-target-completion-tone-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "直接优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100。你自己直接改完，不要只改一个文件。";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/app.js",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 3,
+              endLine: 3,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          if (
+            /The original request contains multiple concrete file changes\./.test(input.content)
+            || /You are still inside the same multi-step task\./.test(input.content)
+            || /You are already inside the execution phase of a concrete task\./.test(input.content)
+          ) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/views/index.ejs",
+                startLine: 1,
+                endLine: 4
+              })
+            };
+            return;
+          }
+
+          yield {
+            delta: "I finished node-todo/app.js, but node-todo/views/index.ejs still needs maxlength=\"100\" before this task is complete."
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 3,
+              endLine: 3,
+              replacement: '  <input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: "Completed the interrupted multi-target optimization across node-todo/app.js and node-todo/views/index.ejs."
+          };
+          return;
+        }
+      }
+
+      if (input.content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+        assert.match(input.content, /Original task: 直接优化 node-todo/);
+        assert.match(input.content, /Recent editable working file: node-todo\/app\.js/);
+        assert.match(input.content, /Pending next step target: node-todo\/views\/index\.ejs/);
+        assert.match(input.content, /Latest tool in context: files/);
+        assert.match(input.content, /Latest tool summary in context: node-todo\/views\/index\.ejs:1-4/);
+        yield {
+          delta: toolCall("edit", {
+            path: "node-todo/views/index.ejs",
+            startLine: 3,
+            endLine: 3,
+            replacement: '  <input name="title" maxlength="100" />'
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: "Completed the interrupted multi-target optimization across node-todo/app.js and node-todo/views/index.ejs."
+          };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ResumeImplicitMultiTargetCompletionToneProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  let approvalCount = 0;
+  bus.on("approval.requested", (event) => {
+    approvalCount += 1;
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const originalPrompt = "直接优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100。你自己直接改完，不要只改一个文件。";
+  const completionPromise = waitForAssistantTaskCompletion(bus, session.sessionId);
+  const viewReadPromise = waitForToolExecutionCompleted(bus, session.sessionId, (summary) => summary.startsWith("node-todo/views/index.ejs:1-4"));
+
+  bus.emit(createUserMessageSubmittedEvent({
+    sessionId: session.sessionId,
+    content: originalPrompt
+  }));
+
+  await viewReadPromise;
+  bus.emit(createRuntimeInterruptRequestedEvent({
+    sessionId: session.sessionId,
+    reason: "cancel"
+  }));
+
+  const cancelledTask = await completionPromise;
+  assert.equal(cancelledTask.payload.state, "cancelled");
+
+  const interruptedEvents = await transcriptStore.readEventsBySession(session.sessionId);
+  assert.ok(
+    interruptedEvents.some((event) =>
+      event.type === "tool.execution.completed" && event.payload.summary.startsWith("node-todo/app.js:3-3 · updated")
+    ),
+    "implicit multi-target completion-tone chain should preserve the first app.js edit before interruption"
+  );
+  assert.ok(
+    interruptedEvents.some((event) =>
+      event.type === "tool.execution.completed" && event.payload.summary.startsWith("node-todo/views/index.ejs:1-4")
+    ),
+    "implicit multi-target completion-tone chain should auto-continue past the completion-tone reply into the pending view read"
+  );
+
+  const resumedResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "还能继续吗"
+  });
+
+  const resumedAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const resumedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(resumedAppContent, /process\.env\.PORT/);
+  assert.match(resumedViewContent, /maxlength="100"/);
+  assert.match(resumedResult.assistantText, /node-todo\/views\/index\.ejs|maxlength|multi-target optimization/i);
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-")),
+    false,
+    "implicit multi-target completion-tone resume should not reread app.js after the pending next target is already known"
+  );
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-4")),
+    false,
+    "implicit multi-target completion-tone resume should not reread the view file after the interruption"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:3-3 · updated")),
+    "implicit multi-target completion-tone resume should continue directly into the pending view edit"
+  );
+  assert.equal(
+    approvalCount,
+    2,
+    "expected one approval for the original app.js edit and one approval for the resumed view edit in the completion-tone chain"
+  );
+}
+
+async function verifyResumeFollowUpInImplicitMultiTargetQuestionChain() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-implicit-multi-target-question-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const express = require("express");\nconst app = express();\nconst PORT = 3000;\napp.listen(PORT, () => {\n  console.log(`Todo app is running at http://localhost:${PORT}`);\n});\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<!DOCTYPE html>\n<form action="/add" method="post">\n  <input name="title" />\n</form>\n',
+    "utf8"
+  );
+
+  class ResumeImplicitMultiTargetQuestionProvider implements ProviderClient {
+    readonly name = "resume-implicit-multi-target-question-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "直接优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100。你自己直接改，不要中途问我要不要继续。";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/app.js",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 3,
+              endLine: 3,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          if (
+            /The original request contains multiple concrete file changes\./.test(input.content)
+            || /You are still inside the same multi-step task\./.test(input.content)
+            || /You are already inside the execution phase of a concrete task\./.test(input.content)
+          ) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/views/index.ejs",
+                startLine: 1,
+                endLine: 4
+              })
+            };
+            return;
+          }
+
+          yield {
+            delta: "I updated node-todo/app.js. Do you want me to continue into node-todo/views/index.ejs now?"
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 3,
+              endLine: 3,
+              replacement: '  <input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: "Completed the interrupted multi-target optimization across node-todo/app.js and node-todo/views/index.ejs."
+          };
+          return;
+        }
+      }
+
+      if (input.content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+        assert.match(input.content, /Original task: 直接优化 node-todo/);
+        assert.match(input.content, /Recent editable working file: node-todo\/app\.js/);
+        assert.match(input.content, /Pending next step target: node-todo\/views\/index\.ejs/);
+        assert.match(input.content, /Latest tool in context: files/);
+        assert.match(input.content, /Latest tool summary in context: node-todo\/views\/index\.ejs:1-4/);
+        yield {
+          delta: toolCall("edit", {
+            path: "node-todo/views/index.ejs",
+            startLine: 3,
+            endLine: 3,
+            replacement: '  <input name="title" maxlength="100" />'
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: "Completed the interrupted multi-target optimization across node-todo/app.js and node-todo/views/index.ejs."
+          };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ResumeImplicitMultiTargetQuestionProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  let approvalCount = 0;
+  bus.on("approval.requested", (event) => {
+    approvalCount += 1;
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const originalPrompt = "直接优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100。你自己直接改，不要中途问我要不要继续。";
+  const completionPromise = waitForAssistantTaskCompletion(bus, session.sessionId);
+  const viewReadPromise = waitForToolExecutionCompleted(bus, session.sessionId, (summary) => summary.startsWith("node-todo/views/index.ejs:1-4"));
+
+  bus.emit(createUserMessageSubmittedEvent({
+    sessionId: session.sessionId,
+    content: originalPrompt
+  }));
+
+  await viewReadPromise;
+  bus.emit(createRuntimeInterruptRequestedEvent({
+    sessionId: session.sessionId,
+    reason: "cancel"
+  }));
+
+  const cancelledTask = await completionPromise;
+  assert.equal(cancelledTask.payload.state, "cancelled");
+
+  const interruptedEvents = await transcriptStore.readEventsBySession(session.sessionId);
+  assert.ok(
+    interruptedEvents.some((event) =>
+      event.type === "tool.execution.completed" && event.payload.summary.startsWith("node-todo/app.js:3-3 · updated")
+    ),
+    "implicit multi-target question chain should preserve the first app.js edit before interruption"
+  );
+  assert.ok(
+    interruptedEvents.some((event) =>
+      event.type === "tool.execution.completed" && event.payload.summary.startsWith("node-todo/views/index.ejs:1-4")
+    ),
+    "implicit multi-target question chain should auto-continue past the blocking question into the pending view read"
+  );
+
+  const resumedResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "还能继续吗"
+  });
+
+  const resumedAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const resumedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(resumedAppContent, /process\.env\.PORT/);
+  assert.match(resumedViewContent, /maxlength="100"/);
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-")),
+    false,
+    "implicit multi-target question resume should not reread app.js after the pending next target is already known"
+  );
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-4")),
+    false,
+    "implicit multi-target question resume should not reread the view file after the interruption"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:3-3 · updated")),
+    "implicit multi-target question resume should continue directly into the pending view edit"
+  );
+  assert.equal(
+    approvalCount,
+    2,
+    "expected one approval for the original app.js edit and one approval for the resumed view edit in the question chain"
+  );
+}
+
+async function verifyImplicitMultiTargetProposalResume(
+  followUpPrompt: "还能继续吗" | "可以" | "帮我优化下" | "帮我看看"
+) {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-implicit-multi-target-proposal-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const express = require("express");\nconst app = express();\nconst PORT = 3000;\napp.listen(PORT, () => {\n  console.log(`Todo app is running at http://localhost:${PORT}`);\n});\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<!DOCTYPE html>\n<form action="/add" method="post">\n  <input name="title" />\n</form>\n',
+    "utf8"
+  );
+
+  class ResumeImplicitMultiTargetProposalProvider implements ProviderClient {
+    readonly name = "resume-implicit-multi-target-proposal-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "直接优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100。你自己直接改完。";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/app.js",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 3,
+              endLine: 3,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          if (
+            /The original request contains multiple concrete file changes\./.test(input.content)
+            || /You are still inside the same multi-step task\./.test(input.content)
+            || /You are already inside the execution phase of a concrete task\./.test(input.content)
+          ) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/views/index.ejs",
+                startLine: 1,
+                endLine: 4
+              })
+            };
+            return;
+          }
+
+          yield {
+            delta: [
+              "I updated node-todo/app.js.",
+              "Next I can continue by reading node-todo/views/index.ejs, add maxlength=\"100\", and finish the remaining file change."
+            ].join("\n")
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 3,
+              endLine: 3,
+              replacement: '  <input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: "Completed the multi-target optimization across node-todo/app.js and node-todo/views/index.ejs."
+          };
+          return;
+        }
+      }
+
+      if (/^The user replied "(还能继续吗|可以|帮我优化下|帮我看看)" and wants to continue the most recent unfinished task\./.test(input.content)) {
+        assert.match(input.content, /Original task: 直接优化 node-todo/);
+        if (/帮我优化下/.test(input.content)) {
+          assert.match(input.content, /Resume that task now instead of treating this as a broad optimization follow-up\./);
+        }
+        if (/帮我看看/.test(input.content)) {
+          assert.match(input.content, /Resume that task now instead of treating this as a broad inspection follow-up\./);
+        }
+        assert.match(input.content, /Recent editable working file: node-todo\/app\.js/);
+        assert.match(input.content, /Pending next step target: node-todo\/views\/index\.ejs/);
+        assert.match(input.content, /Latest tool in context: files/);
+        assert.match(input.content, /Latest tool summary in context: node-todo\/views\/index\.ejs:1-4/);
+        yield {
+          delta: toolCall("edit", {
+            path: "node-todo/views/index.ejs",
+            startLine: 3,
+            endLine: 3,
+            replacement: '  <input name="title" maxlength="100" />'
+          })
+        };
+        return;
+      }
+
+      if (/^Original user request: The user replied "(还能继续吗|可以|帮我优化下|帮我看看)" and wants to continue the most recent unfinished task\./.test(input.content)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: "Completed the interrupted multi-target optimization by finishing node-todo/views/index.ejs."
+          };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ResumeImplicitMultiTargetProposalProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  let approvalCount = 0;
+  bus.on("approval.requested", (event) => {
+    approvalCount += 1;
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const originalPrompt = "直接优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100。你自己直接改完。";
+  const completionPromise = waitForAssistantTaskCompletion(bus, session.sessionId);
+  const viewReadPromise = waitForToolExecutionCompleted(bus, session.sessionId, (summary) => summary.startsWith("node-todo/views/index.ejs:1-4"));
+
+  bus.emit(createUserMessageSubmittedEvent({
+    sessionId: session.sessionId,
+    content: originalPrompt
+  }));
+
+  await viewReadPromise;
+  bus.emit(createRuntimeInterruptRequestedEvent({
+    sessionId: session.sessionId,
+    reason: "cancel"
+  }));
+
+  const cancelledTask = await completionPromise;
+  assert.equal(cancelledTask.payload.state, "cancelled");
+
+  const interruptedEvents = await transcriptStore.readEventsBySession(session.sessionId);
+  assert.ok(
+    interruptedEvents.some((event) =>
+      event.type === "tool.execution.completed" && event.payload.summary.startsWith("node-todo/app.js:3-3 · updated")
+    ),
+    "implicit multi-target proposal chain should preserve the first app.js edit before interruption"
+  );
+  assert.ok(
+    interruptedEvents.some((event) =>
+      event.type === "tool.execution.completed" && event.payload.summary.startsWith("node-todo/views/index.ejs:1-4")
+    ),
+    "implicit multi-target proposal chain should auto-continue past the proposal into the pending view read"
+  );
+  assert.equal(
+    interruptedEvents.some((event) =>
+      event.type === "tool.execution.completed" && event.payload.summary.startsWith("node-todo/views/index.ejs:3-3 · updated")
+    ),
+    false,
+    "implicit multi-target proposal interruption should happen before the pending view edit lands"
+  );
+
+  const resumedResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: followUpPrompt
+  });
+
+  const resumedAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const resumedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(resumedAppContent, /process\.env\.PORT/);
+  assert.match(resumedViewContent, /maxlength="100"/);
+  assert.match(resumedResult.assistantText, /node-todo\/views\/index\.ejs|maxlength|multi-target optimization/i);
+  assert.doesNotMatch(resumedResult.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-")),
+    false,
+    "implicit multi-target proposal resume should not reread app.js after the pending next target is already known"
+  );
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-4")),
+    false,
+    "implicit multi-target proposal resume should not reread the view file after that read already completed before interruption"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:3-3 · updated")),
+    "implicit multi-target proposal resume should continue directly into the pending view edit"
+  );
+  assert.equal(
+    approvalCount,
+    2,
+    "expected one approval for the original app.js edit and one approval for the resumed view edit"
+  );
+}
+
+async function verifyImplicitGenericVerificationStageSummaryResume(
+  followUpPrompt: "还能继续吗" | "可以" | "帮我优化下" | "帮我看看"
+) {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-implicit-generic-stage-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "package.json"),
+    '{\n  "name": "node-todo",\n  "version": "1.0.0",\n  "scripts": {\n    "start": "node app.js"\n  }\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const express = require("express");\nconst app = express();\nconst PORT = 3000;\napp.listen(PORT, () => {\n  console.log(`Todo app is running at http://localhost:${PORT}`);\n});\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<!DOCTYPE html>\n<form action="/add" method="post">\n  <input name="title" />\n</form>\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "verify-generic-resume.mjs"),
+    [
+      'import { readFileSync } from "node:fs";',
+      'const app = readFileSync(new URL("./app.js", import.meta.url), "utf8");',
+      'const view = readFileSync(new URL("./views/index.ejs", import.meta.url), "utf8");',
+      'const appReady = /process\\.env\\.PORT/.test(app);',
+      'const viewReady = /maxlength="100"/.test(view);',
+      'if (appReady && viewReady) {',
+      '  console.log("ready");',
+      '} else if (appReady) {',
+      '  console.log("app-only");',
+      '} else if (viewReady) {',
+      '  console.log("view-only");',
+      '} else {',
+      '  console.log("not-ready");',
+      '}'
+    ].join("\n") + "\n",
+    "utf8"
+  );
+
+  class ResumeImplicitGenericProjectStageProvider implements ProviderClient {
+    readonly name = "resume-implicit-generic-project-stage-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "看看项目，然后直接把 node-todo 优化到正确。你自己判断需要改什么，并运行 `node node-todo/verify-generic-resume.mjs` 验证，直到它正确为止。";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "pwd && ls -la && find . -maxdepth 2 -type f | sed 's#^./##' | sort | head -200"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell") {
+          if (/You are in the middle of a concrete project inspection request\./.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/package.json",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+
+          if (/app-only/.test(input.content)) {
+            if (
+              /You are already inside the execution phase of a concrete task\./.test(input.content)
+              || /You are still inside the same multi-step task\./.test(input.content)
+            ) {
+              yield {
+                delta: toolCall("files", {
+                  path: "node-todo/views/index.ejs",
+                  startLine: 1,
+                  endLine: 4
+                })
+              };
+              return;
+            }
+
+            yield {
+              delta: [
+                "I updated node-todo/app.js and verified that the project moved to app-only.",
+                "Next I will continue with node-todo/views/index.ejs, then rerun node node-todo/verify-generic-resume.mjs."
+              ].join("\n")
+            };
+            return;
+          }
+
+          assert.match(input.content, /ready/);
+          yield { delta: "Completed the implicit generic project stage-summary chain and verified the project is now correct." };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 3,
+              endLine: 3,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-generic-resume.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 3,
+              endLine: 3,
+              replacement: '  <input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-generic-resume.mjs"
+            })
+          };
+          return;
+        }
+      }
+
+      if (/^The user replied "(还能继续吗|可以|帮我优化下|帮我看看)" and wants to continue the most recent unfinished task\./.test(input.content)) {
+        assert.match(input.content, /Original task: 看看项目，然后直接把 node-todo 优化到正确/);
+        if (/帮我优化下/.test(input.content)) {
+          assert.match(input.content, /Resume that task now instead of treating this as a broad optimization follow-up\./);
+        }
+        if (/帮我看看/.test(input.content)) {
+          assert.match(input.content, /Resume that task now instead of treating this as a broad inspection follow-up\./);
+        }
+        assert.match(input.content, /Recent editable working file: node-todo\/app\.js/);
+        assert.match(input.content, /Pending next step target: node-todo\/views\/index\.ejs/);
+        assert.match(input.content, /Latest tool in context: shell/);
+        assert.match(input.content, /Latest tool summary in context: node node-todo\/verify-generic-resume\.mjs · completed/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/views/index.ejs",
+            startLine: 1,
+            endLine: 4
+          })
+        };
+        return;
+      }
+
+      if (/^Original user request: The user replied "(还能继续吗|可以|帮我优化下|帮我看看)" and wants to continue the most recent unfinished task\./.test(input.content)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 3,
+              endLine: 3,
+              replacement: '  <input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-generic-resume.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell") {
+          assert.match(input.content, /ready/);
+          yield { delta: "Completed the implicit generic project stage-summary chain and verified the project is now correct." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ResumeImplicitGenericProjectStageProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  let approvalCount = 0;
+  bus.on("approval.requested", (event) => {
+    approvalCount += 1;
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const originalPrompt = "看看项目，然后直接把 node-todo 优化到正确。你自己判断需要改什么，并运行 `node node-todo/verify-generic-resume.mjs` 验证，直到它正确为止。";
+  const completionPromise = waitForAssistantTaskCompletion(bus, session.sessionId);
+  const firstVerifyPromise = waitForToolExecutionCompleted(bus, session.sessionId, (summary) => summary.startsWith("node node-todo/verify-generic-resume.mjs · completed"));
+
+  bus.emit(createUserMessageSubmittedEvent({
+    sessionId: session.sessionId,
+    content: originalPrompt
+  }));
+
+  await firstVerifyPromise;
+  await waitForBusyPhase(bus, session.sessionId, "assistant");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  bus.emit(createRuntimeInterruptRequestedEvent({
+    sessionId: session.sessionId,
+    reason: "cancel"
+  }));
+
+  const cancelledTask = await completionPromise;
+  assert.equal(cancelledTask.payload.state, "cancelled");
+
+  const resumedResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: followUpPrompt
+  });
+
+  const resumedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(resumedViewContent, /maxlength="100"/);
+  assert.match(resumedResult.assistantText, /correct|ready/i);
+  assert.doesNotMatch(resumedResult.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/package.json:1-")),
+    false,
+    "implicit generic resume follow-up should not restart from package.json"
+  );
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-")),
+    false,
+    "implicit generic resume follow-up should not reread app.js after the pending next target is already known"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-4")),
+    "implicit generic resume follow-up should continue directly into the pending view read"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:3-3 · updated")),
+    "implicit generic resume follow-up should complete the pending view edit"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node node-todo/verify-generic-resume.mjs · completed")),
+    "implicit generic resume follow-up should finish the generic verification after the resumed view edit"
+  );
+  assert.equal(
+    approvalCount,
+    2,
+    "expected one approval before interruption and one approval for the resumed implicit generic stage-summary edit"
+  );
+}
+
+async function verifyResumeFollowUpDoesNotLeakStalePendingNextTarget() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-no-stale-target-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+
+  await writeFile(join(workspace, "old-one.mjs"), 'console.log("old-one");\n', "utf8");
+  await writeFile(join(workspace, "old-two.mjs"), 'console.log("old-two");\n', "utf8");
+  await writeFile(join(workspace, "fresh-total.mjs"), "console.log(total);\n", "utf8");
+
+  class ResumeNoStaleTargetProvider implements ProviderClient {
+    readonly name = "resume-no-stale-target-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const olderPrompt = "Update old-one.mjs and old-two.mjs directly.";
+      const currentPrompt = "Fix fresh-total.mjs so running `node fresh-total.mjs` prints exactly `15`. Verify it and fix any errors before finishing.";
+
+      if (input.content === olderPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "old-one.mjs",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${olderPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /old-one\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "old-one.mjs",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'console.log("old-one updated");'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /old-one\.mjs/.test(summary)) {
+          if (/Pending next step target: old-two\.mjs/.test(input.content)) {
+            yield {
+              delta: toolCall("edit", {
+                path: "old-two.mjs",
+                startLine: 1,
+                endLine: 1,
+                replacement: 'console.log("old-two updated");'
+              })
+            };
+            return;
+          }
+
+          yield {
+            delta: "I updated old-one.mjs and will continue with old-two.mjs next."
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /old-two\.mjs/.test(summary)) {
+          yield { delta: "Completed the old multi-file update." };
+          return;
+        }
+      }
+
+      if (input.content === currentPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "node fresh-total.mjs"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${currentPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell" && /The latest tool attempt failed\./.test(input.content)) {
+          yield {
+            delta: toolCall("files", {
+              path: "fresh-total.mjs",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /fresh-total\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node fresh-total.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell") {
+          assert.match(input.content, /15/);
+          yield { delta: "Repaired fresh-total.mjs and verified the final output is 15." };
+          return;
+        }
+      }
+
+      if (input.content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+        assert.match(input.content, /Original task: Fix fresh-total\.mjs so running `node fresh-total\.mjs` prints exactly `15`\./);
+        assert.match(input.content, /Recent editable working file: fresh-total\.mjs/);
+        assert.match(input.content, /Latest tool in context: files/);
+        assert.match(input.content, /Latest tool summary in context: fresh-total\.mjs:1-1/);
+        assert.doesNotMatch(input.content, /Pending next step target: old-two\.mjs/);
+        yield {
+          delta: toolCall("edit", {
+            path: "fresh-total.mjs",
+            startLine: 1,
+            endLine: 1,
+            replacement: 'console.log(15);'
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "edit" && /fresh-total\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node fresh-total.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell") {
+          assert.match(input.content, /15/);
+          yield { delta: "Repaired fresh-total.mjs and verified the final output is 15." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ResumeNoStaleTargetProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  bus.on("approval.requested", (event) => {
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const olderResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Update old-one.mjs and old-two.mjs directly."
+  });
+
+  assert.ok(
+    olderResult.toolSummaries.some((summary) => summary.startsWith("old-two.mjs:1-1 · updated")),
+    "older task should finish the stale target file before the new interrupted task starts"
+  );
+
+  const completionPromise = waitForAssistantTaskCompletion(bus, session.sessionId);
+  const freshReadPromise = waitForToolExecutionCompleted(bus, session.sessionId, (summary) => summary.startsWith("fresh-total.mjs:1-1"));
+
+  bus.emit(createUserMessageSubmittedEvent({
+    sessionId: session.sessionId,
+    content: "Fix fresh-total.mjs so running `node fresh-total.mjs` prints exactly `15`. Verify it and fix any errors before finishing."
+  }));
+
+  await freshReadPromise;
+  bus.emit(createRuntimeInterruptRequestedEvent({
+    sessionId: session.sessionId,
+    reason: "cancel"
+  }));
+
+  const cancelledTask = await completionPromise;
+  assert.equal(cancelledTask.payload.state, "cancelled");
+
+  const resumedResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "还能继续吗"
+  });
+
+  const freshContent = await readFile(join(workspace, "fresh-total.mjs"), "utf8");
+  assert.match(freshContent, /console\.log\(15\)/);
+  assert.match(resumedResult.assistantText, /15/);
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("old-two.mjs:1-1")),
+    false,
+    "resume follow-up should not leak the older task pending-next target into the new interrupted task"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("fresh-total.mjs:1-1 · updated")),
+    "resume follow-up should continue with the current task repair instead of an older target"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node fresh-total.mjs · completed")),
+    "resume follow-up should finish current-task verification after the repair"
+  );
+}
+
+async function verifyResumeFollowUpDoesNotLeakStaleEditableWorkingFile() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-no-stale-workfile-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+
+  await writeFile(join(workspace, "old-anchor.mjs"), 'console.log("old-anchor");\n', "utf8");
+  await writeFile(join(workspace, "fresh-shell-only.mjs"), "console.log(total);\n", "utf8");
+
+  class ResumeNoStaleWorkfileProvider implements ProviderClient {
+    readonly name = "resume-no-stale-workfile-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const olderPrompt = "Edit old-anchor.mjs directly.";
+      const currentPrompt = "Fix fresh-shell-only.mjs so running `node fresh-shell-only.mjs` prints exactly `15`. Verify it and fix any errors before finishing.";
+
+      if (input.content === olderPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "old-anchor.mjs",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${olderPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /old-anchor\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "old-anchor.mjs",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'console.log("old-anchor updated");'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /old-anchor\.mjs/.test(summary)) {
+          yield { delta: "Completed the old anchor edit." };
+          return;
+        }
+      }
+
+      if (input.content === currentPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "node fresh-shell-only.mjs"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${currentPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /fresh-shell-only\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "fresh-shell-only.mjs",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'console.log(15);'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /fresh-shell-only\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node fresh-shell-only.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /The latest tool attempt failed\./.test(input.content)) {
+          yield {
+            delta: toolCall("files", {
+              path: "fresh-shell-only.mjs",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell") {
+          assert.match(input.content, /15/);
+          yield { delta: "Repaired fresh-shell-only.mjs and verified the final output is 15." };
+          return;
+        }
+      }
+
+      if (input.content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+        assert.match(input.content, /Original task: Fix fresh-shell-only\.mjs so running `node fresh-shell-only\.mjs` prints exactly `15`\./);
+        assert.doesNotMatch(input.content, /Recent editable working file: old-anchor\.mjs/);
+        assert.match(input.content, /Latest tool in context: shell/);
+        assert.match(input.content, /Latest tool summary in context: node fresh-shell-only\.mjs · failed \(1\)/);
+        yield {
+          delta: toolCall("files", {
+            path: "fresh-shell-only.mjs",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /fresh-shell-only\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "fresh-shell-only.mjs",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'console.log(15);'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /fresh-shell-only\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node fresh-shell-only.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell") {
+          assert.match(input.content, /15/);
+          yield { delta: "Repaired fresh-shell-only.mjs and verified the final output is 15." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ResumeNoStaleWorkfileProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  bus.on("approval.requested", (event) => {
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const olderResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Edit old-anchor.mjs directly."
+  });
+
+  assert.ok(
+    olderResult.toolSummaries.some((summary) => summary.startsWith("old-anchor.mjs:1-1 · updated")),
+    "older task should establish an editable working-file anchor before the new interrupted task starts"
+  );
+
+  const completionPromise = waitForAssistantTaskCompletion(bus, session.sessionId);
+
+  bus.emit(createUserMessageSubmittedEvent({
+    sessionId: session.sessionId,
+    content: "Fix fresh-shell-only.mjs so running `node fresh-shell-only.mjs` prints exactly `15`. Verify it and fix any errors before finishing."
+  }));
+
+  await waitForToolExecutionCompleted(bus, session.sessionId, (summary) => summary.startsWith("node fresh-shell-only.mjs · failed (1)"));
+  bus.emit(createRuntimeInterruptRequestedEvent({
+    sessionId: session.sessionId,
+    reason: "cancel"
+  }));
+
+  const cancelledTask = await completionPromise;
+  assert.equal(cancelledTask.payload.state, "cancelled");
+
+  const resumedResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "还能继续吗"
+  });
+
+  const freshContent = await readFile(join(workspace, "fresh-shell-only.mjs"), "utf8");
+  assert.match(freshContent, /console\.log\(15\)/);
+  assert.match(resumedResult.assistantText, /15/);
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("old-anchor.mjs:1-1")),
+    false,
+    "resume follow-up should not pull the older editable working file into the current interrupted task"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("fresh-shell-only.mjs:1-1")),
+    "resume follow-up should inspect the current task file after the shell-only interruption"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("fresh-shell-only.mjs:1-1 · updated")),
+    "resume follow-up should repair the current task file after reading it"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node fresh-shell-only.mjs · completed")),
+    "resume follow-up should finish current-task verification after the repair"
+  );
+}
+
+async function verifyResumeFollowUpDoesNotLeakStaleToolAnchor() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-no-stale-tool-anchor-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+
+  await writeFile(join(workspace, "old-tool-anchor.mjs"), 'console.log("old-tool-anchor");\n', "utf8");
+  await writeFile(join(workspace, "fresh-no-tool.mjs"), "console.log(total);\n", "utf8");
+
+  class ResumeNoStaleToolAnchorProvider implements ProviderClient {
+    readonly name = "resume-no-stale-tool-anchor-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const olderPrompt = "Edit old-tool-anchor.mjs directly.";
+      const currentPrompt = "Fix fresh-no-tool.mjs so running `node fresh-no-tool.mjs` prints exactly `15`. Verify it and fix any errors before finishing.";
+
+      if (input.content === olderPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "old-tool-anchor.mjs",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${olderPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /old-tool-anchor\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "old-tool-anchor.mjs",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'console.log("old-tool-anchor updated");'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /old-tool-anchor\.mjs/.test(summary)) {
+          yield { delta: "Completed the old tool-anchor edit." };
+          return;
+        }
+      }
+
+      if (input.content === currentPrompt) {
+        yield { delta: "I will inspect fresh-no-tool.mjs first, then verify the output." };
+        await waitForProviderDelay(input.signal, 300);
+        return;
+      }
+
+      if (input.content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+        assert.match(input.content, /Original task: Fix fresh-no-tool\.mjs so running `node fresh-no-tool\.mjs` prints exactly `15`\./);
+        assert.doesNotMatch(input.content, /Latest tool in context:/);
+        assert.doesNotMatch(input.content, /Latest tool summary in context:/);
+        yield {
+          delta: toolCall("files", {
+            path: "fresh-no-tool.mjs",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /fresh-no-tool\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "fresh-no-tool.mjs",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'console.log(15);'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /fresh-no-tool\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node fresh-no-tool.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell") {
+          assert.match(input.content, /15/);
+          yield { delta: "Repaired fresh-no-tool.mjs and verified the final output is 15." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ResumeNoStaleToolAnchorProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  bus.on("approval.requested", (event) => {
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const olderResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Edit old-tool-anchor.mjs directly."
+  });
+
+  assert.ok(
+    olderResult.toolSummaries.some((summary) => summary.startsWith("old-tool-anchor.mjs:1-1 · updated")),
+    "older task should establish a stale tool anchor before the new interrupted task starts"
+  );
+
+  const completionPromise = waitForAssistantTaskCompletion(bus, session.sessionId);
+
+  bus.emit(createUserMessageSubmittedEvent({
+    sessionId: session.sessionId,
+    content: "Fix fresh-no-tool.mjs so running `node fresh-no-tool.mjs` prints exactly `15`. Verify it and fix any errors before finishing."
+  }));
+
+  await waitForBusyPhase(bus, session.sessionId, "assistant");
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  bus.emit(createRuntimeInterruptRequestedEvent({
+    sessionId: session.sessionId,
+    reason: "cancel"
+  }));
+
+  const cancelledTask = await completionPromise;
+  assert.equal(cancelledTask.payload.state, "cancelled");
+
+  const resumedResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "还能继续吗"
+  });
+
+  const freshContent = await readFile(join(workspace, "fresh-no-tool.mjs"), "utf8");
+  assert.match(freshContent, /console\.log\(15\)/);
+  assert.match(resumedResult.assistantText, /15/);
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("old-tool-anchor.mjs:1-1")),
+    false,
+    "resume follow-up should not pull the older tool anchor into a task interrupted before its first tool call"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("fresh-no-tool.mjs:1-1")),
+    "resume follow-up should inspect the current task file after the tool-less interruption"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("fresh-no-tool.mjs:1-1 · updated")),
+    "resume follow-up should repair the current task file after reading it"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node fresh-no-tool.mjs · completed")),
+    "resume follow-up should finish current-task verification after the repair"
+  );
+}
+
+async function verifyResumeFollowUpDoesNotLeakStaleInterruptedApproval() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-no-stale-approval-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+
+  await writeFile(join(workspace, "old-approval.mjs"), 'console.log("old-approval");\n', "utf8");
+  await writeFile(join(workspace, "fresh-no-approval.mjs"), "console.log(total);\n", "utf8");
+
+  class ResumeNoStaleApprovalProvider implements ProviderClient {
+    readonly name = "resume-no-stale-approval-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const olderPrompt = "Edit old-approval.mjs directly.";
+      const currentPrompt = "Fix fresh-no-approval.mjs so running `node fresh-no-approval.mjs` prints exactly `15`. Verify it and fix any errors before finishing.";
+
+      if (input.content === olderPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "old-approval.mjs",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${olderPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /old-approval\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "old-approval.mjs",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'console.log("old-approval updated");'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /old-approval\.mjs/.test(summary)) {
+          yield { delta: "Completed the old approval edit." };
+          return;
+        }
+      }
+
+      if (input.content === currentPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "node fresh-no-approval.mjs"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${currentPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell" && /The latest tool attempt failed\./.test(input.content)) {
+          yield {
+            delta: toolCall("files", {
+              path: "fresh-no-approval.mjs",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /fresh-no-approval\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "fresh-no-approval.mjs",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'console.log(15);'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /fresh-no-approval\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node fresh-no-approval.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell") {
+          assert.match(input.content, /15/);
+          yield { delta: "Repaired fresh-no-approval.mjs and verified the final output is 15." };
+          return;
+        }
+      }
+
+      if (input.content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+        assert.match(input.content, /Original task: Fix fresh-no-approval\.mjs so running `node fresh-no-approval\.mjs` prints exactly `15`\./);
+        assert.match(input.content, /Latest tool in context: files/);
+        assert.match(input.content, /Latest tool summary in context: fresh-no-approval\.mjs:1-1/);
+        assert.doesNotMatch(input.content, /Interrupted pending approval: edit · old-approval\.mjs:1-1/);
+        yield {
+          delta: toolCall("edit", {
+            path: "fresh-no-approval.mjs",
+            startLine: 1,
+            endLine: 1,
+            replacement: 'console.log(15);'
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "edit" && /fresh-no-approval\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node fresh-no-approval.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell") {
+          assert.match(input.content, /15/);
+          yield { delta: "Repaired fresh-no-approval.mjs and verified the final output is 15." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ResumeNoStaleApprovalProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  let firstApprovalId: string | undefined;
+  bus.on("approval.requested", (event) => {
+    if (!firstApprovalId) {
+      firstApprovalId = event.payload.approvalId;
+    }
+  });
+
+  const olderCompletionPromise = waitForAssistantTaskCompletion(bus, session.sessionId);
+
+  bus.emit(createUserMessageSubmittedEvent({
+    sessionId: session.sessionId,
+    content: "Edit old-approval.mjs directly."
+  }));
+
+  const oldApproval = await waitForApprovalRequest(bus, session.sessionId);
+  assert.equal(oldApproval.payload.toolName, "edit");
+  bus.emit(createRuntimeInterruptRequestedEvent({
+    sessionId: session.sessionId,
+    reason: "cancel"
+  }));
+
+  const olderCancelledTask = await olderCompletionPromise;
+  assert.equal(olderCancelledTask.payload.state, "cancelled");
+
+  const olderEvents = await transcriptStore.readEventsBySession(session.sessionId);
+  assert.ok(
+    olderEvents.some((event) =>
+      event.type === "approval.resolved"
+      && event.payload.approvalId === oldApproval.payload.approvalId
+      && !event.payload.approved
+    ),
+    "older task should leave behind a denied approval anchor when cancelled during approval"
+  );
+
+  const currentCompletionPromise = waitForAssistantTaskCompletion(bus, session.sessionId);
+  const currentReadPromise = waitForToolExecutionCompleted(
+    bus,
+    session.sessionId,
+    (summary) => summary.startsWith("fresh-no-approval.mjs:1-1")
+  );
+
+  bus.emit(createUserMessageSubmittedEvent({
+    sessionId: session.sessionId,
+    content: "Fix fresh-no-approval.mjs so running `node fresh-no-approval.mjs` prints exactly `15`. Verify it and fix any errors before finishing."
+  }));
+
+  await currentReadPromise;
+  bus.emit(createRuntimeInterruptRequestedEvent({
+    sessionId: session.sessionId,
+    reason: "cancel"
+  }));
+
+  const currentCancelledTask = await currentCompletionPromise;
+  assert.equal(currentCancelledTask.payload.state, "cancelled");
+
+  const resumedResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "还能继续吗"
+  });
+
+  const freshContent = await readFile(join(workspace, "fresh-no-approval.mjs"), "utf8");
+  assert.match(freshContent, /console\.log\(15\)/);
+  assert.match(resumedResult.assistantText, /15/);
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("old-approval.mjs:1-1")),
+    false,
+    "resume follow-up should not leak the older interrupted approval target into the current task"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("fresh-no-approval.mjs:1-1 · updated")),
+    "resume follow-up should continue with the current task repair instead of the old approval target"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node fresh-no-approval.mjs · completed")),
+    "resume follow-up should finish current-task verification after the repair"
+  );
+}
+
+async function verifyApproveFollowUpDoesNotLeakOldProposalIntoInterruptedTask() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-no-stale-proposal-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+
+  await writeFile(join(workspace, "fresh-approve-resume.mjs"), "console.log(total);\n", "utf8");
+
+  class NoStaleProposalProvider implements ProviderClient {
+    readonly name = "no-stale-proposal-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const olderPrompt = "帮我优化下 node-todo";
+      const currentPrompt = "Fix fresh-approve-resume.mjs so running `node fresh-approve-resume.mjs` prints exactly `15`. Verify it and fix any errors before finishing.";
+
+      if (input.content === olderPrompt) {
+        yield {
+          delta: "我先看一下 node-todo 的结构；如果你愿意，我下一步可以直接改 app.js 和视图模板。"
+        };
+        return;
+      }
+
+      if (input.content === currentPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "node fresh-approve-resume.mjs"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${currentPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell" && /The latest tool attempt failed\./.test(input.content)) {
+          yield {
+            delta: toolCall("files", {
+              path: "fresh-approve-resume.mjs",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /fresh-approve-resume\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "fresh-approve-resume.mjs",
+              startLine: 1,
+              endLine: 1,
+              replacement: "console.log(15);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /fresh-approve-resume\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node fresh-approve-resume.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell") {
+          assert.match(input.content, /15/);
+          yield { delta: "Repaired fresh-approve-resume.mjs and verified the final output is 15." };
+          return;
+        }
+      }
+
+      if (input.content.startsWith('The user replied "可以" and wants to continue the most recent unfinished task.')) {
+        assert.match(input.content, /Original task: Fix fresh-approve-resume\.mjs so running `node fresh-approve-resume\.mjs` prints exactly `15`\./);
+        assert.doesNotMatch(input.content, /Approved proposal:/);
+        assert.doesNotMatch(input.content, /execute the immediately previous rewrite proposal/i);
+        assert.doesNotMatch(input.content, /execute the immediately previous optimize proposal/i);
+        yield {
+          delta: toolCall("edit", {
+            path: "fresh-approve-resume.mjs",
+            startLine: 1,
+            endLine: 1,
+            replacement: "console.log(15);"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith('Original user request: The user replied "可以" and wants to continue the most recent unfinished task.')) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "edit" && /fresh-approve-resume\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node fresh-approve-resume.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell") {
+          assert.match(input.content, /15/);
+          yield { delta: "Repaired fresh-approve-resume.mjs and verified the final output is 15." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new NoStaleProposalProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const oldProposalResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "帮我优化下 node-todo"
+  });
+
+  assert.match(oldProposalResult.assistantText, /下一步可以直接改 app\.js 和视图模板/);
+
+  const currentCompletionPromise = waitForAssistantTaskCompletion(bus, session.sessionId);
+  const currentReadPromise = waitForToolExecutionCompleted(
+    bus,
+    session.sessionId,
+    (summary) => summary.startsWith("fresh-approve-resume.mjs:1-1")
+  );
+
+  bus.emit(createUserMessageSubmittedEvent({
+    sessionId: session.sessionId,
+    content: "Fix fresh-approve-resume.mjs so running `node fresh-approve-resume.mjs` prints exactly `15`. Verify it and fix any errors before finishing."
+  }));
+
+  await currentReadPromise;
+  bus.emit(createRuntimeInterruptRequestedEvent({
+    sessionId: session.sessionId,
+    reason: "cancel"
+  }));
+
+  const currentCancelledTask = await currentCompletionPromise;
+  assert.equal(currentCancelledTask.payload.state, "cancelled");
+
+  const resumedResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "可以"
+  });
+
+  const freshContent = await readFile(join(workspace, "fresh-approve-resume.mjs"), "utf8");
+  assert.match(freshContent, /console\.log\(15\)/);
+  assert.match(resumedResult.assistantText, /15/);
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => /node-todo/i.test(summary)),
+    false,
+    "approve follow-up should not jump back into the older proposal target"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("fresh-approve-resume.mjs:1-1 · updated")),
+    "approve follow-up should resume the current interrupted task instead of executing an older proposal"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node fresh-approve-resume.mjs · completed")),
+    "approve follow-up should finish the current-task verification after resuming"
+  );
+}
+
 async function verifyResumeFollowUpAfterApprovalWaitInProjectChain() {
   await verifyApprovalWaitResumeInProjectChain("还能继续吗");
 }
@@ -6037,6 +13859,953 @@ async function verifyNaturalLanguageApprovalShortcuts() {
   }
 }
 
+async function verifyPendingNextStepContextGuidesMultiTargetContinuation() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-pending-next-step-context-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const PORT = 3000;\nconsole.log(PORT);\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<input name="title" />\n',
+    "utf8"
+  );
+
+  class PendingNextStepContextProvider implements ProviderClient {
+    readonly name = "pending-next-step-context-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "Optimize node-todo by updating node-todo/app.js to use process.env.PORT and updating node-todo/views/index.ejs so the title input has maxlength 100. Do the changes directly.";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("edit", {
+            path: "node-todo/app.js",
+            startLine: 1,
+            endLine: 1,
+            replacement: "const PORT = Number(process.env.PORT || 3000);"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          if (input.content.includes("The original request contains multiple concrete file changes.")) {
+            const recentTaskState = input.contextMessages?.find((message) =>
+              message.role === "system" && message.content.includes("Recent task state:")
+            )?.content ?? "";
+            assert.match(recentTaskState, /Working files: node-todo\/app\.js/);
+            assert.match(
+              recentTaskState,
+              /Pending next step: I updated node-todo\/app\.js and will continue with node-todo\/views\/index\.ejs next\./
+            );
+            yield {
+              delta: toolCall("edit", {
+                path: "node-todo/views/index.ejs",
+                startLine: 1,
+                endLine: 1,
+                replacement: '<input name="title" maxlength="100" />'
+              })
+            };
+            return;
+          }
+
+          yield {
+            delta: "I updated node-todo/app.js and will continue with node-todo/views/index.ejs next."
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: "Completed the requested updates in node-todo/app.js and node-todo/views/index.ejs."
+          };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new PendingNextStepContextProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  bus.on("approval.requested", (event) => {
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Optimize node-todo by updating node-todo/app.js to use process.env.PORT and updating node-todo/views/index.ejs so the title input has maxlength 100. Do the changes directly."
+  });
+
+  const appContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const viewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(appContent, /process\.env\.PORT/);
+  assert.match(viewContent, /maxlength="100"/);
+  assert.match(result.assistantText, /node-todo\/app\.js/);
+  assert.match(result.assistantText, /node-todo\/views\/index\.ejs/);
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-1 · updated")),
+    "expected initial app.js edit before the stage summary"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1 · updated")),
+    "expected pending-next-step continuation to go directly into the view edit"
+  );
+}
+
+async function verifyAssistantStageSummaryPromotesExplicitNextTarget() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-stage-next-target-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const PORT = 3000;\nconsole.log(PORT);\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<input name="title" />\n',
+    "utf8"
+  );
+
+  class StageNextTargetProvider implements ProviderClient {
+    readonly name = "stage-next-target-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "Optimize node-todo by updating node-todo/app.js to use process.env.PORT and updating node-todo/views/index.ejs so the title input has maxlength 100. Do the changes directly.";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/app.js",
+            startLine: 1,
+            endLine: 2
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          if (/Pending next step target: node-todo\/views\/index\.ejs/.test(input.content)) {
+            yield {
+              delta: toolCall("edit", {
+                path: "node-todo/views/index.ejs",
+                startLine: 1,
+                endLine: 1,
+                replacement: '<input name="title" maxlength="100" />'
+              })
+            };
+            return;
+          }
+
+          yield {
+            delta: "I updated node-todo/app.js and will continue with node-todo/views/index.ejs before verifying again."
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield { delta: "Completed the requested updates in node-todo/app.js and node-todo/views/index.ejs." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new StageNextTargetProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  bus.on("approval.requested", (event) => {
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Optimize node-todo by updating node-todo/app.js to use process.env.PORT and updating node-todo/views/index.ejs so the title input has maxlength 100. Do the changes directly."
+  });
+
+  const appContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const viewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(appContent, /process\.env\.PORT/);
+  assert.match(viewContent, /maxlength="100"/);
+  assert.match(result.assistantText, /node-todo\/app\.js/);
+  assert.match(result.assistantText, /node-todo\/views\/index\.ejs/);
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-2")),
+    "expected app.js read before the stage summary"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1 · updated")),
+    "expected explicit pending-next-step target to drive the next view edit"
+  );
+}
+
+async function verifyLongCompletionToneWithPendingWorkStillContinues() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-long-completion-pending-work-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "config"), { recursive: true });
+  await mkdir(join(workspace, "src", "lib"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "config", "runtime.json"),
+    '{\n  "product": "SelfMe",\n  "stage": "dev",\n  "region": "cn"\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "src", "console-explain.mjs"),
+    'import runtime from "../config/runtime.json" with { type: "json" };\nimport { formatRuntimeExplain } from "./lib/format-runtim-explain.mjs";\nconsole.log(formatRuntimeExplain(runtime));\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "src", "lib", "format-runtime-explain.mjs"),
+    'export function formatRuntimeExplain(runtime) {\n  return `${runtime.product}:${runtime.stage}`;\n}\n',
+    "utf8"
+  );
+
+  class LongCompletionPendingWorkProvider implements ProviderClient {
+    readonly name = "long-completion-pending-work-provider";
+    sawPendingWorkContinuation = false;
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "Read config/runtime.json and repair existing src/lib/format-runtime-explain.mjs plus src/console-explain.mjs so running `node src/console-explain.mjs` prints exactly `SelfMe dev (cn)`. Verify it before finishing.";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "config/runtime.json",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /config\/runtime\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "src/console-explain.mjs",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /src\/console-explain\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "src/lib/format-runtime-explain.mjs",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /src\/lib\/format-runtime-explain\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "src/lib/format-runtime-explain.mjs",
+              startLine: 2,
+              endLine: 2,
+              replacement: '  return `${runtime.product} ${runtime.stage} (${runtime.region})`;'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /src\/lib\/format-runtime-explain\.mjs/.test(summary)) {
+          if (
+            /You are already inside the execution phase of a concrete task\./.test(input.content)
+            || /The latest tool result does not satisfy the task yet, so your previous reply cannot end the task\./.test(input.content)
+            || /Pending next step target: src\/console-explain\.mjs/.test(input.content)
+          ) {
+            this.sawPendingWorkContinuation = true;
+            yield {
+              delta: toolCall("edit", {
+                path: "src/console-explain.mjs",
+                startLine: 2,
+                endLine: 2,
+                replacement: 'import { formatRuntimeExplain } from "./lib/format-runtime-explain.mjs";'
+              })
+            };
+            return;
+          }
+
+          yield {
+            delta: "The helper format is fixed now and it already renders the runtime string correctly, but the entry file still needs the import repaired before verification can succeed. At this point the remaining issue is isolated to src/console-explain.mjs, so the task cannot finish until that entry file is updated and the script is rerun."
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /src\/console-explain\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node src/console-explain.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /SelfMe dev \(cn\)/.test(input.content)) {
+          yield {
+            delta: "Repaired src/lib/format-runtime-explain.mjs and src/console-explain.mjs, then confirmed the script prints exactly SelfMe dev (cn)."
+          };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+  const provider = new LongCompletionPendingWorkProvider();
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider,
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Read config/runtime.json and repair existing src/lib/format-runtime-explain.mjs plus src/console-explain.mjs so running `node src/console-explain.mjs` prints exactly `SelfMe dev (cn)`. Verify it before finishing."
+  });
+
+  const helperContent = await readFile(join(workspace, "src", "lib", "format-runtime-explain.mjs"), "utf8");
+  const consoleContent = await readFile(join(workspace, "src", "console-explain.mjs"), "utf8");
+  assert.match(helperContent, /runtime\.region/);
+  assert.match(consoleContent, /\.\/lib\/format-runtime-explain\.mjs/);
+  assert.equal(provider.sawPendingWorkContinuation, true);
+  assert.match(result.assistantText, /SelfMe dev \(cn\)/);
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("src/lib/format-runtime-explain.mjs:2-2 · updated")),
+    "expected helper repair before the long pending-work completion tone"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("src/console-explain.mjs:2-2 · updated")),
+    "expected continuation to repair the entry file after the long pending-work completion tone"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node src/console-explain.mjs · completed")),
+    "expected final verification after the resumed entry-file repair"
+  );
+}
+
+async function verifyPathScopedCompletionDoesNotEndDualFileExecution() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-path-scoped-completion-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "config"), { recursive: true });
+  await mkdir(join(workspace, "src", "lib"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "config", "runtime.json"),
+    '{\n  "product": "SelfMe",\n  "stage": "dev",\n  "region": "cn"\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "src", "console-pathscope.mjs"),
+    'import runtime from "../config/runtime.json" with { type: "json" };\nimport { formatRuntimePathscope } from "./lib/format-runtim-pathscope.mjs";\nconsole.log(formatRuntimePathscope(runtime));\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "src", "lib", "format-runtime-pathscope.mjs"),
+    'export function formatRuntimePathscope(runtime) {\n  return `${runtime.product}:${runtime.stage}`;\n}\n',
+    "utf8"
+  );
+
+  class PathScopedCompletionProvider implements ProviderClient {
+    readonly name = "path-scoped-completion-provider";
+    sawForcedContinuation = false;
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "Read config/runtime.json and repair existing src/lib/format-runtime-pathscope.mjs plus src/console-pathscope.mjs so running `node src/console-pathscope.mjs` prints exactly `SelfMe dev (cn)`. Verify it before finishing.";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "config/runtime.json",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /config\/runtime\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "src/console-pathscope.mjs",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /src\/console-pathscope\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "src/lib/format-runtime-pathscope.mjs",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /src\/lib\/format-runtime-pathscope\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "src/lib/format-runtime-pathscope.mjs",
+              startLine: 2,
+              endLine: 2,
+              replacement: '  return `${runtime.product} ${runtime.stage} (${runtime.region})`;'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /src\/lib\/format-runtime-pathscope\.mjs/.test(summary)) {
+          if (
+            /You are already inside the execution phase of a concrete task\./.test(input.content)
+            || /Pending next step target: src\/console-pathscope\.mjs/.test(input.content)
+          ) {
+            this.sawForcedContinuation = true;
+            yield {
+              delta: toolCall("edit", {
+                path: "src/console-pathscope.mjs",
+                startLine: 2,
+                endLine: 2,
+                replacement: 'import { formatRuntimePathscope } from "./lib/format-runtime-pathscope.mjs";'
+              })
+            };
+            return;
+          }
+
+          yield {
+            delta: "Repaired src/lib/format-runtime-pathscope.mjs and confirmed src/lib/format-runtime-pathscope.mjs now formats the runtime correctly."
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /src\/console-pathscope\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node src/console-pathscope.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /SelfMe dev \(cn\)/.test(input.content)) {
+          yield {
+            delta: "Repaired src/lib/format-runtime-pathscope.mjs and src/console-pathscope.mjs, then confirmed the script prints exactly SelfMe dev (cn)."
+          };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+  const provider = new PathScopedCompletionProvider();
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider,
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Read config/runtime.json and repair existing src/lib/format-runtime-pathscope.mjs plus src/console-pathscope.mjs so running `node src/console-pathscope.mjs` prints exactly `SelfMe dev (cn)`. Verify it before finishing."
+  });
+
+  const helperContent = await readFile(join(workspace, "src", "lib", "format-runtime-pathscope.mjs"), "utf8");
+  const consoleContent = await readFile(join(workspace, "src", "console-pathscope.mjs"), "utf8");
+  assert.match(helperContent, /runtime\.region/);
+  assert.match(consoleContent, /\.\/lib\/format-runtime-pathscope\.mjs/);
+  assert.equal(provider.sawForcedContinuation, true);
+  assert.match(result.assistantText, /SelfMe dev \(cn\)/);
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("src/lib/format-runtime-pathscope.mjs:2-2 · updated")),
+    "expected helper repair before the path-scoped completion tone"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("src/console-pathscope.mjs:2-2 · updated")),
+    "expected forced continuation to repair the remaining console file"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node src/console-pathscope.mjs · completed")),
+    "expected final verification after the remaining file repair"
+  );
+}
+
+async function verifyImplicitRemainingChainDoesNotEndAtHelperCompletion() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-implicit-remaining-chain-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "src"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "src", "implicit-bridge-helper.mjs"),
+    'export function implicitBridgeStatus() {\n  return "-ready";\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "src", "implicit-bridge.mjs"),
+    'import { implicitBridgeStatus } from "./implicit-bridge-helperr.mjs";\nconsole.log(`SelfMe${implicitBridgeStatus()}`);\n',
+    "utf8"
+  );
+
+  class ImplicitRemainingChainProvider implements ProviderClient {
+    readonly name = "implicit-remaining-chain-provider";
+    sawForcedContinuation = false;
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = 'Run `node src/implicit-bridge.mjs`, fix the existing files so it prints exactly `SelfMe:ready`, and verify it before finishing.';
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "node src/implicit-bridge.mjs"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell" && /failed \(1\)/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "src/implicit-bridge.mjs",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /src\/implicit-bridge\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "src/implicit-bridge-helper.mjs",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /src\/implicit-bridge-helper\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "src/implicit-bridge-helper.mjs",
+              startLine: 2,
+              endLine: 2,
+              replacement: '  return ":ready";'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /src\/implicit-bridge-helper\.mjs/.test(summary)) {
+          if (
+            /You are already inside the execution phase of a concrete task\./.test(input.content)
+            || /The latest tool result does not satisfy the task yet, so your previous reply cannot end the task\./.test(input.content)
+          ) {
+            this.sawForcedContinuation = true;
+            yield {
+              delta: toolCall("edit", {
+                path: "src/implicit-bridge.mjs",
+                startLine: 1,
+                endLine: 1,
+                replacement: 'import { implicitBridgeStatus } from "./implicit-bridge-helper.mjs";'
+              })
+            };
+            return;
+          }
+
+          yield {
+            delta: "Repaired src/implicit-bridge-helper.mjs and confirmed src/implicit-bridge-helper.mjs now returns the exact ready suffix."
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /src\/implicit-bridge\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node src/implicit-bridge.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /completed/.test(summary) && /SelfMe:ready/.test(input.content)) {
+          yield {
+            delta: "Fixed src/implicit-bridge-helper.mjs and src/implicit-bridge.mjs, then verified the script now prints exactly SelfMe:ready."
+          };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+  const provider = new ImplicitRemainingChainProvider();
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider,
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: 'Run `node src/implicit-bridge.mjs`, fix the existing files so it prints exactly `SelfMe:ready`, and verify it before finishing.'
+  });
+
+  const helperContent = await readFile(join(workspace, "src", "implicit-bridge-helper.mjs"), "utf8");
+  const entryContent = await readFile(join(workspace, "src", "implicit-bridge.mjs"), "utf8");
+  assert.match(helperContent, /:ready/);
+  assert.match(entryContent, /implicit-bridge-helper\.mjs/);
+  assert.equal(provider.sawForcedContinuation, true);
+  assert.match(result.assistantText, /SelfMe:ready/);
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("src/implicit-bridge-helper.mjs:2-2 · updated")),
+    "expected helper repair before the implicit remaining-chain completion tone"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("src/implicit-bridge.mjs:1-1 · updated")),
+    "expected forced continuation to repair the remaining entry file"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node src/implicit-bridge.mjs · completed")),
+    "expected final verification after the remaining entry-file repair"
+  );
+}
+
+async function verifyNearMissShellCompletionToneStillRepairsRemainingHelper() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-nearmiss-shell-completion-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "config"), { recursive: true });
+  await mkdir(join(workspace, "src", "lib"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "config", "service.json"),
+    '{\n  "name": "SelfMe",\n  "surface": "api",\n  "version": "v1"\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "src", "service-nearmiss.mjs"),
+    'import service from "../config/service.json" with { type: "json" };\nimport { renderServiceNearMiss } from "./libs/render-service-nearmiss.mjs";\nconsole.log(renderServiceNearMiss(service));\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "src", "lib", "render-service-nearmiss.mjs"),
+    'export function renderServiceNearMiss(service) {\n  return `${service.name} ${service.surface}-${service.version}`;\n}\n',
+    "utf8"
+  );
+
+  class NearMissShellCompletionProvider implements ProviderClient {
+    readonly name = "nearmiss-shell-completion-provider";
+    sawForcedContinuation = false;
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "Read config/service.json and repair existing src/lib/render-service-nearmiss.mjs plus src/service-nearmiss.mjs so running `node src/service-nearmiss.mjs` prints exactly `SelfMe api@v1`. Verify it and keep fixing until exact.";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "config/service.json",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /config\/service\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "src/service-nearmiss.mjs",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /src\/service-nearmiss\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "src/service-nearmiss.mjs",
+              startLine: 2,
+              endLine: 2,
+              replacement: 'import { renderServiceNearMiss } from "./lib/render-service-nearmiss.mjs";'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /src\/service-nearmiss\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node src/service-nearmiss.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /node src\/service-nearmiss\.mjs/.test(summary)) {
+          if (
+            /You are already inside the execution phase of a concrete task\./.test(input.content)
+            || /The latest tool result does not satisfy the task yet, so your previous reply cannot end the task\./.test(input.content)
+          ) {
+            this.sawForcedContinuation = true;
+            yield {
+              delta: toolCall("files", {
+                path: "src/lib/render-service-nearmiss.mjs",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+
+          yield {
+            delta: "Repaired src/service-nearmiss.mjs and confirmed it now prints SelfMe api-v1."
+          };
+          return;
+        }
+
+        if (toolName === "files" && /src\/lib\/render-service-nearmiss\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "src/lib/render-service-nearmiss.mjs",
+              startLine: 2,
+              endLine: 2,
+              replacement: '  return `${service.name} ${service.surface}@${service.version}`;'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /src\/lib\/render-service-nearmiss\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node src/service-nearmiss.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /SelfMe api@v1/.test(input.content)) {
+          yield {
+            delta: "Repaired src/lib/render-service-nearmiss.mjs and src/service-nearmiss.mjs, then confirmed the script prints exactly SelfMe api@v1."
+          };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+  const provider = new NearMissShellCompletionProvider();
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider,
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Read config/service.json and repair existing src/lib/render-service-nearmiss.mjs plus src/service-nearmiss.mjs so running `node src/service-nearmiss.mjs` prints exactly `SelfMe api@v1`. Verify it and keep fixing until exact."
+  });
+
+  const helperContent = await readFile(join(workspace, "src", "lib", "render-service-nearmiss.mjs"), "utf8");
+  const entryContent = await readFile(join(workspace, "src", "service-nearmiss.mjs"), "utf8");
+  assert.match(helperContent, /api@/);
+  assert.match(entryContent, /\.\/lib\/render-service-nearmiss\.mjs/);
+  assert.equal(provider.sawForcedContinuation, true);
+  assert.match(result.assistantText, /SelfMe api@v1/);
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node src/service-nearmiss.mjs · completed")),
+    "expected a successful but inexact shell verification before the forced continuation"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("src/lib/render-service-nearmiss.mjs:1-3")),
+    "expected remaining helper read after the near-miss completion tone"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("src/lib/render-service-nearmiss.mjs:2-2 · updated")),
+    "expected helper repair after the near-miss completion tone"
+  );
+  assert.ok(
+    result.toolSummaries.filter((summary) => summary.startsWith("node src/service-nearmiss.mjs · completed")).length >= 2,
+    "expected final verification after the remaining helper repair"
+  );
+}
+
 function verifyInterruptFallbackWhenWorkingUiLingers() {
   const bus = new EventBus();
   const editor = new EditorController();
@@ -6087,14 +14856,30 @@ function verifyInterruptFallbackWhenWorkingUiLingers() {
 
 function waitForAssistantTaskCompletion(bus: EventBus, sessionId: string) {
   return new Promise<TaskStateChangedEvent>((resolve) => {
+    let rootTaskId: string | undefined;
     const off = bus.on("task.state.changed", (event) => {
       if (event.sessionId !== sessionId || event.payload.title !== "Respond to user input") {
         return;
       }
 
+      if (rootTaskId && event.taskId !== rootTaskId) {
+        return;
+      }
+
       if (event.payload.state === "completed" || event.payload.state === "failed" || event.payload.state === "cancelled") {
         off();
+        offCompleted();
         resolve(event);
+      }
+    });
+
+    const offCompleted = bus.on("assistant.completed", (event) => {
+      if (event.sessionId !== sessionId) {
+        return;
+      }
+
+      if (!rootTaskId) {
+        rootTaskId = event.taskId;
       }
     });
   });
@@ -6527,6 +15312,143 @@ function verifyContextCompactionExtractsQuotedTargetOutput() {
   assert.match(recentTaskStateMessage, /Target output: Scoped/);
   assert.match(recentTaskStateMessage, /Working files: greet\.mjs/);
   assert.match(recentTaskStateMessage, /Last observed output: Scoped/);
+}
+
+function verifyContextCompactionPreservesPendingApproval() {
+  const sessionId = "compaction-pending-approval-session";
+  const events: RuntimeEvent[] = [];
+
+  events.push(createUserMessageSubmittedEvent({
+    sessionId,
+    content: "Update node-todo and keep working until it is ready."
+  }));
+  events.push(createApprovalRequestedEvent({
+    sessionId,
+    taskId: "pending-approval-task",
+    toolName: "edit",
+    input: {
+      path: "node-todo/views/index.ejs",
+      startLine: 3,
+      endLine: 3,
+      replacement: '<input name="title" maxlength="100" />'
+    },
+    reason: "Edit node-todo/views/index.ejs",
+    risk: "high"
+  }));
+
+  const messages = buildContextMessages(events);
+  const recentTaskStateMessage = messages.find((message) => message.role === "system" && message.content.includes("Recent task state:"))?.content ?? "";
+
+  assert.match(recentTaskStateMessage, /Current request: Update node-todo and keep working until it is ready\./);
+  assert.match(recentTaskStateMessage, /Pending approval: edit · node-todo\/views\/index\.ejs:3-3/);
+}
+
+function verifyContextCompactionClearsResolvedPendingApproval() {
+  const sessionId = "compaction-resolved-pending-approval-session";
+  const events: RuntimeEvent[] = [];
+  const approvalRequested = createApprovalRequestedEvent({
+    sessionId,
+    taskId: "resolved-approval-task",
+    toolName: "edit",
+    input: {
+      path: "node-todo/views/index.ejs",
+      startLine: 3,
+      endLine: 3,
+      replacement: '<input name="title" maxlength="100" />'
+    },
+    reason: "Edit node-todo/views/index.ejs",
+    risk: "high"
+  });
+
+  events.push(createUserMessageSubmittedEvent({
+    sessionId,
+    content: "Update node-todo and keep working until it is ready."
+  }));
+  events.push(approvalRequested);
+  events.push(createApprovalResolvedEvent({
+    sessionId,
+    taskId: "resolved-approval-task",
+    approvalId: approvalRequested.payload.approvalId,
+    approved: true
+  }));
+
+  const messages = buildContextMessages(events);
+  const recentTaskStateMessage = messages.find((message) => message.role === "system" && message.content.includes("Recent task state:"))?.content ?? "";
+
+  assert.match(recentTaskStateMessage, /Current request: Update node-todo and keep working until it is ready\./);
+  assert.doesNotMatch(recentTaskStateMessage, /Pending approval:/);
+}
+
+function verifyContextCompactionPreservesPendingNextStep() {
+  const sessionId = "compaction-pending-next-step-session";
+  const events: RuntimeEvent[] = [];
+
+  events.push(createUserMessageSubmittedEvent({
+    sessionId,
+    content: "Rewrite node-todo and keep working until it is ready."
+  }));
+  events.push(createToolExecutionCompletedEvent({
+    sessionId,
+    taskId: "pending-next-tool-1",
+    toolName: "edit",
+    summary: "node-todo/app.js:1-3 · updated (3 -> 3 lines)"
+  }));
+  events.push(createAssistantDeltaEvent({
+    sessionId,
+    taskId: "pending-next-turn",
+    delta: "I updated node-todo/app.js and will continue with node-todo/views/index.ejs next."
+  }));
+  events.push(createAssistantCompletedEvent({
+    sessionId,
+    taskId: "pending-next-turn",
+    model: "regression-stub"
+  }));
+
+  const messages = buildContextMessages(events);
+  const recentTaskStateMessage = messages.find((message) => message.role === "system" && message.content.includes("Recent task state:"))?.content ?? "";
+
+  assert.match(recentTaskStateMessage, /Current request: Rewrite node-todo and keep working until it is ready\./);
+  assert.match(recentTaskStateMessage, /Working files: node-todo\/app\.js/);
+  assert.match(recentTaskStateMessage, /Pending next step: I updated node-todo\/app\.js and will continue with node-todo\/views\/index\.ejs next\./);
+}
+
+function verifyContextCompactionDropsOlderPendingNextStepAfterNewRequest() {
+  const sessionId = "compaction-drop-older-pending-step-session";
+  const events: RuntimeEvent[] = [];
+
+  events.push(createUserMessageSubmittedEvent({
+    sessionId,
+    content: "Rewrite node-todo and keep working until it is ready."
+  }));
+  events.push(createToolExecutionCompletedEvent({
+    sessionId,
+    taskId: "older-pending-tool-1",
+    toolName: "edit",
+    summary: "node-todo/app.js:1-3 · updated (3 -> 3 lines)"
+  }));
+  events.push(createAssistantDeltaEvent({
+    sessionId,
+    taskId: "older-pending-turn",
+    delta: "I updated node-todo/app.js and will continue with node-todo/views/index.ejs next."
+  }));
+  events.push(createAssistantCompletedEvent({
+    sessionId,
+    taskId: "older-pending-turn",
+    model: "regression-stub"
+  }));
+
+  events.push(createUserMessageSubmittedEvent({
+    sessionId,
+    content: "Improve the CLI flow and keep working."
+  }));
+
+  const messages = buildContextMessages(events);
+  const recentTaskStateMessage = messages.find((message) => message.role === "system" && message.content.includes("Recent task state:"))?.content ?? "";
+
+  assert.match(recentTaskStateMessage, /Current request: Improve the CLI flow and keep working\./);
+  assert.doesNotMatch(recentTaskStateMessage, /Pending next step:/);
+  assert.doesNotMatch(recentTaskStateMessage, /node-todo\/app\.js/);
+  assert.doesNotMatch(recentTaskStateMessage, /node-todo\/views\/index\.ejs/);
 }
 
 function verifyContextCompactionPreservesAssistantStageBoundaries() {
@@ -7040,6 +15962,14 @@ function resolveProviderResponse(content: string) {
   }
 
   if (content.startsWith("Read app.config.json and fix failure-stop-report.mjs")) {
+    return toolCall("files", {
+      path: "app.config.json",
+      startLine: 1,
+      endLine: 20
+    });
+  }
+
+  if (content.startsWith("Read app.config.json and fix failure-question-report.mjs")) {
     return toolCall("files", {
       path: "app.config.json",
       startLine: 1,
@@ -8361,6 +17291,44 @@ function resolveProviderResponse(content: string) {
     }
   }
 
+  if (content.startsWith("Original user request: Read app.config.json and fix failure-question-report.mjs")) {
+    const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
+    const summary = extractLine(content, "Summary:") ?? extractLine(content, "Latest summary:") ?? "";
+
+    if (toolName === "files" && /app\.config\.json/.test(summary)) {
+      return toolCall("shell", {
+        command: "node failure-question-report.mjs"
+      });
+    }
+
+    if (toolName === "shell") {
+      if (/The latest tool attempt failed\./.test(content)) {
+        return "Should I repair failure-question-report.mjs now, or stop here?";
+      }
+
+      assert.match(content, /SelfMe:3000/);
+      return "Repaired failure-question-report.mjs and confirmed it now prints exactly SelfMe:3000.";
+    }
+
+    if (toolName === "files" && /failure-question-report\.mjs/.test(summary)) {
+      return toolCall("edit", {
+        path: "failure-question-report.mjs",
+        startLine: 1,
+        endLine: 2,
+        replacement: [
+          'import config from "./app.config.json" with { type: "json" };',
+          'console.log(`${config.name}:${config.port}`);'
+        ].join("\n")
+      });
+    }
+
+    if (toolName === "edit" && /failure-question-report\.mjs/.test(summary)) {
+      return toolCall("shell", {
+        command: "node failure-question-report.mjs"
+      });
+    }
+  }
+
   if (content.startsWith("Original user request: Read app.config.json and fix converge-report.mjs")) {
     const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
     const summary = extractLine(content, "Summary:") ?? extractLine(content, "Latest summary:") ?? "";
@@ -8847,6 +17815,7 @@ function resolveProviderResponse(content: string) {
   if (content.startsWith("Original user request: 看看项目，然后直接优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100，并运行 `node node-todo/verify-setup.mjs` 验证，直到输出 exactly `ready`。")) {
     const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
     const summary = extractLine(content, "Summary:") ?? extractLine(content, "Latest summary:") ?? "";
+    const latestRawOutput = extractLatestRawOutputBlock(content);
 
     if (toolName === "shell") {
       if (/You are in the middle of a concrete project inspection request\./.test(content)) {
@@ -8858,7 +17827,7 @@ function resolveProviderResponse(content: string) {
         });
       }
 
-      if (/app-only/.test(content)) {
+      if (/app-only/.test(latestRawOutput)) {
         if (/You are already inside the execution phase of a concrete task\./.test(content)) {
           return toolCall("files", {
             path: "node-todo/views/index.ejs",
@@ -8877,7 +17846,7 @@ function resolveProviderResponse(content: string) {
         return "我先看了工作区列表。node-todo 是当前最像要继续处理的项目。";
       }
 
-      assert.match(content, /ready/);
+      assert.match(latestRawOutput, /ready/);
       return "我已经完成这轮项目优化，并重新运行 node node-todo/verify-setup.mjs 验证通过，最终输出是 ready。";
     }
 
@@ -8928,6 +17897,7 @@ function resolveProviderResponse(content: string) {
   if (content.startsWith("Original user request: 看看项目，然后优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100，并运行 `node node-todo/verify-setup.mjs` 验证，直到输出 exactly `ready`。")) {
     const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
     const summary = extractLine(content, "Summary:") ?? extractLine(content, "Latest summary:") ?? "";
+    const latestRawOutput = extractLatestRawOutputBlock(content);
 
     if (toolName === "shell") {
       if (/You are in the middle of a concrete project inspection request\./.test(content)) {
@@ -8939,7 +17909,7 @@ function resolveProviderResponse(content: string) {
         });
       }
 
-      if (/app-only/.test(content)) {
+      if (/app-only/.test(latestRawOutput)) {
         if (/You are already inside the execution phase of a concrete task\./.test(content)) {
           return toolCall("files", {
             path: "node-todo/views/index.ejs",
@@ -8955,7 +17925,7 @@ function resolveProviderResponse(content: string) {
         return "我先看了工作区列表。node-todo 是当前最像要继续处理的项目。";
       }
 
-      assert.match(content, /ready/);
+      assert.match(latestRawOutput, /ready/);
       return "我已经完成这轮项目优化，并重新运行 node node-todo/verify-setup.mjs 验证通过，最终输出是 ready。";
     }
 
@@ -9006,6 +17976,7 @@ function resolveProviderResponse(content: string) {
   if (content.startsWith("Original user request: 看看项目，然后直接优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100，并运行 `node node-todo/verify-exact.mjs` 验证，直到输出 exactly `ready`。")) {
     const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
     const summary = extractLine(content, "Summary:") ?? extractLine(content, "Latest summary:") ?? "";
+    const latestRawOutput = extractLatestRawOutputBlock(content);
 
     if (toolName === "shell") {
       if (/You are in the middle of a concrete project inspection request\./.test(content)) {
@@ -9017,7 +17988,7 @@ function resolveProviderResponse(content: string) {
         });
       }
 
-      if (/app-only/.test(content)) {
+      if (/app-only/.test(latestRawOutput)) {
         if (/You are already inside the execution phase of a concrete task\./.test(content)) {
           return toolCall("files", {
             path: "node-todo/views/index.ejs",
@@ -9032,7 +18003,7 @@ function resolveProviderResponse(content: string) {
         ].join("\n");
       }
 
-      if (/ready!/.test(content)) {
+      if (/ready!/.test(latestRawOutput)) {
         if (/The latest tool result does not satisfy the task yet, so your previous reply cannot end the task\./.test(content)) {
           return toolCall("files", {
             path: "node-todo/verify-exact.mjs",
@@ -9048,7 +18019,7 @@ function resolveProviderResponse(content: string) {
         return "我先看了工作区列表。node-todo 是当前最像要继续处理的项目。";
       }
 
-      assert.match(content, /ready/);
+      assert.match(latestRawOutput, /ready/);
       return "我已经完成这轮项目优化，并重新运行 node node-todo/verify-exact.mjs 验证通过，最终输出是 ready。";
     }
 
@@ -9201,6 +18172,7 @@ function resolveProviderResponse(content: string) {
   ) {
     const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
     const summary = extractLine(content, "Summary:") ?? extractLine(content, "Latest summary:") ?? "";
+    const latestRawOutput = extractLatestRawOutputBlock(content);
 
     if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
       return toolCall("edit", {
@@ -9217,7 +18189,7 @@ function resolveProviderResponse(content: string) {
       });
     }
 
-    if (toolName === "shell" && /app-only/.test(content)) {
+    if (toolName === "shell" && /app-only/.test(latestRawOutput)) {
       if (/You are already inside the execution phase of a concrete task\./.test(content)) {
         return toolCall("files", {
           path: "node-todo/views/index.ejs",
@@ -9244,7 +18216,7 @@ function resolveProviderResponse(content: string) {
       });
     }
 
-    if (toolName === "shell" && /ready!/.test(content)) {
+    if (toolName === "shell" && /ready!/.test(latestRawOutput)) {
       if (/The latest tool result does not satisfy the task yet, so your previous reply cannot end the task\./.test(content)) {
         return toolCall("files", {
           path: "node-todo/verify-exact.mjs",
@@ -9272,7 +18244,24 @@ function resolveProviderResponse(content: string) {
     }
 
     if (toolName === "shell") {
-      assert.match(content, /ready/);
+      assert.match(latestRawOutput, /ready/);
+      return "I completed the rewrite proposal and reran node node-todo/verify-exact.mjs until the final output was exactly ready.";
+    }
+  }
+
+  if (
+    /execute the immediately previous rewrite proposal now\./.test(content)
+    && /node-todo\/verify-exact\.mjs/.test(content)
+  ) {
+    const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
+    const summary = extractLine(content, "Summary:") ?? extractLine(content, "Latest summary:") ?? "";
+    const latestRawOutput = extractLatestRawOutputBlock(content);
+
+    if (
+      toolName === "shell"
+      && /node node-todo\/verify-exact\.mjs · completed/.test(summary)
+      && /^ready\s*$/m.test(latestRawOutput)
+    ) {
       return "I completed the rewrite proposal and reran node node-todo/verify-exact.mjs until the final output was exactly ready.";
     }
   }
@@ -11208,6 +20197,17 @@ function extractLine(content: string, prefix: string) {
     .find((line) => line.startsWith(prefix))
     ?.slice(prefix.length)
     .trim();
+}
+
+function extractLatestRawOutputBlock(content: string) {
+  const marker = "Raw output (already shown to the user):\n";
+  const index = content.lastIndexOf(marker);
+
+  if (index < 0) {
+    return "";
+  }
+
+  return content.slice(index + marker.length).trim();
 }
 
 function chunkText(content: string, size: number) {

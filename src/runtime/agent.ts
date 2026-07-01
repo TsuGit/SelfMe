@@ -31,6 +31,7 @@ import { extractExpectedOutputFromTaskRequest } from "./task-intent.js";
 
 const STANDARD_AGENT_TOOL_STEPS = 6;
 const EXTENDED_AGENT_TOOL_STEPS = 12;
+const ASSISTANT_PASS_MULTIPLIER = 4;
 const TOOL_CALL_OPEN = "<tool_call>";
 const TOOL_CALL_CLOSE = "</tool_call>";
 const TOOL_CALL_DENIED_PROMPT = "The requested tool action was denied by the user. Continue without that action. If you can still help, answer directly. If another tool is needed, return exactly one tool call block.";
@@ -49,6 +50,45 @@ interface ActiveRunState {
   phase: "assistant" | "tool" | "approval";
   pendingApprovalId?: string;
 }
+
+interface RuntimeToolResult {
+  toolName: string;
+  summary: string;
+  rawOutput?: string;
+  errorMessage?: string;
+}
+
+interface AnchoredRuntimeToolResult extends RuntimeToolResult {
+  workingFileAnchor?: string;
+}
+
+type AssistantMessageStepResult =
+  | {
+    kind: "continue";
+    nextPrompt: string;
+    proposalNarrowingCount: number;
+    lastDeferredAssistantStageSignature?: string;
+  }
+  | {
+    kind: "completed";
+    directAnswer?: string;
+    proposalNarrowingCount: number;
+    lastDeferredAssistantStageSignature?: string;
+  };
+
+type AssistantToolStepResult =
+  | {
+    kind: "continue";
+    nextPrompt: string;
+    repeatedToolResultCount: number;
+    lastToolResult?: RuntimeToolResult;
+  }
+  | {
+    kind: "completed";
+    directAnswer?: string;
+    repeatedToolResultCount: number;
+    lastToolResult?: RuntimeToolResult;
+  };
 
 export class AgentRuntime {
   private readonly pendingApprovals = new Map<string, {
@@ -516,14 +556,9 @@ export class AgentRuntime {
     let proposalNarrowingCount = 0;
     let repeatedToolResultCount = 0;
     let lastDeferredAssistantStageSignature: string | undefined;
-    let lastToolResult:
-      | {
-        toolName: string;
-        summary: string;
-        rawOutput?: string;
-        errorMessage?: string;
-      }
-      | undefined;
+    let lastToolResult: RuntimeToolResult | undefined;
+    let lastAssistantMessageSignature: string | undefined;
+    let repeatedAssistantMessageCount = 0;
     const activeRun = this.startActiveRun(sessionId, responseTaskId);
     this.taskOriginalRequests.set(responseTaskId, originalRequest);
     this.taskKnownPaths.set(responseTaskId, new Set(extractWritableTaskPaths(originalRequest)));
@@ -534,15 +569,15 @@ export class AgentRuntime {
       nextPrompt = originalRequest;
     }
 
-    this.input.bus.emit(createTaskStateChangedEvent({
-      sessionId,
-      taskId: responseTaskId,
-      state: "running",
-      title: "Respond to user input"
-    }));
+    this.startRuntimeTask(sessionId, responseTaskId);
 
     try {
-      for (let step = 0; step <= maxToolSteps; step += 1) {
+      const maxAssistantPasses = maxToolSteps * ASSISTANT_PASS_MULTIPLIER;
+      let assistantPassCount = 0;
+      let toolStepCount = 0;
+
+      while (assistantPassCount < maxAssistantPasses) {
+        assistantPassCount += 1;
         const workingFileAnchor = this.taskLatestEditablePaths.get(responseTaskId);
         const assistantPass = await this.runAssistantPass({
           sessionId,
@@ -554,383 +589,453 @@ export class AgentRuntime {
         });
 
         if (assistantPass.kind === "message") {
-          let assistantStageCommitted = false;
-
-          const commitAssistantStage = async (forceDeferredEmission = false) => {
-            if (assistantStageCommitted) {
-              return;
-            }
-
-            const isDeferredStage = !forceDeferredEmission
-              && !assistantPass.messageWasEmitted
-              && shouldPreserveDeferredAssistantStage(assistantPass.messageText);
-
-            if (
-              !assistantPass.messageWasEmitted
-              && !forceDeferredEmission
-              && !isDeferredStage
-            ) {
-              return;
-            }
-
-            if (isDeferredStage) {
-              const signature = createAssistantStageSignature(assistantPass.messageText);
-
-              if (signature && signature === lastDeferredAssistantStageSignature) {
-                assistantStageCommitted = true;
-                return;
-              }
-
-              lastDeferredAssistantStageSignature = signature;
-            }
-
-            if (!assistantPass.messageWasEmitted && assistantPass.messageText.trim().length > 0) {
-              const nextEvent = createAssistantDeltaEvent({
-                sessionId,
-                taskId: responseTaskId,
-                delta: assistantPass.messageText
-              });
-              this.input.bus.emit(nextEvent);
-              await this.input.transcriptStore.appendEvent(nextEvent);
-            }
-
-            const completedEvent = createAssistantCompletedEvent({
+          if (
+            !assistantPass.messageText.trim()
+            && lastToolResult
+            && isLatestToolResultTaskTerminal(originalRequest, lastToolResult)
+          ) {
+            await this.finishRuntimeTask({
               sessionId,
               taskId: responseTaskId,
-              model: this.input.session.model
+              state: "completed",
+              directAnswer: buildDirectTerminalCompletionAnswer(
+                originalRequest,
+                lastToolResult,
+                preferredLanguage
+              )
             });
-            this.input.bus.emit(completedEvent);
-            await this.input.transcriptStore.appendEvent(completedEvent);
-            assistantStageCommitted = true;
-          };
-
-          if (
-            proposalNarrowingCount === 0
-            && shouldForceProposalNarrowing(originalRequest, assistantPass.messageText)
-          ) {
-            proposalNarrowingCount += 1;
-            await commitAssistantStage();
-            nextPrompt = buildProposalNarrowingPrompt(
-              originalRequest,
-              assistantPass.messageText,
-              preferredLanguage
-            );
-            continue;
+            return;
           }
 
-          if (
-            !hasAttemptedTool
-            && shouldForceInitialTaskStart(originalRequest, assistantPass.messageText)
-          ) {
-            await commitAssistantStage();
-            nextPrompt = buildPrematureTaskStartPrompt(
-              originalRequest,
-              assistantPass.messageText,
-              preferredLanguage
-            );
-            continue;
-          }
+          const assistantMessageSignature = createAssistantStageSignature(assistantPass.messageText) ?? "__empty__";
+          repeatedAssistantMessageCount = assistantMessageSignature === lastAssistantMessageSignature
+            ? repeatedAssistantMessageCount + 1
+            : 0;
+          lastAssistantMessageSignature = assistantMessageSignature;
 
-          if (
-            lastToolResult
-            && shouldForceTaskContinuation(originalRequest, assistantPass.messageText, lastToolResult)
-          ) {
-            await commitAssistantStage();
-            nextPrompt = buildPrematureContinuationPrompt(
-              originalRequest,
-              assistantPass.messageText,
-              withWorkingFileAnchor(lastToolResult, workingFileAnchor),
-              preferredLanguage
-            );
-            continue;
-          }
-
-          if (
-            lastToolResult
-            && shouldForceProjectInspectionContinuation(originalRequest, assistantPass.messageText, lastToolResult)
-          ) {
-            await commitAssistantStage();
-            nextPrompt = buildProjectInspectionContinuationPrompt(
-              originalRequest,
-              assistantPass.messageText,
-              lastToolResult,
-              preferredLanguage
-            );
-            continue;
-          }
-
-          if (
-            lastToolResult
-            && shouldForceWholeProjectInspectionContinuation(originalRequest, assistantPass.messageText, lastToolResult)
-          ) {
-            await commitAssistantStage();
-            nextPrompt = buildWholeProjectInspectionContinuationPrompt(
-              originalRequest,
-              assistantPass.messageText,
-              lastToolResult,
-              preferredLanguage
-            );
-            continue;
-          }
-
-          if (
-            lastToolResult
-            && shouldForceProjectWorkfileContinuation(originalRequest, assistantPass.messageText, lastToolResult)
-          ) {
-            await commitAssistantStage();
-            nextPrompt = buildProjectWorkfileContinuationPrompt(
-              originalRequest,
-              assistantPass.messageText,
-              lastToolResult,
-              preferredLanguage
-            );
-            continue;
-          }
-
-          if (
-            lastToolResult
-            && shouldForceFailureRecovery(originalRequest, assistantPass.messageText, lastToolResult)
-          ) {
-            await commitAssistantStage();
-            nextPrompt = buildFailureRecoveryPrompt(
-              originalRequest,
-              assistantPass.messageText,
-              withWorkingFileAnchor(lastToolResult, workingFileAnchor),
-              preferredLanguage
-            );
-            continue;
-          }
-
-          if (
-            lastToolResult
-            && shouldForceExecutionConvergence(originalRequest, assistantPass.messageText, lastToolResult)
-          ) {
-            await commitAssistantStage();
-            nextPrompt = buildExecutionConvergencePrompt(
-              originalRequest,
-              assistantPass.messageText,
-              withWorkingFileAnchor(lastToolResult, workingFileAnchor),
-              preferredLanguage
-            );
-            continue;
-          }
-
-          if (
-            lastToolResult
-            && shouldForceMultiTargetMutationContinuation(originalRequest, assistantPass.messageText, lastToolResult)
-          ) {
-            await commitAssistantStage();
-            nextPrompt = buildMultiTargetMutationContinuationPrompt(
-              originalRequest,
-              assistantPass.messageText,
-              withWorkingFileAnchor(lastToolResult, workingFileAnchor),
-              preferredLanguage
-            );
-            continue;
-          }
-
-          if (
-            lastToolResult
-            && shouldForceFollowUpReplyTightening(originalRequest, assistantPass.messageText, lastToolResult)
-          ) {
-            await commitAssistantStage();
-            nextPrompt = buildFollowUpReplyTighteningPrompt(
-              originalRequest,
-              assistantPass.messageText,
-              lastToolResult,
-              preferredLanguage
-            );
-            continue;
-          }
-
-          if (
-            lastToolResult
-            && shouldForceCompletionTightening(originalRequest, assistantPass.messageText, lastToolResult)
-          ) {
-            await commitAssistantStage();
-            nextPrompt = buildCompletionTighteningPrompt(
-              originalRequest,
-              assistantPass.messageText,
-              lastToolResult,
-              preferredLanguage
-            );
-            continue;
-          }
-
-          await commitAssistantStage(true);
-
-          const taskCompleted = createTaskStateChangedEvent({
+          const messageStep = await this.processAssistantMessagePass({
             sessionId,
             taskId: responseTaskId,
-            state: "completed",
-            title: "Respond to user input"
+            originalRequest,
+            preferredLanguage,
+            assistantPass,
+            hasAttemptedTool,
+            proposalNarrowingCount,
+            lastToolResult,
+            workingFileAnchor,
+            lastDeferredAssistantStageSignature,
+            repeatedAssistantMessageCount
           });
-          this.input.bus.emit(taskCompleted);
-          await this.input.transcriptStore.appendEvent(taskCompleted);
-          return;
+
+          proposalNarrowingCount = messageStep.proposalNarrowingCount;
+          lastDeferredAssistantStageSignature = messageStep.lastDeferredAssistantStageSignature;
+
+          if (messageStep.kind === "completed") {
+            await this.finishRuntimeTask({
+              sessionId,
+              taskId: responseTaskId,
+              state: "completed",
+              directAnswer: messageStep.directAnswer
+            });
+            return;
+          }
+
+          nextPrompt = messageStep.nextPrompt;
+          continue;
         }
 
-        if (step === maxToolSteps) {
+        if (toolStepCount === maxToolSteps) {
           throw new Error(`Agent stopped after ${maxToolSteps} tool steps`);
         }
 
-        if (
-          lastToolResult
-          && shouldForceTerminalCompletionInsteadOfExtraTool(originalRequest, lastToolResult)
-        ) {
-          nextPrompt = buildCompletionTighteningPrompt(
-            originalRequest,
-            renderAssistantToolCallForPrompt(assistantPass.toolCall),
-            withWorkingFileAnchor(lastToolResult, this.taskLatestEditablePaths.get(responseTaskId)),
-            preferredLanguage
-          );
-          continue;
-        }
-
-        const tool = this.input.tools.get(assistantPass.toolCall.tool);
-
-        if (!tool) {
-          throw new Error(`Unknown tool requested by model: ${assistantPass.toolCall.tool}`);
-        }
-
-        const toolInput = parseToolInput(tool, assistantPass.toolCall.input);
+        toolStepCount += 1;
         hasAttemptedTool = true;
-        const toolTaskResult = await this.requestToolFromAssistant({
+        const toolStep = await this.processAssistantToolCall({
           sessionId,
-          rootTaskId: responseTaskId,
-          tool,
-          input: toolInput,
+          taskId: responseTaskId,
+          originalRequest,
+          preferredLanguage,
+          toolCall: assistantPass.toolCall,
+          previousToolResult: lastToolResult,
+          previousRepeatedToolResultCount: repeatedToolResultCount,
           signal: activeRun.controller.signal
         });
 
-        if (toolTaskResult.kind === "denied") {
-          nextPrompt = buildDeniedContinuationPrompt(originalRequest, preferredLanguage);
-          continue;
+        repeatedToolResultCount = toolStep.repeatedToolResultCount;
+        lastToolResult = toolStep.lastToolResult;
+
+        if (toolStep.kind === "completed") {
+          await this.finishRuntimeTask({
+            sessionId,
+            taskId: responseTaskId,
+            state: "completed",
+            directAnswer: toolStep.directAnswer
+          });
+          return;
         }
 
-        if (toolTaskResult.kind === "failed") {
-          repeatedToolResultCount = isSameToolResult(lastToolResult, toolTaskResult.result)
-            ? repeatedToolResultCount + 1
-            : 0;
-
-          if (shouldAutoSummarizeToolFailure(originalRequest, toolTaskResult.result)) {
-            const directAnswer = buildDirectToolFailureAnswer(toolTaskResult.result, preferredLanguage);
-
-            if (directAnswer) {
-              const nextEvent = createAssistantDeltaEvent({
-                sessionId,
-                taskId: responseTaskId,
-                delta: directAnswer
-              });
-              this.input.bus.emit(nextEvent);
-              await this.input.transcriptStore.appendEvent(nextEvent);
-
-              const completedEvent = createAssistantCompletedEvent({
-                sessionId,
-                taskId: responseTaskId,
-                model: this.input.session.model
-              });
-              this.input.bus.emit(completedEvent);
-              await this.input.transcriptStore.appendEvent(completedEvent);
-
-              const taskCompleted = createTaskStateChangedEvent({
-                sessionId,
-                taskId: responseTaskId,
-                state: "completed",
-                title: "Respond to user input"
-              });
-              this.input.bus.emit(taskCompleted);
-              await this.input.transcriptStore.appendEvent(taskCompleted);
-              return;
-            }
-          }
-
-          lastToolResult = toolTaskResult.result;
-          nextPrompt = shouldUseStalledContinuationPrompt(originalRequest, repeatedToolResultCount, toolTaskResult.result)
-            ? buildStalledToolContinuationPrompt(
-              originalRequest,
-              withWorkingFileAnchor(toolTaskResult.result, this.taskLatestEditablePaths.get(responseTaskId)),
-              repeatedToolResultCount,
-              preferredLanguage
-            )
-            : buildToolFailureContinuationPrompt(
-              originalRequest,
-              withWorkingFileAnchor(toolTaskResult.result, this.taskLatestEditablePaths.get(responseTaskId)),
-              preferredLanguage
-            );
-          continue;
-        }
-
-        const previousToolResult = lastToolResult;
-        repeatedToolResultCount = isSameToolResult(lastToolResult, toolTaskResult.result)
-          ? repeatedToolResultCount + 1
-          : 0;
-        lastToolResult = toolTaskResult.result;
-        nextPrompt = shouldUseStalledContinuationPrompt(originalRequest, repeatedToolResultCount, toolTaskResult.result)
-          ? buildStalledToolContinuationPrompt(
-            originalRequest,
-            withWorkingFileAnchor(toolTaskResult.result, this.taskLatestEditablePaths.get(responseTaskId)),
-            repeatedToolResultCount,
-            preferredLanguage
-          )
-          : previousToolResult && shouldCarryEditRangeFailureForward(previousToolResult, toolTaskResult.result)
-            ? buildEditRangeRecoveryContinuationPrompt(originalRequest, previousToolResult, toolTaskResult.result, preferredLanguage)
-            : buildToolContinuationPrompt(
-              originalRequest,
-              withWorkingFileAnchor(toolTaskResult.result, this.taskLatestEditablePaths.get(responseTaskId)),
-              preferredLanguage
-            );
+        nextPrompt = toolStep.nextPrompt;
       }
+
+      throw new Error(`Agent stopped after ${maxAssistantPasses} assistant passes`);
     } catch (error) {
       if (isAbortError(error)) {
-        const completedEvent = createAssistantCompletedEvent({
-          sessionId,
-          taskId: responseTaskId,
-          model: this.input.session.model
-        });
-        this.input.bus.emit(completedEvent);
-        await this.input.transcriptStore.appendEvent(completedEvent);
-
-        const taskCancelled = createTaskStateChangedEvent({
+        await this.finishRuntimeTask({
           sessionId,
           taskId: responseTaskId,
           state: "cancelled",
-          title: "Respond to user input"
+          ensureAssistantCompleted: true
         });
-        this.input.bus.emit(taskCancelled);
-        await this.input.transcriptStore.appendEvent(taskCancelled);
-
         this.emitTransientStatus(sessionId, "Stopped", "Current task stopped.");
         return;
       }
 
-      const completedEvent = createAssistantCompletedEvent({
+      await this.failRuntimeTask(
         sessionId,
-        taskId: responseTaskId,
-        model: this.input.session.model
-      });
-      this.input.bus.emit(completedEvent);
-      await this.input.transcriptStore.appendEvent(completedEvent);
-
-      const runtimeError = createRuntimeErrorRaisedEvent({
-        sessionId,
-        taskId: responseTaskId,
-        message: error instanceof Error ? error.message : "Unknown runtime error"
-      });
-      this.input.bus.emit(runtimeError);
-      await this.input.transcriptStore.appendEvent(runtimeError);
-
-      const taskFailed = createTaskStateChangedEvent({
-        sessionId,
-        taskId: responseTaskId,
-        state: "failed",
-        title: "Respond to user input"
-      });
-      this.input.bus.emit(taskFailed);
-      await this.input.transcriptStore.appendEvent(taskFailed);
+        responseTaskId,
+        error instanceof Error ? error.message : "Unknown runtime error"
+      );
     } finally {
       this.clearActiveRun(responseTaskId);
     }
+  }
+
+  private async finishRuntimeTask(input: {
+    sessionId: string;
+    taskId: string;
+    state: "completed" | "cancelled" | "failed";
+    directAnswer?: string;
+    ensureAssistantCompleted?: boolean;
+  }) {
+    if (input.directAnswer) {
+      await this.emitAssistantFinalAnswer(input.sessionId, input.taskId, input.directAnswer);
+    } else if (input.ensureAssistantCompleted) {
+      await this.emitAssistantCompletion(input.sessionId, input.taskId);
+    }
+
+    await this.completeRuntimeTask(input.sessionId, input.taskId, input.state);
+  }
+
+  private startRuntimeTask(sessionId: string, taskId: string) {
+    this.input.bus.emit(createTaskStateChangedEvent({
+      sessionId,
+      taskId,
+      state: "running",
+      title: "Respond to user input"
+    }));
+  }
+
+  private async failRuntimeTask(sessionId: string, taskId: string, message: string) {
+    await this.emitAssistantCompletion(sessionId, taskId);
+
+    const runtimeError = createRuntimeErrorRaisedEvent({
+      sessionId,
+      taskId,
+      message
+    });
+    this.input.bus.emit(runtimeError);
+    await this.input.transcriptStore.appendEvent(runtimeError);
+
+    await this.completeRuntimeTask(sessionId, taskId, "failed");
+  }
+
+  private async emitAssistantFinalAnswer(sessionId: string, taskId: string, delta: string) {
+    const nextEvent = createAssistantDeltaEvent({
+      sessionId,
+      taskId,
+      delta
+    });
+    this.input.bus.emit(nextEvent);
+    await this.input.transcriptStore.appendEvent(nextEvent);
+    await this.emitAssistantCompletion(sessionId, taskId);
+  }
+
+  private async emitAssistantCompletion(sessionId: string, taskId: string) {
+    const completedEvent = createAssistantCompletedEvent({
+      sessionId,
+      taskId,
+      model: this.input.session.model
+    });
+    this.input.bus.emit(completedEvent);
+    await this.input.transcriptStore.appendEvent(completedEvent);
+  }
+
+  private async completeRuntimeTask(
+    sessionId: string,
+    taskId: string,
+    state: "completed" | "cancelled" | "failed"
+  ) {
+    const taskEvent = createTaskStateChangedEvent({
+      sessionId,
+      taskId,
+      state,
+      title: "Respond to user input"
+    });
+    this.input.bus.emit(taskEvent);
+    await this.input.transcriptStore.appendEvent(taskEvent);
+  }
+
+  private async processAssistantMessagePass(input: {
+    sessionId: string;
+    taskId: string;
+    originalRequest: string;
+    preferredLanguage: PreferredReplyLanguage;
+    assistantPass: {
+      kind: "message";
+      messageText: string;
+      messageWasEmitted: boolean;
+    };
+    hasAttemptedTool: boolean;
+    proposalNarrowingCount: number;
+    lastToolResult?: RuntimeToolResult;
+    workingFileAnchor?: string;
+    lastDeferredAssistantStageSignature?: string;
+    repeatedAssistantMessageCount: number;
+  }): Promise<AssistantMessageStepResult> {
+    if (shouldAutoFinalizeRepeatedTerminalAssistantReply({
+      originalRequest: input.originalRequest,
+      assistantMessage: input.assistantPass.messageText,
+      latestToolResult: input.lastToolResult,
+      repeatedAssistantMessageCount: input.repeatedAssistantMessageCount
+    })) {
+      const stageCommit = await this.commitAssistantStage({
+        sessionId: input.sessionId,
+        taskId: input.taskId,
+        messageText: input.assistantPass.messageText,
+        messageWasEmitted: input.assistantPass.messageWasEmitted,
+        lastDeferredAssistantStageSignature: input.lastDeferredAssistantStageSignature,
+        forceDeferredEmission: true,
+        alreadyCommitted: false
+      });
+
+      return {
+        kind: "completed",
+        directAnswer: buildDirectTerminalCompletionAnswer(
+          input.originalRequest,
+          input.lastToolResult!,
+          input.preferredLanguage
+        ),
+        proposalNarrowingCount: input.proposalNarrowingCount,
+        lastDeferredAssistantStageSignature: stageCommit.lastDeferredAssistantStageSignature
+      };
+    }
+
+    const continuationDecision = resolveAssistantMessageContinuation({
+      originalRequest: input.originalRequest,
+      assistantMessage: input.assistantPass.messageText,
+      preferredLanguage: input.preferredLanguage,
+      hasAttemptedTool: input.hasAttemptedTool,
+      proposalNarrowingCount: input.proposalNarrowingCount,
+      lastToolResult: input.lastToolResult,
+      workingFileAnchor: input.workingFileAnchor
+    });
+
+    if (continuationDecision) {
+      const stageCommit = await this.commitAssistantStage({
+        sessionId: input.sessionId,
+        taskId: input.taskId,
+        messageText: input.assistantPass.messageText,
+        messageWasEmitted: input.assistantPass.messageWasEmitted,
+        lastDeferredAssistantStageSignature: input.lastDeferredAssistantStageSignature,
+        forceDeferredEmission: false,
+        alreadyCommitted: false
+      });
+
+      return {
+        kind: "continue",
+        nextPrompt: continuationDecision.nextPrompt,
+        proposalNarrowingCount: continuationDecision.consumeProposalNarrowingCount
+          ? input.proposalNarrowingCount + 1
+          : input.proposalNarrowingCount,
+        lastDeferredAssistantStageSignature: stageCommit.lastDeferredAssistantStageSignature
+      };
+    }
+
+    const stageCommit = await this.commitAssistantStage({
+      sessionId: input.sessionId,
+      taskId: input.taskId,
+      messageText: input.assistantPass.messageText,
+      messageWasEmitted: input.assistantPass.messageWasEmitted,
+      lastDeferredAssistantStageSignature: input.lastDeferredAssistantStageSignature,
+      forceDeferredEmission: true,
+      alreadyCommitted: false
+    });
+
+    return {
+      kind: "completed",
+      proposalNarrowingCount: input.proposalNarrowingCount,
+      lastDeferredAssistantStageSignature: stageCommit.lastDeferredAssistantStageSignature
+    };
+  }
+
+  private async commitAssistantStage(input: {
+    sessionId: string;
+    taskId: string;
+    messageText: string;
+    messageWasEmitted: boolean;
+    lastDeferredAssistantStageSignature?: string;
+    forceDeferredEmission: boolean;
+    alreadyCommitted: boolean;
+  }) {
+    if (input.alreadyCommitted) {
+      return {
+        committed: true,
+        lastDeferredAssistantStageSignature: input.lastDeferredAssistantStageSignature
+      };
+    }
+
+    const isDeferredStage = !input.forceDeferredEmission
+      && !input.messageWasEmitted
+      && shouldPreserveDeferredAssistantStage(input.messageText);
+
+    if (
+      !input.messageWasEmitted
+      && !input.forceDeferredEmission
+      && !isDeferredStage
+    ) {
+      return {
+        committed: false,
+        lastDeferredAssistantStageSignature: input.lastDeferredAssistantStageSignature
+      };
+    }
+
+    let nextDeferredAssistantStageSignature = input.lastDeferredAssistantStageSignature;
+
+    if (isDeferredStage) {
+      const signature = createAssistantStageSignature(input.messageText);
+
+      if (signature && signature === input.lastDeferredAssistantStageSignature) {
+        return {
+          committed: true,
+          lastDeferredAssistantStageSignature: input.lastDeferredAssistantStageSignature
+        };
+      }
+
+      nextDeferredAssistantStageSignature = signature;
+    }
+
+    if (!input.messageWasEmitted && input.messageText.trim().length > 0) {
+      const nextEvent = createAssistantDeltaEvent({
+        sessionId: input.sessionId,
+        taskId: input.taskId,
+        delta: input.messageText
+      });
+      this.input.bus.emit(nextEvent);
+      await this.input.transcriptStore.appendEvent(nextEvent);
+    }
+
+    await this.emitAssistantCompletion(input.sessionId, input.taskId);
+
+    return {
+      committed: true,
+      lastDeferredAssistantStageSignature: nextDeferredAssistantStageSignature
+    };
+  }
+
+  private async processAssistantToolCall(input: {
+    sessionId: string;
+    taskId: string;
+    originalRequest: string;
+    preferredLanguage: PreferredReplyLanguage;
+    toolCall: ParsedAssistantToolCall;
+    previousToolResult?: RuntimeToolResult;
+    previousRepeatedToolResultCount: number;
+    signal: AbortSignal;
+  }): Promise<AssistantToolStepResult> {
+    const workingFileAnchor = this.taskLatestEditablePaths.get(input.taskId);
+
+    if (
+      input.previousToolResult
+      && shouldForceTerminalCompletionInsteadOfExtraTool(input.originalRequest, input.previousToolResult)
+    ) {
+      return {
+        kind: "continue",
+        nextPrompt: buildCompletionTighteningPrompt(
+          input.originalRequest,
+          renderAssistantToolCallForPrompt(input.toolCall),
+          withWorkingFileAnchor(input.previousToolResult, workingFileAnchor),
+          input.preferredLanguage
+        ),
+        repeatedToolResultCount: input.previousRepeatedToolResultCount,
+        lastToolResult: input.previousToolResult
+      };
+    }
+
+    const tool = this.input.tools.get(input.toolCall.tool);
+
+    if (!tool) {
+      throw new Error(`Unknown tool requested by model: ${input.toolCall.tool}`);
+    }
+
+    const toolInput = parseToolInput(tool, input.toolCall.input);
+    const toolTaskResult = await this.requestToolFromAssistant({
+      sessionId: input.sessionId,
+      rootTaskId: input.taskId,
+      tool,
+      input: toolInput,
+      signal: input.signal
+    });
+
+    if (toolTaskResult.kind === "denied") {
+      return {
+        kind: "continue",
+        nextPrompt: buildDeniedContinuationPrompt(input.originalRequest, input.preferredLanguage),
+        repeatedToolResultCount: input.previousRepeatedToolResultCount,
+        lastToolResult: input.previousToolResult
+      };
+    }
+
+    if (toolTaskResult.kind === "failed") {
+      const failureDecision = resolveFailedToolResultContinuation({
+        originalRequest: input.originalRequest,
+        preferredLanguage: input.preferredLanguage,
+        previousToolResult: input.previousToolResult,
+        previousRepeatedToolResultCount: input.previousRepeatedToolResultCount,
+        result: toolTaskResult.result,
+        workingFileAnchor
+      });
+
+      if (failureDecision.kind === "direct_answer") {
+        return {
+          kind: "completed",
+          directAnswer: failureDecision.directAnswer,
+          repeatedToolResultCount: failureDecision.repeatedToolResultCount,
+          lastToolResult: toolTaskResult.result
+        };
+      }
+
+      return {
+        kind: "continue",
+        nextPrompt: failureDecision.nextPrompt,
+        repeatedToolResultCount: failureDecision.repeatedToolResultCount,
+        lastToolResult: toolTaskResult.result
+      };
+    }
+
+    const successDecision = resolveSuccessfulToolResultContinuation({
+      originalRequest: input.originalRequest,
+      preferredLanguage: input.preferredLanguage,
+      previousToolResult: input.previousToolResult,
+      previousRepeatedToolResultCount: input.previousRepeatedToolResultCount,
+      result: toolTaskResult.result,
+      workingFileAnchor
+    });
+
+    if ("directAnswer" in successDecision) {
+      return {
+        kind: "completed",
+        directAnswer: successDecision.directAnswer,
+        repeatedToolResultCount: successDecision.repeatedToolResultCount,
+        lastToolResult: toolTaskResult.result
+      };
+    }
+
+    return {
+      kind: "continue",
+      nextPrompt: successDecision.nextPrompt,
+      repeatedToolResultCount: successDecision.repeatedToolResultCount,
+      lastToolResult: toolTaskResult.result
+    };
   }
 
   private async runAssistantPass(input: {
@@ -961,6 +1066,8 @@ export class AgentRuntime {
     let streamedVisible = false;
     let visibleMessageEmitted = false;
     let pendingPrefix = "";
+    const deferVisibleEmission = input.content.startsWith("Original user request:")
+      || looksLikeActionableTaskRequest(input.content);
 
     for await (const chunk of this.input.provider.streamResponse({
       content: input.content,
@@ -970,7 +1077,7 @@ export class AgentRuntime {
       buffer += chunk.delta;
 
       if (streamedVisible) {
-        if (input.suppressMessageEmission) {
+        if (input.suppressMessageEmission || deferVisibleEmission) {
           continue;
         }
 
@@ -995,7 +1102,7 @@ export class AgentRuntime {
       if (mode === "message") {
         streamedVisible = true;
 
-        if (!input.suppressMessageEmission) {
+        if (!input.suppressMessageEmission && !deferVisibleEmission) {
           const nextEvent = createAssistantDeltaEvent({
             sessionId: input.sessionId,
             taskId: input.taskId,
@@ -1442,8 +1549,8 @@ function extractWritableTaskPaths(request: string) {
     .map((match) => match[1]?.trim())
     .filter((value): value is string => Boolean(value));
   const paths = [
-    ...quoted.flatMap((value) => extractPathsFromSnippet(value)),
-    ...extractPathsFromSnippet(request.replace(/`[^`]+`/g, " "))
+    ...extractPathsFromSnippet(request.replace(/`[^`]+`/g, " ")),
+    ...quoted.flatMap((value) => extractPathsFromSnippet(value))
   ];
 
   return dedupeNormalizedPaths(paths);
@@ -1451,7 +1558,7 @@ function extractWritableTaskPaths(request: string) {
 
 function extractPathsFromSnippet(content: string) {
   const commandPath = extractCommandPath(content);
-  const directPaths = [...content.matchAll(/\b([A-Za-z0-9_./-]+\.(?:mjs|js|ts|tsx|json|txt|md|csv))\b/g)]
+  const directPaths = [...content.matchAll(/\b([A-Za-z0-9_./-]+\.(?:tsx|json|mjs|js|ts|txt|md|csv))\b/g)]
     .map((match) => match[1]?.trim())
     .filter((value): value is string => Boolean(value));
 
@@ -1480,7 +1587,7 @@ function dedupeNormalizedPaths(paths: string[]) {
 }
 
 function extractCommandPath(command: string) {
-  const match = command.match(/\b(?:node|pnpm|npm|yarn|bun|deno|python|python3|sh|bash|tsx)\s+([^\s]+?\.(?:mjs|js|ts|tsx|json|txt|md|csv))\b/i);
+  const match = command.match(/\b(?:node|pnpm|npm|yarn|bun|deno|python|python3|sh|bash|tsx)\s+([^\s]+?\.(?:tsx|json|mjs|js|ts|txt|md|csv))\b/i);
   return match?.[1]?.trim();
 }
 
@@ -1613,6 +1720,19 @@ function combineToolRawOutput(stdout?: string, stderr?: string) {
   return hasStderr ? stderr : "";
 }
 
+function extractLastNonEmptyLine(content?: string) {
+  if (!content) {
+    return "";
+  }
+
+  const lines = content
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  return lines.at(-1) ?? "";
+}
+
 function createAbortError() {
   const error = new Error("Request aborted");
   error.name = "AbortError";
@@ -1628,7 +1748,7 @@ function withWorkingFileAnchor<T extends {
   summary: string;
   rawOutput?: string;
   errorMessage?: string;
-}>(input: T, workingFileAnchor?: string) {
+}>(input: T, workingFileAnchor?: string): T & { workingFileAnchor?: string } {
   return {
     ...input,
     workingFileAnchor
@@ -1650,49 +1770,138 @@ function isToolExecutionFailureSummary(summary: string) {
   return /\bfailed\b/i.test(summary) || /\btimed out\b/i.test(summary) || /\bcancelled\b/i.test(summary);
 }
 
+function pushPreferredNextAction(lines: string[], actionHint?: string) {
+  if (actionHint) {
+    lines.push(`Preferred next action: ${actionHint}`);
+  }
+}
+
+function pushPreferredAnswerStyle(lines: string[], answerStyleHint?: string) {
+  if (answerStyleHint) {
+    lines.push(`Preferred answer style: ${answerStyleHint}`);
+  }
+}
+
+function pushClueLines(lines: string[], clueLines: string[]) {
+  if (clueLines.length > 0) {
+    lines.push(...clueLines);
+  }
+}
+
+function buildAssistantMessageClueLines(assistantMessage: string) {
+  const clues: string[] = [];
+  const nextTargetPath = extractLikelyNextTargetPathFromAssistantMessage(assistantMessage);
+
+  if (nextTargetPath) {
+    clues.push(`Pending next step target: ${nextTargetPath}`);
+  }
+
+  return clues;
+}
+
+function pushErrorLine(lines: string[], errorMessage?: string) {
+  if (errorMessage) {
+    lines.push(`Error: ${errorMessage}`);
+  }
+}
+
+function pushRawOutputSection(lines: string[], rawOutput?: string, fallback = false) {
+  if (rawOutput && rawOutput.trim().length > 0) {
+    lines.push("Raw output (already shown to the user):");
+    lines.push(rawOutput);
+    return;
+  }
+
+  if (fallback) {
+    lines.push("Raw output: (none)");
+  }
+}
+
+function buildAssistantToolPromptLines(input: {
+  originalRequest: string;
+  instructionLines: string[];
+  preferredLanguage: PreferredReplyLanguage;
+  assistantMessage: string;
+  latestTool: Pick<RuntimeToolResult, "toolName" | "summary">;
+}) {
+  return [
+    `Original user request: ${input.originalRequest}`,
+    "",
+    ...input.instructionLines,
+    buildPreferredReplyLanguageInstruction(input.preferredLanguage),
+    "",
+    `Previous assistant message: ${input.assistantMessage.trim() || "(empty)"}`,
+    `Latest tool: ${input.latestTool.toolName}`,
+    `Latest summary: ${input.latestTool.summary}`
+  ];
+}
+
+function buildToolResultPromptLines(input: {
+  originalRequest: string;
+  instructionLines: string[];
+  preferredLanguage: PreferredReplyLanguage;
+  toolResult: Pick<RuntimeToolResult, "toolName" | "summary">;
+}) {
+  return [
+    `Original user request: ${input.originalRequest}`,
+    "",
+    ...input.instructionLines,
+    buildPreferredReplyLanguageInstruction(input.preferredLanguage),
+    "",
+    `Tool: ${input.toolResult.toolName}`,
+    `Summary: ${input.toolResult.summary}`
+  ];
+}
+
+function buildRequestPromptLines(input: {
+  originalRequest: string;
+  instructionLines: string[];
+  preferredLanguage: PreferredReplyLanguage;
+  assistantMessage?: string;
+}) {
+  return [
+    `Original user request: ${input.originalRequest}`,
+    "",
+    ...input.instructionLines,
+    buildPreferredReplyLanguageInstruction(input.preferredLanguage),
+    ...(typeof input.assistantMessage === "string"
+      ? ["", `Previous assistant message: ${input.assistantMessage.trim() || "(empty)"}`]
+      : [])
+  ];
+}
+
 function buildToolContinuationPrompt(originalRequest: string, input: {
   toolName: string;
   summary: string;
   rawOutput?: string;
   workingFileAnchor?: string;
 }, preferredLanguage: PreferredReplyLanguage) {
-  const lines = [
-    `Original user request: ${originalRequest}`,
-    "",
-    "Continue from the latest tool result only.",
-    "Do not infer anything that is not explicitly present in the result below.",
-    "If another tool is required, return exactly one tool call block.",
-    "If the original request is not yet completed, keep working instead of stopping at a status update.",
-    "Otherwise answer the user briefly and directly.",
-    "The terminal already shows the raw tool output to the user.",
-    "Do not restate raw output line-by-line or quote it verbatim unless the user explicitly asked for a transformation or summary.",
-    "For listings, reads, and command output, prefer a one-sentence conclusion over repeating the visible lines.",
-    "If system context includes Recent task state, treat its Target verification and Working files as the current task anchor.",
-    "Do not rerun earlier auxiliary commands or warmups when a later target verification command is already established.",
-    buildPreferredReplyLanguageInstruction(preferredLanguage),
-    "",
-    `Tool: ${input.toolName}`,
-    `Summary: ${input.summary}`
-  ];
+  const lines = buildToolResultPromptLines({
+    originalRequest,
+    instructionLines: [
+      "Continue from the latest tool result only.",
+      "Do not infer anything that is not explicitly present in the result below.",
+      "If another tool is required, return exactly one tool call block.",
+      "If the original request is not yet completed, keep working instead of stopping at a status update.",
+      "Otherwise answer the user briefly and directly.",
+      "The terminal already shows the raw tool output to the user.",
+      "Do not restate raw output line-by-line or quote it verbatim unless the user explicitly asked for a transformation or summary.",
+      "For listings, reads, and command output, prefer a one-sentence conclusion over repeating the visible lines.",
+      "If system context includes Recent task state, treat its Target verification and Working files as the current task anchor.",
+      "If Recent task state includes Pending next step, continue that concrete next step before broad rereads or replanning.",
+      "If Recent task state includes Pending approval, retry that exact action before reopening broader exploration.",
+      "Do not rerun earlier auxiliary commands or warmups when a later target verification command is already established."
+    ],
+    preferredLanguage,
+    toolResult: input
+  });
 
   const actionHint = buildToolContinuationActionHint(originalRequest, input);
-
-  if (actionHint) {
-    lines.push(`Preferred next action: ${actionHint}`);
-  }
+  pushPreferredNextAction(lines, actionHint);
 
   const clueLines = buildToolContinuationClueLines(originalRequest, input);
-
-  if (clueLines.length > 0) {
-    lines.push(...clueLines);
-  }
-
-  if (input.rawOutput && input.rawOutput.trim().length > 0) {
-    lines.push("Raw output (already shown to the user):");
-    lines.push(input.rawOutput);
-  } else {
-    lines.push("Raw output: (none)");
-  }
+  pushClueLines(lines, clueLines);
+  pushRawOutputSection(lines, input.rawOutput, true);
 
   return lines.join("\n");
 }
@@ -1740,10 +1949,7 @@ function buildEditRangeRecoveryContinuationPrompt(originalRequest: string, faile
     lines.push(`Actual file range: ${actualRange}`);
   }
 
-  if (currentRead.rawOutput && currentRead.rawOutput.trim().length > 0) {
-    lines.push("Raw output (already shown to the user):");
-    lines.push(currentRead.rawOutput);
-  }
+  pushRawOutputSection(lines, currentRead.rawOutput);
 
   return lines.join("\n");
 }
@@ -1755,32 +1961,27 @@ function buildPrematureContinuationPrompt(originalRequest: string, assistantMess
   errorMessage?: string;
   workingFileAnchor?: string;
 }, preferredLanguage: PreferredReplyLanguage) {
-  const lines = [
-    `Original user request: ${originalRequest}`,
-    "",
-    "You are still inside the same multi-step task.",
-    "Your previous assistant message was only a progress update, not a completed result.",
-    "Do not stop until the original request is actually completed.",
-    "If more work is needed, return exactly one tool call block.",
-    "Only answer directly after the requested read/create/edit/verification work is truly finished.",
-    "Do not apologize or restate the same status update.",
-    buildPreferredReplyLanguageInstruction(preferredLanguage),
-    "",
-    `Previous assistant message: ${assistantMessage.trim() || "(empty)"}`,
-    `Latest tool: ${input.toolName}`,
-    `Latest summary: ${input.summary}`
+  const lines = buildAssistantToolPromptLines({
+    originalRequest,
+    instructionLines: [
+      "You are still inside the same multi-step task.",
+      "Your previous assistant message was only a progress update, not a completed result.",
+      "Do not stop until the original request is actually completed.",
+      "If more work is needed, return exactly one tool call block.",
+      "Only answer directly after the requested read/create/edit/verification work is truly finished.",
+      "Do not apologize or restate the same status update."
+    ],
+    preferredLanguage,
+    assistantMessage,
+    latestTool: input
+  });
+
+  const clueLines = [
+    ...buildAssistantMessageClueLines(assistantMessage),
+    ...buildToolContinuationClueLines(originalRequest, input)
   ];
-
-  const clueLines = buildToolContinuationClueLines(originalRequest, input);
-
-  if (clueLines.length > 0) {
-    lines.push(...clueLines);
-  }
-
-  if (input.rawOutput && input.rawOutput.trim().length > 0) {
-    lines.push("Raw output (already shown to the user):");
-    lines.push(input.rawOutput);
-  }
+  pushClueLines(lines, clueLines);
+  pushRawOutputSection(lines, input.rawOutput);
 
   return lines.join("\n");
 }
@@ -1792,39 +1993,28 @@ function buildStalledToolContinuationPrompt(originalRequest: string, input: {
   errorMessage?: string;
   workingFileAnchor?: string;
 }, repeatedCount: number, preferredLanguage: PreferredReplyLanguage) {
-  const lines = [
-    `Original user request: ${originalRequest}`,
-    "",
-    "The latest tool result repeated without progress.",
-    `Repeated identical result count: ${repeatedCount + 1}`,
-    "Do not repeat the same tool step again unless you just changed the exact source that should affect this result.",
-    "Pick a different targeted action that can change the outcome.",
-    "If another tool is needed, return exactly one tool call block.",
-    "Only answer directly when the original request is truly complete.",
-    buildPreferredReplyLanguageInstruction(preferredLanguage),
-    "",
-    `Tool: ${input.toolName}`,
-    `Summary: ${input.summary}`
-  ];
+  const lines = buildToolResultPromptLines({
+    originalRequest,
+    instructionLines: [
+      "The latest tool result repeated without progress.",
+      `Repeated identical result count: ${repeatedCount + 1}`,
+      "Do not repeat the same tool step again unless you just changed the exact source that should affect this result.",
+      "Pick a different targeted action that can change the outcome.",
+      "If another tool is needed, return exactly one tool call block.",
+      "Only answer directly when the original request is truly complete."
+    ],
+    preferredLanguage,
+    toolResult: input
+  });
 
   const actionHint = buildStalledActionHint(originalRequest, input);
-
-  if (actionHint) {
-    lines.push(`Preferred next action: ${actionHint}`);
-  }
+  pushPreferredNextAction(lines, actionHint);
 
   const clueLines = input.toolName === "shell"
     ? buildToolFailureClueLines(originalRequest, input)
     : [];
-
-  if (clueLines.length > 0) {
-    lines.push(...clueLines);
-  }
-
-  if (input.rawOutput && input.rawOutput.trim().length > 0) {
-    lines.push("Raw output (already shown to the user):");
-    lines.push(input.rawOutput);
-  }
+  pushClueLines(lines, clueLines);
+  pushRawOutputSection(lines, input.rawOutput);
 
   return lines.join("\n");
 }
@@ -1834,19 +2024,19 @@ function buildPrematureTaskStartPrompt(
   assistantMessage: string,
   preferredLanguage: PreferredReplyLanguage
 ) {
-  return [
-    `Original user request: ${originalRequest}`,
-    "",
-    "You have not started the requested work yet.",
-    "Your previous assistant message described intent or a plan, but did not actually perform the task.",
-    "For actionable requests, do the work now instead of describing what you will do.",
-    "If tools are needed, return exactly one tool call block.",
-    "Only answer directly when the request truly needs no tool work.",
-    "Do not ask for permission to begin unless the user explicitly asked for discussion first.",
-    buildPreferredReplyLanguageInstruction(preferredLanguage),
-    "",
-    `Previous assistant message: ${assistantMessage.trim() || "(empty)"}`
-  ].join("\n");
+  return buildRequestPromptLines({
+    originalRequest,
+    instructionLines: [
+      "You have not started the requested work yet.",
+      "Your previous assistant message described intent or a plan, but did not actually perform the task.",
+      "For actionable requests, do the work now instead of describing what you will do.",
+      "If tools are needed, return exactly one tool call block.",
+      "Only answer directly when the request truly needs no tool work.",
+      "Do not ask for permission to begin unless the user explicitly asked for discussion first."
+    ],
+    preferredLanguage,
+    assistantMessage
+  }).join("\n");
 }
 
 function buildProposalNarrowingPrompt(
@@ -1854,18 +2044,18 @@ function buildProposalNarrowingPrompt(
   assistantMessage: string,
   preferredLanguage: PreferredReplyLanguage
 ) {
-  return [
-    `Original user request: ${originalRequest}`,
-    "",
-    "The user asked for only the next step, not a broad plan.",
-    "Rewrite your previous answer as exactly one concrete next step.",
-    "Do not list multiple options.",
-    "Do not start doing the work yet.",
-    "Keep it short and directly executable after a simple user confirmation.",
-    buildPreferredReplyLanguageInstruction(preferredLanguage),
-    "",
-    `Previous assistant message: ${assistantMessage.trim() || "(empty)"}`
-  ].join("\n");
+  return buildRequestPromptLines({
+    originalRequest,
+    instructionLines: [
+      "The user asked for only the next step, not a broad plan.",
+      "Rewrite your previous answer as exactly one concrete next step.",
+      "Do not list multiple options.",
+      "Do not start doing the work yet.",
+      "Keep it short and directly executable after a simple user confirmation."
+    ],
+    preferredLanguage,
+    assistantMessage
+  }).join("\n");
 }
 
 function buildFailureRecoveryPrompt(
@@ -1880,38 +2070,30 @@ function buildFailureRecoveryPrompt(
   },
   preferredLanguage: PreferredReplyLanguage
 ) {
-  const lines = [
-    `Original user request: ${originalRequest}`,
-    "",
-    "A single failed tool result does not complete this task.",
-    "Your previous assistant message stopped after a failure instead of continuing the repair loop.",
-    "Keep working from the failure you already have.",
-    "If tools are needed, return exactly one tool call block.",
-    "Only answer directly if the task is truly blocked on missing user input or a denied permission.",
-    "Do not just restate the failure.",
-    buildPreferredReplyLanguageInstruction(preferredLanguage),
-    "",
-    `Previous assistant message: ${assistantMessage.trim() || "(empty)"}`,
-    `Latest tool: ${input.toolName}`,
-    `Latest summary: ${input.summary}`
-  ];
+  const lines = buildAssistantToolPromptLines({
+    originalRequest,
+    instructionLines: [
+      "A single failed tool result does not complete this task.",
+      "Your previous assistant message stopped after a failure instead of continuing the repair loop.",
+      "Keep working from the failure you already have.",
+      "If tools are needed, return exactly one tool call block.",
+      "Only answer directly if the task is truly blocked on missing user input or a denied permission.",
+      "Do not just restate the failure."
+    ],
+    preferredLanguage,
+    assistantMessage,
+    latestTool: input
+  });
 
   const actionHint = buildFailureActionHint(input);
+  pushPreferredNextAction(lines, actionHint);
 
-  if (actionHint) {
-    lines.push(`Preferred next action: ${actionHint}`);
-  }
-
-  const clueLines = buildToolFailureClueLines(originalRequest, input);
-
-  if (clueLines.length > 0) {
-    lines.push(...clueLines);
-  }
-
-  if (input.rawOutput && input.rawOutput.trim().length > 0) {
-    lines.push("Raw output (already shown to the user):");
-    lines.push(input.rawOutput);
-  }
+  const clueLines = [
+    ...buildAssistantMessageClueLines(assistantMessage),
+    ...buildToolFailureClueLines(originalRequest, input)
+  ];
+  pushClueLines(lines, clueLines);
+  pushRawOutputSection(lines, input.rawOutput);
 
   return lines.join("\n");
 }
@@ -1927,37 +2109,29 @@ function buildProjectInspectionContinuationPrompt(
   },
   preferredLanguage: PreferredReplyLanguage
 ) {
-  const lines = [
-    `Original user request: ${originalRequest}`,
-    "",
-    "You are in the middle of a concrete project inspection request.",
-    "Do not stop at a broad question after the workspace listing.",
-    "Continue the inspection now by reading the most likely project entry from the listing.",
-    "If another tool is needed, return exactly one tool call block.",
-    "Only answer directly after you have inspected at least one concrete project entry.",
-    buildPreferredReplyLanguageInstruction(preferredLanguage),
-    "",
-    `Previous assistant message: ${assistantMessage.trim() || "(empty)"}`,
-    `Latest tool: ${input.toolName}`,
-    `Latest summary: ${input.summary}`
-  ];
+  const lines = buildAssistantToolPromptLines({
+    originalRequest,
+    instructionLines: [
+      "You are in the middle of a concrete project inspection request.",
+      "Do not stop at a broad question after the workspace listing.",
+      "Continue the inspection now by reading the most likely project entry from the listing.",
+      "If another tool is needed, return exactly one tool call block.",
+      "Only answer directly after you have inspected at least one concrete project entry."
+    ],
+    preferredLanguage,
+    assistantMessage,
+    latestTool: input
+  });
 
   const actionHint = buildToolContinuationActionHint(originalRequest, input);
+  pushPreferredNextAction(lines, actionHint);
 
-  if (actionHint) {
-    lines.push(`Preferred next action: ${actionHint}`);
-  }
-
-  const clueLines = buildToolContinuationClueLines(originalRequest, input);
-
-  if (clueLines.length > 0) {
-    lines.push(...clueLines);
-  }
-
-  if (input.rawOutput && input.rawOutput.trim().length > 0) {
-    lines.push("Raw output (already shown to the user):");
-    lines.push(input.rawOutput);
-  }
+  const clueLines = [
+    ...buildAssistantMessageClueLines(assistantMessage),
+    ...buildToolContinuationClueLines(originalRequest, input)
+  ];
+  pushClueLines(lines, clueLines);
+  pushRawOutputSection(lines, input.rawOutput);
 
   return lines.join("\n");
 }
@@ -1973,37 +2147,29 @@ function buildProjectWorkfileContinuationPrompt(
   },
   preferredLanguage: PreferredReplyLanguage
 ) {
-  const lines = [
-    `Original user request: ${originalRequest}`,
-    "",
-    "You are in the middle of a project improvement task.",
-    "You already inspected a concrete project entry, so do not stop at analysis or a broad next-step suggestion.",
-    "Continue now by reading the most likely implementation file for the improvement work.",
-    "If another tool is needed, return exactly one tool call block.",
-    "Only answer directly after you have inspected a concrete working file or truly completed the task.",
-    buildPreferredReplyLanguageInstruction(preferredLanguage),
-    "",
-    `Previous assistant message: ${assistantMessage.trim() || "(empty)"}`,
-    `Latest tool: ${input.toolName}`,
-    `Latest summary: ${input.summary}`
-  ];
+  const lines = buildAssistantToolPromptLines({
+    originalRequest,
+    instructionLines: [
+      "You are in the middle of a project improvement task.",
+      "You already inspected a concrete project entry, so do not stop at analysis or a broad next-step suggestion.",
+      "Continue now by reading the most likely implementation file for the improvement work.",
+      "If another tool is needed, return exactly one tool call block.",
+      "Only answer directly after you have inspected a concrete working file or truly completed the task."
+    ],
+    preferredLanguage,
+    assistantMessage,
+    latestTool: input
+  });
 
   const actionHint = buildToolContinuationActionHint(originalRequest, input);
+  pushPreferredNextAction(lines, actionHint);
 
-  if (actionHint) {
-    lines.push(`Preferred next action: ${actionHint}`);
-  }
-
-  const clueLines = buildToolContinuationClueLines(originalRequest, input);
-
-  if (clueLines.length > 0) {
-    lines.push(...clueLines);
-  }
-
-  if (input.rawOutput && input.rawOutput.trim().length > 0) {
-    lines.push("Raw output (already shown to the user):");
-    lines.push(input.rawOutput);
-  }
+  const clueLines = [
+    ...buildAssistantMessageClueLines(assistantMessage),
+    ...buildToolContinuationClueLines(originalRequest, input)
+  ];
+  pushClueLines(lines, clueLines);
+  pushRawOutputSection(lines, input.rawOutput);
 
   return lines.join("\n");
 }
@@ -2019,20 +2185,19 @@ function buildWholeProjectInspectionContinuationPrompt(
   },
   preferredLanguage: PreferredReplyLanguage
 ) {
-  const lines = [
-    `Original user request: ${originalRequest}`,
-    "",
-    "You are in the middle of a whole-project inspection request.",
-    "Inspecting only the project entry is not enough here.",
-    "Continue now by reading the most likely core implementation file for this project.",
-    "If another tool is needed, return exactly one tool call block.",
-    "Only answer directly after you have inspected at least one core implementation file or truly hit a blocker.",
-    buildPreferredReplyLanguageInstruction(preferredLanguage),
-    "",
-    `Previous assistant message: ${assistantMessage.trim() || "(empty)"}`,
-    `Latest tool: ${input.toolName}`,
-    `Latest summary: ${input.summary}`
-  ];
+  const lines = buildAssistantToolPromptLines({
+    originalRequest,
+    instructionLines: [
+      "You are in the middle of a whole-project inspection request.",
+      "Inspecting only the project entry is not enough here.",
+      "Continue now by reading the most likely core implementation file for this project.",
+      "If another tool is needed, return exactly one tool call block.",
+      "Only answer directly after you have inspected at least one core implementation file or truly hit a blocker."
+    ],
+    preferredLanguage,
+    assistantMessage,
+    latestTool: input
+  });
 
   const targetPath = extractPathFromToolSummary(input.summary);
   const inspectionFile = targetPath ? deriveLikelyProjectWorkfileFromEntryPath(targetPath) : undefined;
@@ -2041,10 +2206,8 @@ function buildWholeProjectInspectionContinuationPrompt(
     lines.push(`Likely inspection file: ${inspectionFile}`);
   }
 
-  if (input.rawOutput && input.rawOutput.trim().length > 0) {
-    lines.push("Raw output (already shown to the user):");
-    lines.push(input.rawOutput);
-  }
+  pushClueLines(lines, buildAssistantMessageClueLines(assistantMessage));
+  pushRawOutputSection(lines, input.rawOutput);
 
   return lines.join("\n");
 }
@@ -2061,33 +2224,27 @@ function buildMultiTargetMutationContinuationPrompt(
   },
   preferredLanguage: PreferredReplyLanguage
 ) {
-  const lines = [
-    `Original user request: ${originalRequest}`,
-    "",
-    "The original request contains multiple concrete file changes.",
-    "One successful edit does not complete the task when your own reply says more requested work remains.",
-    "Continue with the next remaining requested change now.",
-    "If tools are needed, return exactly one tool call block.",
-    "Only answer directly after the remaining requested edits are done or truly blocked.",
-    buildPreferredReplyLanguageInstruction(preferredLanguage),
-    "",
-    `Previous assistant message: ${assistantMessage.trim() || "(empty)"}`,
-    `Latest tool: ${input.toolName}`,
-    `Latest summary: ${input.summary}`
-  ];
+  const lines = buildAssistantToolPromptLines({
+    originalRequest,
+    instructionLines: [
+      "The original request contains multiple concrete file changes.",
+      "One successful edit does not complete the task when your own reply says more requested work remains.",
+      "Continue with the next remaining requested change now.",
+      "If tools are needed, return exactly one tool call block.",
+      "Only answer directly after the remaining requested edits are done or truly blocked."
+    ],
+    preferredLanguage,
+    assistantMessage,
+    latestTool: input
+  });
 
   const actionHint = input.toolName === "edit" || input.toolName === "write"
     ? "do not stop after the first successful edit; move to the next requested file or remaining requested change now"
     : buildToolContinuationActionHint(originalRequest, input);
 
-  if (actionHint) {
-    lines.push(`Preferred next action: ${actionHint}`);
-  }
-
-  if (input.rawOutput && input.rawOutput.trim().length > 0) {
-    lines.push("Raw output (already shown to the user):");
-    lines.push(input.rawOutput);
-  }
+  pushPreferredNextAction(lines, actionHint);
+  pushClueLines(lines, buildAssistantMessageClueLines(assistantMessage));
+  pushRawOutputSection(lines, input.rawOutput);
 
   return lines.join("\n");
 }
@@ -2104,42 +2261,38 @@ function buildExecutionConvergencePrompt(
   },
   preferredLanguage: PreferredReplyLanguage
 ) {
-  const lines = [
-    `Original user request: ${originalRequest}`,
-    "",
-    "You are already inside the execution phase of a concrete task.",
-    "Your previous assistant message explained the situation but did not advance the task.",
-    "Do not stop for explanation-only updates.",
-    "Take the next concrete step that moves the task forward.",
-    "If tools are needed, return exactly one tool call block.",
-    "Only answer directly when the task is actually complete or truly blocked on user input.",
-    buildPreferredReplyLanguageInstruction(preferredLanguage),
-    "",
-    `Previous assistant message: ${assistantMessage.trim() || "(empty)"}`,
-    `Latest tool: ${input.toolName}`,
-    `Latest summary: ${input.summary}`
-  ];
+  const progressOnly = looksLikeProgressOnlyAssistantReply(assistantMessage);
+  const lines = buildAssistantToolPromptLines({
+    originalRequest,
+    instructionLines: [
+      "You are already inside the execution phase of a concrete task.",
+      progressOnly
+        ? "Your previous assistant message was only a progress update."
+        : "Your previous assistant message explained the situation but did not advance the task.",
+      "Do not stop for explanation-only updates.",
+      "Take the next concrete step that moves the task forward.",
+      "If tools are needed, return exactly one tool call block.",
+      "Only answer directly when the task is actually complete or truly blocked on user input."
+    ],
+    preferredLanguage,
+    assistantMessage,
+    latestTool: input
+  });
 
   const actionHint = input.toolName === "shell"
     ? buildToolContinuationActionHint(originalRequest, input) ?? buildFailureActionHint(input)
     : buildToolContinuationActionHint(originalRequest, input);
 
-  if (actionHint) {
-    lines.push(`Preferred next action: ${actionHint}`);
-  }
+  pushPreferredNextAction(lines, actionHint);
 
   const clueLines = input.toolName === "shell"
-    ? buildToolFailureClueLines(originalRequest, input)
-    : [];
-
-  if (clueLines.length > 0) {
-    lines.push(...clueLines);
-  }
-
-  if (input.rawOutput && input.rawOutput.trim().length > 0) {
-    lines.push("Raw output (already shown to the user):");
-    lines.push(input.rawOutput);
-  }
+    ? [
+      ...buildAssistantMessageClueLines(assistantMessage),
+      ...buildToolFailureClueLines(originalRequest, input)
+    ]
+    : buildAssistantMessageClueLines(assistantMessage);
+  pushClueLines(lines, clueLines);
+  pushRawOutputSection(lines, input.rawOutput);
 
   return lines.join("\n");
 }
@@ -2157,45 +2310,36 @@ function buildCompletionTighteningPrompt(
   preferredLanguage: PreferredReplyLanguage
 ) {
   const taskTerminal = isLatestToolResultTaskTerminal(originalRequest, input);
-  const lines = [
-    `Original user request: ${originalRequest}`,
-    "",
-    taskTerminal
-      ? "The latest tool result appears to satisfy the task, but your previous reply did not close it clearly."
-      : "The latest tool result does not satisfy the task yet, so your previous reply cannot end the task.",
-    taskTerminal
-      ? "Give a short direct completion answer instead of a vague explanation."
-      : "Continue the task instead of ending on explanation alone.",
-    taskTerminal
-      ? "Do not call more tools unless the latest result still does not actually satisfy the request."
-      : "If tools are needed, return exactly one tool call block.",
-    buildPreferredReplyLanguageInstruction(preferredLanguage),
-    "",
-    `Previous assistant message: ${assistantMessage.trim() || "(empty)"}`,
-    `Latest tool: ${input.toolName}`,
-    `Latest summary: ${input.summary}`
-  ];
+  const lines = buildAssistantToolPromptLines({
+    originalRequest,
+    instructionLines: [
+      taskTerminal
+        ? "The latest tool result appears to satisfy the task, but your previous reply did not close it clearly."
+        : "The latest tool result does not satisfy the task yet, so your previous reply cannot end the task.",
+      taskTerminal
+        ? "Give a short direct completion answer instead of a vague explanation."
+        : "Continue the task instead of ending on explanation alone.",
+      taskTerminal
+        ? "Do not call more tools unless the latest result still does not actually satisfy the request."
+        : "If tools are needed, return exactly one tool call block."
+    ],
+    preferredLanguage,
+    assistantMessage,
+    latestTool: input
+  });
 
   const actionHint = taskTerminal
     ? "answer directly in one short sentence that clearly states the completed outcome"
     : buildToolContinuationActionHint(originalRequest, input) ?? buildFailureActionHint(input);
 
-  if (actionHint) {
-    lines.push(`Preferred next action: ${actionHint}`);
-  }
+  pushPreferredNextAction(lines, actionHint);
 
   const clueLines = input.toolName === "shell"
     ? buildToolFailureClueLines(originalRequest, input)
     : [];
 
-  if (clueLines.length > 0) {
-    lines.push(...clueLines);
-  }
-
-  if (input.rawOutput && input.rawOutput.trim().length > 0) {
-    lines.push("Raw output (already shown to the user):");
-    lines.push(input.rawOutput);
-  }
+  pushClueLines(lines, clueLines);
+  pushRawOutputSection(lines, input.rawOutput);
 
   return lines.join("\n");
 }
@@ -2212,42 +2356,34 @@ function buildFollowUpReplyTighteningPrompt(
   },
   preferredLanguage: PreferredReplyLanguage
 ) {
-  const lines = [
-    `Original user request: ${originalRequest}`,
-    "",
-    "Your previous reply was too thin for an approval or continue follow-up.",
-    "Do not start with an acknowledgement like 可以, 已继续, 好的, sure, or okay.",
-    "Give one short direct answer that states the concrete work result and the current outcome.",
-    "Do not ask a broad follow-up question here.",
-    "Do not call more tools unless the latest result still does not actually satisfy the request.",
-    buildPreferredReplyLanguageInstruction(preferredLanguage),
-    "",
-    `Previous assistant message: ${assistantMessage.trim() || "(empty)"}`,
-    `Latest tool: ${input.toolName}`,
-    `Latest summary: ${input.summary}`
-  ];
+  const lines = buildAssistantToolPromptLines({
+    originalRequest,
+    instructionLines: [
+      "Your previous reply was too thin for an approval or continue follow-up.",
+      "Do not start with an acknowledgement like 可以, 已继续, 好的, sure, or okay.",
+      "Give one short direct answer that states the concrete work result and the current outcome.",
+      "Do not ask a broad follow-up question here.",
+      "Do not call more tools unless the latest result still does not actually satisfy the request."
+    ],
+    preferredLanguage,
+    assistantMessage,
+    latestTool: input
+  });
 
   const actionHint = buildToolContinuationActionHint(originalRequest, input);
 
-  if (actionHint) {
-    lines.push(`Preferred next action: ${actionHint}`);
-  }
-
-  if (input.rawOutput && input.rawOutput.trim().length > 0) {
-    lines.push("Raw output (already shown to the user):");
-    lines.push(input.rawOutput);
-  }
+  pushPreferredNextAction(lines, actionHint);
+  pushRawOutputSection(lines, input.rawOutput);
 
   return lines.join("\n");
 }
 
 function buildDeniedContinuationPrompt(originalRequest: string, preferredLanguage: PreferredReplyLanguage) {
-  return [
-    `Original user request: ${originalRequest}`,
-    "",
-    TOOL_CALL_DENIED_PROMPT,
-    buildPreferredReplyLanguageInstruction(preferredLanguage)
-  ].join("\n");
+  return buildRequestPromptLines({
+    originalRequest,
+    instructionLines: [TOOL_CALL_DENIED_PROMPT],
+    preferredLanguage
+  }).join("\n");
 }
 
 function buildToolFailureContinuationPrompt(originalRequest: string, input: {
@@ -2257,46 +2393,35 @@ function buildToolFailureContinuationPrompt(originalRequest: string, input: {
   errorMessage?: string;
   workingFileAnchor?: string;
 }, preferredLanguage: PreferredReplyLanguage) {
-  const lines = [
-    `Original user request: ${originalRequest}`,
-    "",
-    "The latest tool attempt failed.",
-    "Do not repeat the raw failure twice.",
-    "Explain the failure briefly and accurately.",
-    "If another tool can help, return exactly one tool call block.",
-    "Otherwise answer directly.",
-    "The terminal already shows the raw tool output to the user.",
-    "Do not restate stdout or stderr line-by-line unless one exact line is necessary to explain the next action.",
-    "Prefer a short conclusion such as the key error, missing file, or exit code.",
-    "If system context includes Recent task state, continue from its Target verification and Working files instead of restarting broader exploration.",
-    "Do not go back to earlier auxiliary commands when the current task already has a later target verification command.",
-    buildPreferredReplyLanguageInstruction(preferredLanguage),
-    "",
-    `Tool: ${input.toolName}`,
-    `Summary: ${input.summary}`
-  ];
+  const lines = buildToolResultPromptLines({
+    originalRequest,
+    instructionLines: [
+      "The latest tool attempt failed.",
+      "Do not repeat the raw failure twice.",
+      "Explain the failure briefly and accurately.",
+      "If another tool can help, return exactly one tool call block.",
+      "Otherwise answer directly.",
+      "The terminal already shows the raw tool output to the user.",
+      "Do not restate stdout or stderr line-by-line unless one exact line is necessary to explain the next action.",
+      "Prefer a short conclusion such as the key error, missing file, or exit code.",
+      "If system context includes Recent task state, continue from its Target verification and Working files instead of restarting broader exploration.",
+      "If Recent task state includes Pending next step, continue that concrete next step before broad rereads or replanning.",
+      "If Recent task state includes Pending approval, retry that exact action before broad rereads or replanning.",
+      "Do not go back to earlier auxiliary commands when the current task already has a later target verification command."
+    ],
+    preferredLanguage,
+    toolResult: input
+  });
 
   const replyHint = buildFailureReplyHint(input, preferredLanguage);
-
-  if (replyHint) {
-    lines.push(`Preferred answer style: ${replyHint}`);
-  }
+  pushPreferredAnswerStyle(lines, replyHint);
 
   const actionHint = buildFailureActionHint(input);
-
-  if (actionHint) {
-    lines.push(`Preferred next action: ${actionHint}`);
-  }
+  pushPreferredNextAction(lines, actionHint);
 
   const clueLines = buildToolFailureClueLines(originalRequest, input);
-
-  if (clueLines.length > 0) {
-    lines.push(...clueLines);
-  }
-
-  if (input.errorMessage) {
-    lines.push(`Error: ${input.errorMessage}`);
-  }
+  pushClueLines(lines, clueLines);
+  pushErrorLine(lines, input.errorMessage);
 
   if (input.rawOutput && input.rawOutput !== input.errorMessage) {
     lines.push("Raw output (already shown to the user):");
@@ -2328,6 +2453,8 @@ function buildAgentSystemPrompt(tools: ToolImplementation[], preferredLanguage: 
     "The terminal UI already shows raw tool output to the user, so do not repeat listings, file contents, stdout, or stderr line-by-line unless the user explicitly asked for that transformation.",
     "Prefer one concise conclusion sentence over echoing visible tool output.",
     "When system context messages include Recent task state or Recent repair thread, use them to resume the current coding task before rereading unrelated files.",
+    "If Recent task state includes Pending next step, continue that concrete step before broader replanning.",
+    "If Recent task state includes Pending approval, retry that exact blocked action before drifting into broader analysis.",
     "For directory listings, only mention entries that actually appear in the listing.",
     "Never invent tool names or input fields.",
     "Available tools:"
@@ -2394,7 +2521,7 @@ function buildFailureActionHint(input: {
     return "prefer a targeted read of the file or command source that references the missing path, then fix that path before doing broader exploration";
   }
 
-  if (/[A-Za-z0-9_./-]+\.(?:mjs|js|ts|tsx|json|txt):\d+/i.test(shellText)) {
+  if (/[A-Za-z0-9_./-]+\.(?:tsx|json|mjs|js|ts|txt):\d+/i.test(shellText)) {
     return "prefer the specific source file and line mentioned in the shell output before reading anything broader";
   }
 
@@ -2430,6 +2557,16 @@ function buildToolContinuationActionHint(originalRequest: string, input: {
 }) {
   if (input.toolName === "files") {
     const targetPath = extractPathFromToolSummary(input.summary);
+    const rewriteWorkingFile = targetPath
+      && looksLikeProjectRewriteRequest(originalRequest)
+      && looksLikeProjectEntryPath(targetPath)
+      && !looksLikeEditableSourcePath(targetPath)
+      ? deriveLikelyProjectWorkfileFromEntryPath(targetPath)
+      : undefined;
+
+    if (rewriteWorkingFile) {
+      return `use this project entry to continue the rewrite by reading ${rewriteWorkingFile} next instead of editing the entry file itself`;
+    }
 
     if (!targetPath || !looksLikeExecutionTask(originalRequest)) {
       if (
@@ -2448,6 +2585,15 @@ function buildToolContinuationActionHint(originalRequest: string, input: {
         && !looksLikeEditableSourcePath(targetPath)
       ) {
         return "do not stop at project-entry analysis; read the most likely working file next so you can make a concrete improvement";
+      }
+
+      if (
+        targetPath
+        && looksLikeProjectRewriteRequest(originalRequest)
+        && looksLikeProjectEntryPath(targetPath)
+        && !looksLikeEditableSourcePath(targetPath)
+      ) {
+        return "do not stop at project-entry analysis; read the most likely working file next so you can carry the rewrite into a concrete implementation file";
       }
 
       return undefined;
@@ -2498,7 +2644,7 @@ function buildToolContinuationActionHint(originalRequest: string, input: {
 }
 
 function extractPathFromToolSummary(summary: string) {
-  const match = summary.match(/^([A-Za-z0-9_./-]+\.(?:mjs|cjs|js|ts|tsx|json|txt|md|csv|ejs|html|css))(?::\d+(?:-\d+)?)?/);
+  const match = summary.match(/^([A-Za-z0-9_./-]+\.(?:tsx|json|mjs|cjs|ejs|html|css|js|ts|txt|md|csv))(?::\d+(?:-\d+)?)?/);
   return match?.[1]?.trim();
 }
 
@@ -2598,7 +2744,18 @@ function buildToolContinuationClueLines(originalRequest: string, input: {
       clues.push(`Working file anchor: ${input.workingFileAnchor}`);
     }
 
-    if (!workingFile || !looksLikeBroadProjectImprovementRequest(originalRequest)) {
+    if (workingFile && looksLikeProjectRewriteRequest(originalRequest)) {
+      clues.push(`Likely working file: ${workingFile}`);
+      return dedupePromptLines(clues);
+    }
+
+    if (
+      !workingFile
+      || (
+        !looksLikeBroadProjectImprovementRequest(originalRequest)
+        && !looksLikeProjectRewriteRequest(originalRequest)
+      )
+    ) {
       return dedupePromptLines(clues);
     }
 
@@ -2666,8 +2823,41 @@ function extractShellCommandFromSummary(summary: string) {
   return match?.[1]?.trim();
 }
 
+function extractPrimaryPathFromShellCommand(command: string) {
+  const match = command.match(
+    /\b((?:src|config|apps?|packages?|docs)?\/?[A-Za-z0-9_./-]+\.(?:tsx|json|mjs|cjs|ejs|html|css|js|ts|txt|md|csv))\b/
+  );
+  const candidate = match?.[1]?.trim();
+
+  if (!candidate) {
+    return undefined;
+  }
+
+  const normalized = stripLineLocationSuffix(normalizePromptPath(candidate));
+
+  if (
+    normalized.startsWith("node:")
+    || normalized.startsWith("file:///")
+    || normalized.includes("/node_modules/")
+    || normalized === "."
+  ) {
+    return undefined;
+  }
+
+  return normalized;
+}
+
 function extractExpectedExactOutput(content: string) {
   return extractExpectedOutputFromTaskRequest(content);
+}
+
+function extractVerificationCommandFromTaskRequest(content: string) {
+  const backtickValues = [...content.matchAll(/`([^`]+)`/g)]
+    .map((match) => match[1]?.trim())
+    .filter((value): value is string => Boolean(value));
+
+  const commandValues = backtickValues.filter((value) => /^(?:node|pnpm|npm|yarn|bun|deno|python|python3|sh|bash|tsx)\b/i.test(value));
+  return commandValues.at(-1);
 }
 
 function extractObservedShellOutput(rawOutput?: string) {
@@ -2808,8 +2998,8 @@ function extractRequestedModulePath(content: string) {
 
 function extractLikelyTargetFile(content: string) {
   const candidates = [
-    ...matchAllGroups(content, /\b((?:src|config|apps?|packages?|docs)\/[A-Za-z0-9_./-]+\.(?:mjs|js|ts|tsx|json|txt|md|csv))(?::\d+(?::\d+)?)?/g),
-    ...matchAllGroups(content, /\b([A-Za-z0-9_./-]+\.(?:mjs|js|ts|tsx|json|txt|md|csv))(?::\d+(?::\d+)?)?/g)
+    ...matchAllGroups(content, /\b((?:src|config|apps?|packages?|docs)\/[A-Za-z0-9_./-]+\.(?:tsx|json|mjs|js|ts|txt|md|csv))(?::\d+(?::\d+)?)?/g),
+    ...matchAllGroups(content, /\b([A-Za-z0-9_./-]+\.(?:tsx|json|mjs|js|ts|txt|md|csv))(?::\d+(?::\d+)?)?/g)
   ]
     .map(normalizePromptPath)
     .map(stripLineLocationSuffix)
@@ -2821,7 +3011,7 @@ function extractLikelyTargetFile(content: string) {
 }
 
 function extractReferencedLocation(content: string) {
-  const match = content.match(/\b([A-Za-z0-9_./-]+\.(?:mjs|js|ts|tsx|json|txt|md|csv):\d+(?::\d+)?)\b/);
+  const match = content.match(/\b([A-Za-z0-9_./-]+\.(?:tsx|json|mjs|js|ts|txt|md|csv):\d+(?::\d+)?)\b/);
   return match?.[1] ? normalizePromptPath(match[1].trim()) : undefined;
 }
 
@@ -2831,7 +3021,7 @@ function stripLineLocationSuffix(value: string) {
 
 function normalizePromptPath(value: string) {
   const trimmed = value.trim();
-  const relativeMatch = trimmed.match(/((?:src|config|apps?|packages?|docs)\/[A-Za-z0-9_./-]+\.(?:mjs|js|ts|tsx|json|txt|md|csv)(?::\d+(?::\d+)?)?)/);
+  const relativeMatch = trimmed.match(/((?:src|config|apps?|packages?|docs)\/[A-Za-z0-9_./-]+\.(?:tsx|json|mjs|js|ts|txt|md|csv)(?::\d+(?::\d+)?)?)/);
 
   if (relativeMatch?.[1]) {
     return relativeMatch[1];
@@ -2914,7 +3104,8 @@ function shouldDeferAssistantMessageEmission(originalRequest: string) {
 
 function shouldPreserveDeferredAssistantStage(content: string) {
   return looksLikeStageSummaryWithPendingWork(content)
-    && !looksLikeBroadProposalReply(content);
+    && !looksLikeBroadProposalReply(content)
+    && Boolean(extractLikelyNextTargetPathFromAssistantMessage(content));
 }
 
 function buildDirectToolFailureAnswer(input: {
@@ -2994,133 +3185,117 @@ function resolveRunnableUserRequest(
   historyEvents: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>
 ) {
   const followUpContext = buildRecentFollowUpContext(historyEvents);
+  const followUp = classifyRunnableFollowUp(content);
 
-  if (isResumeFollowUp(content)) {
-    const interruptedResume = buildInterruptedTaskResumeForFollowUp({
+  if (!followUp) {
+    return content;
+  }
+
+  const interruptedResume = resolveInterruptedResumeFollowUp({
+    content,
+    historyEvents,
+    followUp,
+    previousAssistantProposal: followUpContext.previousAssistantProposal
+  });
+
+  if (interruptedResume) {
+    return interruptedResume;
+  }
+
+  if (followUp.kind === "resume") {
+    return content;
+  }
+
+  if (followUp.kind === "optimize" && followUpContext.previousAssistantProposal && looksLikeAssistantOptimizationProposal(followUpContext.previousAssistantProposal)) {
+    return buildApprovedOptimizeProposalPrompt({
       content,
-      historyEvents,
-      acknowledgementMode: "discussion question",
-      requireInterruptedTask: false
+      approvedProposal: followUpContext.previousAssistantProposal,
+      recentEditableWorkingFile: followUpContext.recentEditableWorkingFile
     });
+  }
 
-    if (interruptedResume) {
-      return interruptedResume;
+  if (followUp.kind === "rewrite" && followUpContext.previousAssistantProposal && looksLikeAssistantRewriteProposal(followUpContext.previousAssistantProposal)) {
+    return buildApprovedRewriteProposalPrompt({
+      content,
+      approvedProposal: followUpContext.previousAssistantProposal,
+      recentEditableWorkingFile: followUpContext.recentEditableWorkingFile
+    });
+  }
+
+  if (followUp.kind === "inspect" && followUpContext.previousAssistantProposal && looksLikeAssistantInspectionProposal(followUpContext.previousAssistantProposal)) {
+    return buildApprovedInspectProposalPrompt({
+      content,
+      approvedProposal: followUpContext.previousAssistantProposal,
+      recentEditableWorkingFile: followUpContext.recentEditableWorkingFile,
+      wholeProjectInspection: followUp.wholeProjectInspection
+    });
+  }
+
+  if (
+    (followUp.kind === "optimize" || followUp.kind === "rewrite" || followUp.kind === "inspect")
+    && (followUpContext.previousUserTask || followUpContext.recentEditableWorkingFile)
+  ) {
+    return buildRecentContextFollowUpPrompt({
+      content,
+      intent: followUp.kind,
+      previousUserTask: followUpContext.previousUserTask,
+      recentEditableWorkingFile: followUpContext.recentEditableWorkingFile,
+      wholeProjectInspection: followUp.kind === "inspect" ? followUp.wholeProjectInspection : undefined
+      });
+  }
+
+  if (followUp.kind === "approve" && followUpContext.previousAssistantProposal) {
+    if (looksLikeAssistantRewriteProposal(followUpContext.previousAssistantProposal)) {
+      return buildApprovedRewriteProposalPrompt({
+        content,
+        approvedProposal: followUpContext.previousAssistantProposal,
+        recentEditableWorkingFile: followUpContext.recentEditableWorkingFile
+      });
     }
   }
 
-  if (isAffirmativeFollowUp(content)) {
-    const interruptedResume = buildInterruptedTaskResumeForFollowUp({
-      content,
-      historyEvents,
-      acknowledgementMode: "generic acknowledgement",
-      requireInterruptedTask: true,
-      allowProposalResumeOnlyAfterExecution: true,
-      previousAssistantProposal: followUpContext.previousAssistantProposal
-    });
+  if (followUp.kind !== "approve" || !followUpContext.previousAssistantProposal) {
+    return content;
+  }
 
-    if (interruptedResume) {
-      return interruptedResume;
-    }
+  return buildApprovedProposalPrompt({
+    content,
+    approvedProposal: followUpContext.previousAssistantProposal
+  });
+}
+
+type RunnableFollowUp =
+  | { kind: "resume" }
+  | { kind: "approve" }
+  | { kind: "optimize" }
+  | { kind: "rewrite" }
+  | { kind: "inspect"; wholeProjectInspection: boolean };
+
+function classifyRunnableFollowUp(content: string): RunnableFollowUp | undefined {
+  if (isResumeFollowUp(content)) {
+    return { kind: "resume" };
   }
 
   if (isVagueOptimizationFollowUp(content)) {
-    const interruptedResume = buildInterruptedTaskResumeForFollowUp({
-      content,
-      historyEvents,
-      acknowledgementMode: "broad optimization follow-up",
-      requireInterruptedTask: true
-    });
-
-    if (interruptedResume) {
-      return interruptedResume;
-    }
-
-    if (followUpContext.previousUserTask || followUpContext.recentEditableWorkingFile) {
-      return buildRecentContextFollowUpPrompt({
-        content,
-        intent: "optimize",
-        previousUserTask: followUpContext.previousUserTask,
-        recentEditableWorkingFile: followUpContext.recentEditableWorkingFile
-      });
-    }
+    return { kind: "optimize" };
   }
 
   if (isVagueRewriteFollowUp(content)) {
-    const interruptedResume = buildInterruptedTaskResumeForFollowUp({
-      content,
-      historyEvents,
-      acknowledgementMode: "broad rewrite follow-up",
-      requireInterruptedTask: true,
-      requireProposalExecution: true
-    });
-
-    if (interruptedResume) {
-      return interruptedResume;
-    }
-
-    if (followUpContext.previousAssistantProposal && looksLikeAssistantRewriteProposal(followUpContext.previousAssistantProposal)) {
-      return [
-        `The user replied "${content.trim()}" and wants you to execute the immediately previous rewrite proposal now.`,
-        "Carry out that rewrite now instead of narrowing it to a single-file tweak.",
-        "Do the rewrite work now instead of stopping at analysis or another proposal.",
-        "Do not ask which file to start from unless the current context truly lacks a concrete target.",
-        "Start with the concrete work result, current finding, or the next real action.",
-        "Continue from the latest task state and recent working files already in context.",
-        followUpContext.recentEditableWorkingFile ? `Recent editable working file: ${followUpContext.recentEditableWorkingFile}` : "",
-        `Approved proposal: ${followUpContext.previousAssistantProposal}`
-      ].filter(Boolean).join("\n");
-    }
-
-    if (followUpContext.previousUserTask || followUpContext.recentEditableWorkingFile) {
-      return buildRecentContextFollowUpPrompt({
-        content,
-        intent: "rewrite",
-        previousUserTask: followUpContext.previousUserTask,
-        recentEditableWorkingFile: followUpContext.recentEditableWorkingFile
-      });
-    }
+    return { kind: "rewrite" };
   }
 
   if (isVagueInspectionFollowUp(content)) {
-    const interruptedResume = buildInterruptedTaskResumeForFollowUp({
-      content,
-      historyEvents,
-      acknowledgementMode: "broad inspection follow-up",
-      requireInterruptedTask: true
-    });
-
-    if (interruptedResume) {
-      return interruptedResume;
-    }
-
-    if (followUpContext.previousUserTask || followUpContext.recentEditableWorkingFile) {
-      const wantsWholeProjectInspection = isWholeProjectInspectionFollowUp(content);
-
-      return buildRecentContextFollowUpPrompt({
-        content,
-        intent: "inspect",
-        previousUserTask: followUpContext.previousUserTask,
-        recentEditableWorkingFile: followUpContext.recentEditableWorkingFile,
-        wholeProjectInspection: wantsWholeProjectInspection
-      });
-    }
+    return {
+      kind: "inspect",
+      wholeProjectInspection: isWholeProjectInspectionFollowUp(content)
+    };
   }
 
-  if (!isAffirmativeFollowUp(content)) {
-    return content;
+  if (isAffirmativeFollowUp(content)) {
+    return { kind: "approve" };
   }
 
-  if (!followUpContext.previousAssistantProposal) {
-    return content;
-  }
-
-  return [
-    `The user replied "${content.trim()}" to approve the immediately previous proposal.`,
-    "Carry out that approved proposal now instead of restating it.",
-    "Do not start with an acknowledgement like 可以, 可以继续, 好的, sure, or okay.",
-    "Start with the concrete work result, current finding, or the next real action.",
-    `Approved proposal: ${followUpContext.previousAssistantProposal}`
-  ].join("\n");
+  return undefined;
 }
 
 function isResumeFollowUp(content: string) {
@@ -3152,7 +3327,21 @@ function isAffirmativeFollowUp(content: string) {
     return true;
   }
 
+  if (isProposalAcceptanceFollowUp(normalized)) {
+    return true;
+  }
+
   return /^(?:继续|继续吧|干|干吧|搞|搞吧|弄|弄吧|来吧|开始吧)(?:[\s,，。!！?？/]+(?:继续|继续吧|干|干吧|搞|搞吧|弄|弄吧|来吧|开始吧))+$/iu.test(normalized);
+}
+
+function isProposalAcceptanceFollowUp(content: string) {
+  const normalized = content.trim();
+
+  if (!normalized || normalized.startsWith("/")) {
+    return false;
+  }
+
+  return /^(?:按你说的|照你说的)(?:改|做|来)吧?$|^(?:按这个|照这个)(?:改|做|来)吧?$|^(?:就按这个|那就按这个)(?:改|做|来)吧?$/iu.test(normalized);
 }
 
 function isVagueOptimizationFollowUp(content: string) {
@@ -3181,7 +3370,7 @@ function isVagueRewriteFollowUp(content: string) {
     return false;
   }
 
-  return /^(?:你能)?(?:帮我)?(?:重新写|重写)(?:这个|整个|项目)?(?:一下|下|吗)?$/iu.test(normalized)
+  return /^(?:你能)?(?:帮我)?(?:重新写|重写)(?:这个|整个|项目|个项目|一个项目)?(?:一下|下|吗)?$/iu.test(normalized)
     || /^(?:rewrite|rebuild)(?: it| this| the project)?$/iu.test(normalized);
 }
 
@@ -3273,6 +3462,7 @@ function extractPreviousAssistantProposal(
   historyEvents: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>
 ) {
   const timeline = projectSessionTimeline(historyEvents);
+  const previousActionableUserIndex = findPreviousActionableUserTimelineIndex(timeline);
   let skippedLatestUser = false;
 
   for (let index = timeline.length - 1; index >= 0; index -= 1) {
@@ -3286,6 +3476,10 @@ function extractPreviousAssistantProposal(
       continue;
     }
 
+    if (previousActionableUserIndex >= 0 && index <= previousActionableUserIndex) {
+      break;
+    }
+
     if (entry?.kind === "assistant" && looksLikeAssistantProposal(entry.text)) {
       return entry.text;
     }
@@ -3294,13 +3488,47 @@ function extractPreviousAssistantProposal(
   return undefined;
 }
 
+function findPreviousActionableUserTimelineIndex(
+  timeline: ReturnType<typeof projectSessionTimeline>
+) {
+  let skippedLatestUser = false;
+
+  for (let index = timeline.length - 1; index >= 0; index -= 1) {
+    const entry = timeline[index];
+
+    if (!skippedLatestUser) {
+      if (entry?.kind === "user") {
+        skippedLatestUser = true;
+      }
+
+      continue;
+    }
+
+    if (
+      entry?.kind === "user"
+      && !isAffirmativeFollowUp(entry.text)
+      && !isResumeFollowUp(entry.text)
+      && looksLikeActionableTaskRequest(entry.text)
+    ) {
+      return index;
+    }
+  }
+
+  return -1;
+}
+
 function extractRecentEditableWorkingFile(
   historyEvents: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>
 ) {
   const timeline = projectSessionTimeline(historyEvents);
+  const previousActionableUserIndex = findPreviousActionableUserTimelineIndex(timeline);
 
   for (let index = timeline.length - 1; index >= 0; index -= 1) {
     const entry = timeline[index];
+
+    if (previousActionableUserIndex >= 0 && index <= previousActionableUserIndex) {
+      break;
+    }
 
     if (entry?.kind !== "tool" || !entry.toolSummary) {
       continue;
@@ -3324,6 +3552,7 @@ function extractRecentToolAnchor(
   historyEvents: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>
 ) {
   const timeline = projectSessionTimeline(historyEvents);
+  const previousActionableUserIndex = findPreviousActionableUserTimelineIndex(timeline);
   let skippedLatestUser = false;
 
   for (let index = timeline.length - 1; index >= 0; index -= 1) {
@@ -3337,6 +3566,10 @@ function extractRecentToolAnchor(
       continue;
     }
 
+    if (previousActionableUserIndex >= 0 && index <= previousActionableUserIndex) {
+      break;
+    }
+
     if (entry?.kind === "tool" && entry.toolName && entry.toolSummary) {
       return {
         toolName: entry.toolName,
@@ -3348,12 +3581,52 @@ function extractRecentToolAnchor(
   return undefined;
 }
 
+function extractRecentPendingNextTarget(
+  historyEvents: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>
+) {
+  const timeline = projectSessionTimeline(historyEvents);
+  const previousActionableUserIndex = findPreviousActionableUserTimelineIndex(timeline);
+  let skippedLatestUser = false;
+
+  for (let index = timeline.length - 1; index >= 0; index -= 1) {
+    const entry = timeline[index];
+
+    if (!skippedLatestUser) {
+      if (entry?.kind === "user") {
+        skippedLatestUser = true;
+      }
+
+      continue;
+    }
+
+    if (previousActionableUserIndex >= 0 && index <= previousActionableUserIndex) {
+      break;
+    }
+
+    if (entry?.kind !== "assistant") {
+      continue;
+    }
+
+    const nextTarget = extractLikelyNextTargetPathFromAssistantMessage(entry.text);
+
+    if (nextTarget) {
+      return nextTarget;
+    }
+  }
+
+  return undefined;
+}
+
 function extractRecentInterruptedApprovalAnchor(
   historyEvents: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>
 ) {
   const latestUserIndex = findLatestUserMessageIndex(historyEvents);
+  const previousActionableUserEventIndex = findPreviousActionableUserEventIndex(historyEvents);
   const relevantEvents = latestUserIndex >= 0
-    ? historyEvents.slice(0, latestUserIndex)
+    ? historyEvents.slice(
+      Math.max(0, previousActionableUserEventIndex >= 0 ? previousActionableUserEventIndex : 0),
+      latestUserIndex
+    )
     : historyEvents;
 
   for (let index = relevantEvents.length - 1; index >= 0; index -= 1) {
@@ -3418,6 +3691,32 @@ function findLatestUserMessageIndex(
   return -1;
 }
 
+function findPreviousActionableUserEventIndex(
+  historyEvents: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>
+) {
+  const latestUserIndex = findLatestUserMessageIndex(historyEvents);
+
+  for (let index = latestUserIndex - 1; index >= 0; index -= 1) {
+    const event = historyEvents[index];
+
+    if (event?.type !== "user.message.submitted") {
+      continue;
+    }
+
+    const content = event.payload.content;
+
+    if (
+      !isAffirmativeFollowUp(content)
+      && !isResumeFollowUp(content)
+      && looksLikeActionableTaskRequest(content)
+    ) {
+      return index;
+    }
+  }
+
+  return -1;
+}
+
 function buildRecentContextFollowUpPrompt(input: {
   content: string;
   intent: "optimize" | "rewrite" | "inspect";
@@ -3442,15 +3741,91 @@ function buildRecentContextFollowUpPrompt(input: {
   const targetingLine = input.intent === "inspect"
     ? "Do not ask what to inspect first unless the current context truly lacks a concrete target."
     : "Do not ask which file to start from unless the current context truly lacks a concrete target.";
+  const projectRewriteLine = input.intent === "rewrite"
+    ? "Treat this as a project-level rewrite follow-up, so anchor on the project entry before narrowing back down to implementation files."
+    : "";
+  const recentEditableWorkingFileLine = input.intent === "rewrite"
+    ? ""
+    : input.recentEditableWorkingFile ? `Recent editable working file: ${input.recentEditableWorkingFile}` : "";
 
   return [
     requestLine,
     actionLine,
     targetingLine,
+    projectRewriteLine,
+    "Start with the concrete work result, current finding, or the next real action.",
+    "Continue from the latest task state and recent working files already in context.",
+    recentEditableWorkingFileLine,
+    input.previousUserTask ? `Previous context request: ${input.previousUserTask}` : ""
+  ].filter(Boolean).join("\n");
+}
+
+function buildApprovedProposalPrompt(input: {
+  content: string;
+  approvedProposal: string;
+}) {
+  return [
+    `The user replied "${input.content.trim()}" to approve the immediately previous proposal.`,
+    "Carry out that approved proposal now instead of restating it.",
+    "Do not start with an acknowledgement like 可以, 可以继续, 好的, sure, or okay.",
+    "Start with the concrete work result, current finding, or the next real action.",
+    `Approved proposal: ${input.approvedProposal}`
+  ].join("\n");
+}
+
+function buildApprovedRewriteProposalPrompt(input: {
+  content: string;
+  approvedProposal: string;
+  recentEditableWorkingFile?: string;
+}) {
+  return [
+    `The user replied "${input.content.trim()}" and wants you to execute the immediately previous rewrite proposal now.`,
+    "Carry out that rewrite now instead of narrowing it to a single-file tweak.",
+    "Do the rewrite work now instead of stopping at analysis or another proposal.",
+    "Do not ask which file to start from unless the current context truly lacks a concrete target.",
     "Start with the concrete work result, current finding, or the next real action.",
     "Continue from the latest task state and recent working files already in context.",
     input.recentEditableWorkingFile ? `Recent editable working file: ${input.recentEditableWorkingFile}` : "",
-    input.previousUserTask ? `Previous context request: ${input.previousUserTask}` : ""
+    `Approved proposal: ${input.approvedProposal}`
+  ].filter(Boolean).join("\n");
+}
+
+function buildApprovedOptimizeProposalPrompt(input: {
+  content: string;
+  approvedProposal: string;
+  recentEditableWorkingFile?: string;
+}) {
+  return [
+    `The user replied "${input.content.trim()}" and wants you to execute the immediately previous optimize proposal now.`,
+    "Carry out that optimization now instead of turning it into another generic suggestion.",
+    "Do the optimize work now instead of stopping at analysis or another proposal.",
+    "Do not ask which file to start from unless the current context truly lacks a concrete target.",
+    "Start with the concrete work result, current finding, or the next real action.",
+    "Continue from the latest task state and recent working files already in context.",
+    input.recentEditableWorkingFile ? `Recent editable working file: ${input.recentEditableWorkingFile}` : "",
+    `Approved proposal: ${input.approvedProposal}`
+  ].filter(Boolean).join("\n");
+}
+
+function buildApprovedInspectProposalPrompt(input: {
+  content: string;
+  approvedProposal: string;
+  recentEditableWorkingFile?: string;
+  wholeProjectInspection?: boolean;
+}) {
+  return [
+    `The user replied "${input.content.trim()}" and wants you to execute the immediately previous inspect proposal now.`,
+    input.wholeProjectInspection
+      ? "Carry out that whole-project inspection now instead of shrinking it to a single-file glance."
+      : "Carry out that inspection now instead of drifting into another generic suggestion.",
+    input.wholeProjectInspection
+      ? "Treat this as a whole-project inspection follow-up, not a single-file peek."
+      : "Inspect the most concrete current target instead of restarting broad exploration.",
+    "Do not ask what to inspect first unless the current context truly lacks a concrete target.",
+    "Start with the concrete work result, current finding, or the next real action.",
+    "Continue from the latest task state and recent working files already in context.",
+    input.recentEditableWorkingFile ? `Recent editable working file: ${input.recentEditableWorkingFile}` : "",
+    `Approved proposal: ${input.approvedProposal}`
   ].filter(Boolean).join("\n");
 }
 
@@ -3462,6 +3837,61 @@ function buildRecentFollowUpContext(
     previousAssistantProposal: extractPreviousAssistantProposal(historyEvents),
     recentEditableWorkingFile: extractRecentEditableWorkingFile(historyEvents)
   };
+}
+
+function resolveInterruptedResumeFollowUp(input: {
+  content: string;
+  historyEvents: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>;
+  followUp: RunnableFollowUp;
+  previousAssistantProposal?: string;
+}) {
+  switch (input.followUp.kind) {
+    case "resume":
+      return buildInterruptedTaskResumeForFollowUp({
+        content: input.content,
+        historyEvents: input.historyEvents,
+        acknowledgementMode: "discussion question",
+        requireInterruptedTask: false
+      });
+
+    case "approve":
+      return buildInterruptedTaskResumeForFollowUp({
+        content: input.content,
+        historyEvents: input.historyEvents,
+        acknowledgementMode: "generic acknowledgement",
+        requireInterruptedTask: true,
+        allowProposalResumeOnlyAfterExecution: true,
+        previousAssistantProposal: input.previousAssistantProposal
+      });
+
+    case "optimize":
+      return buildInterruptedTaskResumeForFollowUp({
+        content: input.content,
+        historyEvents: input.historyEvents,
+        acknowledgementMode: "broad optimization follow-up",
+        requireInterruptedTask: true
+      });
+
+    case "rewrite":
+      return buildInterruptedTaskResumeForFollowUp({
+        content: input.content,
+        historyEvents: input.historyEvents,
+        acknowledgementMode: "broad rewrite follow-up",
+        requireInterruptedTask: true,
+        requireProposalExecution: true
+      });
+
+    case "inspect":
+      return buildInterruptedTaskResumeForFollowUp({
+        content: input.content,
+        historyEvents: input.historyEvents,
+        acknowledgementMode: "broad inspection follow-up",
+        requireInterruptedTask: true
+      });
+
+    default:
+      return undefined;
+  }
 }
 
 function buildInterruptedTaskResumeForFollowUp(input: {
@@ -3520,6 +3950,7 @@ function buildInterruptedTaskResumeRequest(input: {
     | "broad inspection follow-up";
 }) {
   const recentEditableWorkingFile = extractRecentEditableWorkingFile(input.historyEvents);
+  const recentPendingNextTarget = extractRecentPendingNextTarget(input.historyEvents);
   const recentToolAnchor = extractRecentToolAnchor(input.historyEvents);
   const interruptedApprovalAnchor = hasRecentInterruptedAssistantTask(input.historyEvents)
     ? extractRecentInterruptedApprovalAnchor(input.historyEvents)
@@ -3532,6 +3963,7 @@ function buildInterruptedTaskResumeRequest(input: {
     "Start with the concrete work result, current finding, or the next real action.",
     "Continue from the latest task state already in context.",
     recentEditableWorkingFile ? `Recent editable working file: ${recentEditableWorkingFile}` : "",
+    recentPendingNextTarget ? `Pending next step target: ${recentPendingNextTarget}` : "",
     recentToolAnchor ? `Latest tool in context: ${recentToolAnchor.toolName}` : "",
     recentToolAnchor ? `Latest tool summary in context: ${recentToolAnchor.summary}` : "",
     interruptedApprovalAnchor
@@ -3571,6 +4003,7 @@ function hasToolActivitySinceLatestAssistantProposal(
   historyEvents: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>
 ) {
   const timeline = projectSessionTimeline(historyEvents);
+  const previousActionableUserIndex = findPreviousActionableUserTimelineIndex(timeline);
   let skippedLatestUser = false;
   let sawToolAfterProposal = false;
 
@@ -3583,6 +4016,10 @@ function hasToolActivitySinceLatestAssistantProposal(
       }
 
       continue;
+    }
+
+    if (previousActionableUserIndex >= 0 && index <= previousActionableUserIndex) {
+      break;
     }
 
     if (entry?.kind === "assistant" && looksLikeAssistantProposal(entry.text)) {
@@ -3604,10 +4041,10 @@ function looksLikeAssistantProposal(content: string) {
     return false;
   }
 
-  const hasOffer = /\b(if you want|if you'd like|i can|next step|if you want me to continue)\b/i.test(normalized)
-    || /(如果你愿意|如果你要我继续|我下一步可以|我可以继续|下一步可以)/u.test(normalized);
-  const hasAction = /\b(read|write|edit|fix|repair|create|update|change|modify|inspect|run)\b/i.test(normalized)
-    || /(读取|写入|编辑|修复|创建|更新|修改|检查|运行|改)/u.test(normalized);
+  const hasOffer = /\b(if you want|if you'd like|i can|next step|if you want me to continue|i would first|i'd first|i would start by|i'd start by|i would begin by|i'd begin by)\b/i.test(normalized)
+    || /(如果你愿意|如果你要我继续|我下一步可以|我可以继续|下一步可以|我建议下一步|下一步我可以|我会先|我先)/u.test(normalized);
+  const hasAction = /\b(read|write|edit|fix|repair|create|update|change|modify|inspect|review|check|run|look at|rewrite|rebuild|optimize|improve|refactor)\b/i.test(normalized)
+    || /(读取|写入|编辑|修复|创建|更新|修改|检查|运行|改|阅读|查看|看下|看看|审一下|读|重写|优化|改进|重构)/u.test(normalized);
 
   return hasOffer && hasAction;
 }
@@ -3626,12 +4063,272 @@ function looksLikeAssistantRewriteProposal(content: string) {
   return hasRewriteCue || mentionedTargets.length >= 2;
 }
 
-function shouldForceTaskContinuation(originalRequest: string, assistantMessage: string, latestToolResult: {
-  toolName: string;
-  summary: string;
-  rawOutput?: string;
-  errorMessage?: string;
+function looksLikeAssistantOptimizationProposal(content: string) {
+  const normalized = content.trim();
+
+  if (!looksLikeAssistantProposal(normalized)) {
+    return false;
+  }
+
+  if (looksLikeAssistantRewriteProposal(normalized)) {
+    return false;
+  }
+
+  const hasOptimizeCue = /\b(optimize|improve|refactor|improvement)\b/i.test(normalized)
+    || /(优化|改进|重构)/u.test(normalized);
+  const mentionedTargets = extractExplicitFileTargets(normalized);
+
+  return hasOptimizeCue || mentionedTargets.length >= 2;
+}
+
+function looksLikeAssistantInspectionProposal(content: string) {
+  const normalized = content.trim();
+
+  if (!looksLikeAssistantProposal(normalized)) {
+    return false;
+  }
+
+  if (looksLikeAssistantRewriteProposal(normalized) || looksLikeAssistantOptimizationProposal(normalized)) {
+    return false;
+  }
+
+  const hasInspectCue = /\b(inspect|inspection|review|check|look at|read through|read)\b/i.test(normalized)
+    || /(检查|看看|看下|审一下|阅读|读一遍|查看|读)/u.test(normalized);
+  const mentionedTargets = extractExplicitFileTargets(normalized);
+
+  return hasInspectCue || mentionedTargets.length >= 2;
+}
+
+function resolveAssistantMessageContinuation(input: {
+  originalRequest: string;
+  assistantMessage: string;
+  preferredLanguage: PreferredReplyLanguage;
+  hasAttemptedTool: boolean;
+  proposalNarrowingCount: number;
+  lastToolResult?: RuntimeToolResult;
+  workingFileAnchor?: string;
 }) {
+  if (
+    input.proposalNarrowingCount === 0
+    && shouldForceProposalNarrowing(input.originalRequest, input.assistantMessage)
+  ) {
+    return {
+      nextPrompt: buildProposalNarrowingPrompt(
+        input.originalRequest,
+        input.assistantMessage,
+        input.preferredLanguage
+      ),
+      consumeProposalNarrowingCount: true
+    };
+  }
+
+  if (
+    !input.hasAttemptedTool
+    && shouldForceInitialTaskStart(input.originalRequest, input.assistantMessage)
+  ) {
+    return {
+      nextPrompt: buildPrematureTaskStartPrompt(
+        input.originalRequest,
+        input.assistantMessage,
+        input.preferredLanguage
+      )
+    };
+  }
+
+  if (!input.lastToolResult) {
+    return undefined;
+  }
+
+  const anchoredToolResult = withWorkingFileAnchor(input.lastToolResult, input.workingFileAnchor);
+  const continuationRules = [
+    {
+      when: () => shouldForceTaskContinuation(input.originalRequest, input.assistantMessage, input.lastToolResult!),
+      nextPrompt: () => buildPrematureContinuationPrompt(
+        input.originalRequest,
+        input.assistantMessage,
+        anchoredToolResult,
+        input.preferredLanguage
+      )
+    },
+    {
+      when: () => shouldForceProjectInspectionContinuation(input.originalRequest, input.assistantMessage, input.lastToolResult!),
+      nextPrompt: () => buildProjectInspectionContinuationPrompt(
+        input.originalRequest,
+        input.assistantMessage,
+        input.lastToolResult!,
+        input.preferredLanguage
+      )
+    },
+    {
+      when: () => shouldForceWholeProjectInspectionContinuation(input.originalRequest, input.assistantMessage, input.lastToolResult!),
+      nextPrompt: () => buildWholeProjectInspectionContinuationPrompt(
+        input.originalRequest,
+        input.assistantMessage,
+        input.lastToolResult!,
+        input.preferredLanguage
+      )
+    },
+    {
+      when: () => shouldForceProjectWorkfileContinuation(input.originalRequest, input.assistantMessage, input.lastToolResult!),
+      nextPrompt: () => buildProjectWorkfileContinuationPrompt(
+        input.originalRequest,
+        input.assistantMessage,
+        input.lastToolResult!,
+        input.preferredLanguage
+      )
+    },
+    {
+      when: () => shouldForceFailureRecovery(input.originalRequest, input.assistantMessage, input.lastToolResult!),
+      nextPrompt: () => buildFailureRecoveryPrompt(
+        input.originalRequest,
+        input.assistantMessage,
+        anchoredToolResult,
+        input.preferredLanguage
+      )
+    },
+    {
+      when: () => shouldForceExecutionConvergence(input.originalRequest, input.assistantMessage, input.lastToolResult!),
+      nextPrompt: () => buildExecutionConvergencePrompt(
+        input.originalRequest,
+        input.assistantMessage,
+        anchoredToolResult,
+        input.preferredLanguage
+      )
+    },
+    {
+      when: () => shouldForceMultiTargetMutationContinuation(input.originalRequest, input.assistantMessage, input.lastToolResult!),
+      nextPrompt: () => buildMultiTargetMutationContinuationPrompt(
+        input.originalRequest,
+        input.assistantMessage,
+        anchoredToolResult,
+        input.preferredLanguage
+      )
+    },
+    {
+      when: () => shouldForceFollowUpReplyTightening(input.originalRequest, input.assistantMessage, input.lastToolResult!),
+      nextPrompt: () => buildFollowUpReplyTighteningPrompt(
+        input.originalRequest,
+        input.assistantMessage,
+        input.lastToolResult!,
+        input.preferredLanguage
+      )
+    },
+    {
+      when: () => shouldForceCompletionTightening(input.originalRequest, input.assistantMessage, input.lastToolResult!),
+      nextPrompt: () => buildCompletionTighteningPrompt(
+        input.originalRequest,
+        input.assistantMessage,
+        input.lastToolResult!,
+        input.preferredLanguage
+      )
+    }
+  ];
+
+  for (const rule of continuationRules) {
+    if (rule.when()) {
+      return { nextPrompt: rule.nextPrompt() };
+    }
+  }
+
+  return undefined;
+}
+
+function resolveFailedToolResultContinuation(input: {
+  originalRequest: string;
+  preferredLanguage: PreferredReplyLanguage;
+  previousToolResult?: RuntimeToolResult;
+  previousRepeatedToolResultCount: number;
+  result: RuntimeToolResult;
+  workingFileAnchor?: string;
+}) {
+  const repeatedToolResultCount = isSameToolResult(input.previousToolResult, input.result)
+    ? input.previousRepeatedToolResultCount + 1
+    : 0;
+
+  if (shouldAutoSummarizeToolFailure(input.originalRequest, input.result)) {
+    const directAnswer = buildDirectToolFailureAnswer(input.result, input.preferredLanguage);
+
+    if (directAnswer) {
+      return {
+        kind: "direct_answer" as const,
+        repeatedToolResultCount,
+        directAnswer
+      };
+    }
+  }
+
+  const anchoredResult = withWorkingFileAnchor(input.result, input.workingFileAnchor);
+  const nextPrompt = shouldUseStalledContinuationPrompt(input.originalRequest, repeatedToolResultCount, input.result)
+    ? buildStalledToolContinuationPrompt(
+      input.originalRequest,
+      anchoredResult,
+      repeatedToolResultCount,
+      input.preferredLanguage
+    )
+    : buildToolFailureContinuationPrompt(
+      input.originalRequest,
+      anchoredResult,
+      input.preferredLanguage
+    );
+
+  return {
+    kind: "continue" as const,
+    repeatedToolResultCount,
+    nextPrompt
+  };
+}
+
+function resolveSuccessfulToolResultContinuation(input: {
+  originalRequest: string;
+  preferredLanguage: PreferredReplyLanguage;
+  previousToolResult?: AnchoredRuntimeToolResult;
+  previousRepeatedToolResultCount: number;
+  result: RuntimeToolResult;
+  workingFileAnchor?: string;
+}) {
+  const repeatedToolResultCount = isSameToolResult(input.previousToolResult, input.result)
+    ? input.previousRepeatedToolResultCount + 1
+    : 0;
+
+  if (shouldForceTerminalCompletionInsteadOfExtraTool(input.originalRequest, input.result)) {
+    return {
+      repeatedToolResultCount,
+      directAnswer: buildDirectTerminalCompletionAnswer(
+        input.originalRequest,
+        input.result,
+        input.preferredLanguage
+      )
+    };
+  }
+
+  const anchoredResult = withWorkingFileAnchor(input.result, input.workingFileAnchor);
+  const nextPrompt = shouldUseStalledContinuationPrompt(input.originalRequest, repeatedToolResultCount, input.result)
+    ? buildStalledToolContinuationPrompt(
+      input.originalRequest,
+      anchoredResult,
+      repeatedToolResultCount,
+      input.preferredLanguage
+    )
+    : input.previousToolResult && shouldCarryEditRangeFailureForward(input.previousToolResult, input.result)
+      ? buildEditRangeRecoveryContinuationPrompt(
+        input.originalRequest,
+        input.previousToolResult,
+        input.result,
+        input.preferredLanguage
+      )
+      : buildToolContinuationPrompt(
+        input.originalRequest,
+        anchoredResult,
+        input.preferredLanguage
+      );
+
+  return {
+    repeatedToolResultCount,
+    nextPrompt
+  };
+}
+
+function shouldForceTaskContinuation(originalRequest: string, assistantMessage: string, latestToolResult: RuntimeToolResult) {
   if (!looksLikeLongRunningTask(originalRequest)) {
     return false;
   }
@@ -3640,11 +4337,23 @@ function shouldForceTaskContinuation(originalRequest: string, assistantMessage: 
     return false;
   }
 
+  if (looksLikeProjectInspectionRequest(originalRequest) || looksLikeExecutionTask(originalRequest)) {
+    return false;
+  }
+
+  if (
+    looksLikePathScopedCompletionForMultiTargetRequest(originalRequest, assistantMessage, latestToolResult)
+    || looksLikeCompletionToneWithPendingWork(assistantMessage)
+    || looksLikeAssistantProposal(assistantMessage)
+  ) {
+    return true;
+  }
+
   if (isLatestToolResultTaskTerminal(originalRequest, latestToolResult)) {
     return false;
   }
 
-  return looksLikeProgressOnlyAssistantReply(assistantMessage);
+  return false;
 }
 
 function shouldForceFailureRecovery(originalRequest: string, assistantMessage: string, latestToolResult: {
@@ -3661,11 +4370,12 @@ function shouldForceFailureRecovery(originalRequest: string, assistantMessage: s
     return false;
   }
 
-  if (looksLikeBlockingQuestion(assistantMessage)) {
+  if (looksLikeUserInputBlockingQuestion(assistantMessage)) {
     return false;
   }
 
-  return !looksLikeCompletionReply(assistantMessage);
+  return !looksLikeCompletionReply(assistantMessage)
+    || looksLikeCompletionToneWithPendingWork(assistantMessage);
 }
 
 function shouldForceProjectInspectionContinuation(originalRequest: string, assistantMessage: string, latestToolResult: {
@@ -3682,7 +4392,10 @@ function shouldForceProjectInspectionContinuation(originalRequest: string, assis
     return false;
   }
 
-  return looksLikeBlockingQuestion(assistantMessage) || looksLikeProgressOnlyAssistantReply(assistantMessage);
+  return looksLikeBlockingQuestion(assistantMessage)
+    || looksLikeProgressOnlyAssistantReply(assistantMessage)
+    || looksLikeCompletionToneWithPendingWork(assistantMessage)
+    || looksLikeAssistantProposal(assistantMessage);
 }
 
 function shouldForceWholeProjectInspectionContinuation(originalRequest: string, assistantMessage: string, latestToolResult: {
@@ -3705,7 +4418,10 @@ function shouldForceWholeProjectInspectionContinuation(originalRequest: string, 
     return false;
   }
 
-  return looksLikeBlockingQuestion(assistantMessage) || looksLikeProgressOnlyAssistantReply(assistantMessage);
+  return looksLikeBlockingQuestion(assistantMessage)
+    || looksLikeProgressOnlyAssistantReply(assistantMessage)
+    || looksLikeCompletionToneWithPendingWork(assistantMessage)
+    || looksLikeAssistantProposal(assistantMessage);
 }
 
 function shouldForceProjectWorkfileContinuation(originalRequest: string, assistantMessage: string, latestToolResult: {
@@ -3728,7 +4444,10 @@ function shouldForceProjectWorkfileContinuation(originalRequest: string, assista
     return false;
   }
 
-  return looksLikeBlockingQuestion(assistantMessage) || looksLikeProgressOnlyAssistantReply(assistantMessage);
+  return looksLikeBlockingQuestion(assistantMessage)
+    || looksLikeProgressOnlyAssistantReply(assistantMessage)
+    || looksLikeCompletionToneWithPendingWork(assistantMessage)
+    || looksLikeAssistantProposal(assistantMessage);
 }
 
 function shouldForceExecutionConvergence(originalRequest: string, assistantMessage: string, latestToolResult: {
@@ -3745,7 +4464,10 @@ function shouldForceExecutionConvergence(originalRequest: string, assistantMessa
     return false;
   }
 
-  if (isLatestToolResultTaskTerminal(originalRequest, latestToolResult)) {
+  if (
+    (latestToolResult.toolName === "edit" || latestToolResult.toolName === "write")
+    && looksLikeMultiTargetMutationTask(originalRequest)
+  ) {
     return false;
   }
 
@@ -3773,8 +4495,28 @@ function shouldForceExecutionConvergence(originalRequest: string, assistantMessa
     return true;
   }
 
-  if (looksLikeProgressOnlyAssistantReply(assistantMessage)) {
+  if (looksLikeCompletionToneWithPendingWork(assistantMessage)) {
+    return true;
+  }
+
+  if (looksLikeLocalCompletionBeforeVerification(originalRequest, assistantMessage, latestToolResult)) {
+    return true;
+  }
+
+  if (looksLikePathScopedCompletionForMultiTargetRequest(originalRequest, assistantMessage, latestToolResult)) {
+    return true;
+  }
+
+  if (looksLikeAssistantProposal(assistantMessage)) {
+    return true;
+  }
+
+  if (isLatestToolResultTaskTerminal(originalRequest, latestToolResult)) {
     return false;
+  }
+
+  if (looksLikeProgressOnlyAssistantReply(assistantMessage)) {
+    return true;
   }
 
   return !looksLikeCompletionReply(assistantMessage);
@@ -3799,6 +4541,7 @@ function shouldForceMultiTargetMutationContinuation(originalRequest: string, ass
   }
 
   return looksLikeStageSummaryWithPendingWork(assistantMessage)
+    || looksLikeCompletionToneWithPendingWork(assistantMessage)
     || looksLikeAssistantProposal(assistantMessage)
     || looksLikePathScopedCompletionForMultiTargetRequest(originalRequest, assistantMessage, latestToolResult);
 }
@@ -3833,9 +4576,122 @@ function shouldForceCompletionTightening(originalRequest: string, assistantMessa
 
   return !looksLikeCompletionReply(assistantMessage)
     || looksLikeThinCompletionReply(originalRequest, assistantMessage, latestToolResult)
+    || looksLikeMissingExactOutputAnchorCompletionReply(originalRequest, assistantMessage, latestToolResult)
+    || looksLikeMissingFileVerificationAnchorCompletionReply(originalRequest, assistantMessage, latestToolResult)
+    || looksLikeMissingShellVerificationAnchorCompletionReply(originalRequest, assistantMessage, latestToolResult)
     || looksLikeDistractedCompletionReply(originalRequest, assistantMessage, latestToolResult)
     || looksLikeFailureRecapCompletionReply(assistantMessage)
     || looksLikeProcessHeavyCompletionReply(assistantMessage);
+}
+
+function shouldAutoFinalizeRepeatedTerminalAssistantReply(input: {
+  originalRequest: string;
+  assistantMessage: string;
+  latestToolResult?: {
+    toolName: string;
+    summary: string;
+    rawOutput?: string;
+    errorMessage?: string;
+  };
+  repeatedAssistantMessageCount: number;
+}) {
+  if (!input.latestToolResult) {
+    return false;
+  }
+
+  if (!isLatestToolResultTaskTerminal(input.originalRequest, input.latestToolResult)) {
+    return false;
+  }
+
+  if (!input.assistantMessage.trim()) {
+    return !looksLikeBlockingQuestion(input.assistantMessage);
+  }
+
+  if (input.repeatedAssistantMessageCount < 1) {
+    return false;
+  }
+
+  if (
+    looksLikeVerificationRequest(input.originalRequest)
+    || extractExplicitFileTargets(input.originalRequest).length > 1
+    || looksLikeBlockingQuestion(input.assistantMessage)
+  ) {
+    return false;
+  }
+
+  const latestPath = extractPathFromToolSummary(input.latestToolResult.summary);
+  const normalizedMessage = input.assistantMessage.trim().toLowerCase();
+
+  if (!latestPath || !normalizedMessage.includes(latestPath.toLowerCase())) {
+    return false;
+  }
+
+  return /\b(updated?|updating|fixed?|created?|optimized?|improved?|refactored?|rewrote|changed?)\b/i.test(input.assistantMessage)
+    || /(已更新|已修复|已创建|已优化|已改进|已重构|已重写|已修改|更新了|修好了|创建了|优化了|改进了|重构了|重写了|修改了)/u.test(input.assistantMessage);
+}
+
+function buildDirectTerminalCompletionAnswer(
+  originalRequest: string,
+  latestToolResult: {
+    toolName: string;
+    summary: string;
+    rawOutput?: string;
+    errorMessage?: string;
+  },
+  preferredLanguage: PreferredReplyLanguage
+) {
+  const finalOutput = extractLastNonEmptyLine(latestToolResult.rawOutput);
+  const latestPath = extractPathFromToolSummary(latestToolResult.summary);
+  const requestedPaths = extractWritableTaskPaths(originalRequest);
+  const primaryRequestedPath = requestedPaths.length > 0 && requestedPaths.length <= 2
+    ? requestedPaths.at(-1)
+    : undefined;
+  const createIntent = /\b(create|write)\b/i.test(originalRequest) || /(创建|新建|写入)/u.test(originalRequest);
+
+  if (
+    latestToolResult.toolName === "shell"
+    && looksLikeExactOutputRequest(originalRequest)
+    && finalOutput
+  ) {
+    if (primaryRequestedPath) {
+      if (preferredLanguage === "zh") {
+        return createIntent
+          ? `已创建 ${primaryRequestedPath}，并验证其精确输出为 ${finalOutput}。`
+          : `已完成 ${primaryRequestedPath}，并验证其精确输出为 ${finalOutput}。`;
+      }
+
+      return createIntent
+        ? `Created ${primaryRequestedPath} and verified it prints exactly ${finalOutput}.`
+        : `Completed ${primaryRequestedPath} and verified it prints exactly ${finalOutput}.`;
+    }
+
+    return preferredLanguage === "zh"
+      ? `已完成，并重新运行验证命令，最终输出是 \`${finalOutput}\`。`
+      : `Completed and reran the verification command; the final output was \`${finalOutput}\`.`;
+  }
+
+  if (
+    latestToolResult.toolName === "shell"
+    && looksLikeVerificationRequest(originalRequest)
+    && finalOutput
+  ) {
+    return preferredLanguage === "zh"
+      ? `已完成，并重新运行验证命令，最终输出是 \`${finalOutput}\`。`
+      : `Completed and reran the verification command; the final output was \`${finalOutput}\`.`;
+  }
+
+  if (
+    latestPath
+    && (latestToolResult.toolName === "edit" || latestToolResult.toolName === "write" || latestToolResult.toolName === "files")
+  ) {
+    return preferredLanguage === "zh"
+      ? `已完成，已处理 \`${latestPath}\`。`
+      : `Completed; updated \`${latestPath}\`.`;
+  }
+
+  return preferredLanguage === "zh"
+    ? "已完成。"
+    : "Completed.";
 }
 
 function shouldForceTerminalCompletionInsteadOfExtraTool(originalRequest: string, latestToolResult: {
@@ -3845,6 +4701,17 @@ function shouldForceTerminalCompletionInsteadOfExtraTool(originalRequest: string
   errorMessage?: string;
 }) {
   if (!looksLikeLongRunningTask(originalRequest) && !looksLikeExecutionTask(originalRequest)) {
+    return false;
+  }
+
+  if (
+    (latestToolResult.toolName === "edit" || latestToolResult.toolName === "write")
+    && !looksLikeVerificationRequest(originalRequest)
+    && (
+      looksLikeMultiTargetMutationTask(originalRequest)
+      || looksLikeBroadProjectImprovementRequest(originalRequest)
+    )
+  ) {
     return false;
   }
 
@@ -3993,8 +4860,8 @@ function getAgentToolStepBudget(content: string) {
 }
 
 function hasMutationIntent(content: string) {
-  return /\b(create|write|edit|fix|repair|update|change|modify|improve|optimize|refactor)\b/i.test(content)
-    || /(创建|写入|编辑|修复|更新|修改|优化|改进|重构)/u.test(content);
+  return /\b(create|write|edit|fix|repair|update|change|modify|improve|optimize|refactor|rewrite|rebuild)\b/i.test(content)
+    || /(创建|写入|编辑|修复|更新|修改|优化|改进|重构|重写|重做)/u.test(content);
 }
 
 function looksLikeExtendedCodingTask(content: string) {
@@ -4063,6 +4930,11 @@ function looksLikeActionableTaskRequest(content: string) {
 
 function looksLikeNextStepProposalRequest(content: string) {
   const taskContent = extractEmbeddedTaskContent(content);
+
+  if (/^The user replied ".+" and wants you to execute the immediately previous (?:rewrite |optimize |inspect )?proposal now\./.test(taskContent)) {
+    return false;
+  }
+
   return /\b(next step|what.*improve next|what.*do next)\b/i.test(taskContent)
     || /(下一步|接下来.*做什么|想.*改进什么)/u.test(taskContent);
 }
@@ -4131,9 +5003,16 @@ function isFilesVerificationTerminal(originalRequest: string, summary: string) {
     return false;
   }
 
-  const requestedPaths = extractWritableTaskPaths(originalRequest);
+  const requestedPaths = extractWritableTaskPaths(originalRequest).map(normalizeApprovalPath);
+  const normalizedPath = normalizeApprovalPath(path);
 
-  if (!requestedPaths.includes(normalizeApprovalPath(path))) {
+  if (!requestedPaths.includes(normalizedPath)) {
+    return false;
+  }
+
+  const finalRequestedPath = requestedPaths.at(-1);
+
+  if (requestedPaths.length > 1 && finalRequestedPath && normalizedPath !== finalRequestedPath) {
     return false;
   }
 
@@ -4151,11 +5030,11 @@ function looksLikeVerificationRequest(content: string) {
 }
 
 function looksLikeDiscussionRequest(content: string) {
-  if (/\b(discuss|brainstorm|explain|why|architecture|tradeoff|plan|strategy)\b/i.test(content)) {
+  if (/\b(discuss|brainstorm|explain|why|architecture|tradeoff|plan|strategy|how would you|what would you do|tell me what you(?:'d| would) do)\b/i.test(content)) {
     return true;
   }
 
-  return /(讨论|聊聊|为什么|架构|取舍|方案|计划|策略|先讨论)/u.test(content);
+  return /(讨论|聊聊|为什么|架构|取舍|方案|计划|策略|先讨论|告诉我.*怎么做|会怎么做|你会怎么做)/u.test(content);
 }
 
 function looksLikeProjectInspectionRequest(content: string) {
@@ -4179,12 +5058,29 @@ function looksLikeWholeProjectInspectionRequest(content: string) {
 function looksLikeBroadProjectImprovementRequest(content: string) {
   const taskContent = extractEmbeddedTaskContent(content);
 
+  if (looksLikeDiscussionRequest(taskContent) || looksLikeNextStepProposalRequest(taskContent)) {
+    return false;
+  }
+
   if (!hasMutationIntent(taskContent)) {
     return false;
   }
 
   return looksLikeProjectInspectionRequest(taskContent)
     || /\b(project|repo|repository|codebase)\b/i.test(taskContent)
+    || /(项目|仓库|代码)/u.test(taskContent);
+}
+
+function looksLikeProjectRewriteRequest(content: string) {
+  const taskContent = extractEmbeddedTaskContent(content);
+  const hasRewriteIntent = /\b(rewrite|rebuild)\b/i.test(taskContent)
+    || /(重写|重做)/u.test(taskContent);
+
+  if (!hasRewriteIntent) {
+    return false;
+  }
+
+  return /\b(project|repo|repository|codebase)\b/i.test(taskContent)
     || /(项目|仓库|代码)/u.test(taskContent);
 }
 
@@ -4200,8 +5096,46 @@ function looksLikeMultiTargetMutationTask(content: string) {
 
 function extractExplicitFileTargets(content: string) {
   const taskContent = extractEmbeddedTaskContent(content);
-  const pathMatches = taskContent.match(/[A-Za-z0-9_./-]+\.(?:mjs|cjs|js|ts|tsx|json|txt|md|csv|ejs|html|css)/g) ?? [];
+  const pathMatches = taskContent.match(/[A-Za-z0-9_./-]+\.(?:tsx|json|mjs|cjs|ejs|html|css|js|ts|txt|md|csv)/g) ?? [];
   return Array.from(new Set(pathMatches.map((path) => stripLineLocationSuffix(normalizePromptPath(path.trim())))));
+}
+
+function normalizeComparablePath(value: string) {
+  return stripLineLocationSuffix(normalizePromptPath(value))
+    .replace(/\\/g, "/")
+    .replace(/^\.\//, "")
+    .replace(/^\/+/, "");
+}
+
+function pathsReferToSameTarget(left: string, right: string) {
+  const normalizedLeft = normalizeComparablePath(left).toLowerCase();
+  const normalizedRight = normalizeComparablePath(right).toLowerCase();
+
+  if (!normalizedLeft || !normalizedRight) {
+    return false;
+  }
+
+  return normalizedLeft === normalizedRight
+    || normalizedLeft.endsWith(`/${normalizedRight}`)
+    || normalizedRight.endsWith(`/${normalizedLeft}`);
+}
+
+function extractLikelyNextTargetPathFromAssistantMessage(content: string) {
+  if (
+    !looksLikeStageSummaryWithPendingWork(content)
+    && !looksLikeProgressOnlyAssistantReply(content)
+    && !looksLikeCompletionToneWithPendingWork(content)
+  ) {
+    return undefined;
+  }
+
+  const targets = extractExplicitFileTargets(content);
+
+  if (targets.length === 0) {
+    return undefined;
+  }
+
+  return targets.at(-1);
 }
 
 function looksLikePathScopedCompletionForMultiTargetRequest(
@@ -4225,31 +5159,63 @@ function looksLikePathScopedCompletionForMultiTargetRequest(
   }
 
   const latestPath = extractPathFromToolSummary(latestToolResult.summary);
+  const mentionedPaths = extractExplicitFileTargets(content);
 
-  if (!latestPath) {
+  if (!latestPath || mentionedPaths.length === 0) {
     return false;
   }
 
-  const normalized = content.toLowerCase();
+  const matchedRequestedTargets = targets.filter((target) =>
+    mentionedPaths.some((mentionedPath) => pathsReferToSameTarget(mentionedPath, target))
+  );
 
-  if (!normalized.includes(latestPath.toLowerCase())) {
+  if (!matchedRequestedTargets.some((target) => pathsReferToSameTarget(target, latestPath))) {
     return false;
   }
 
-  return !targets.some((path) => path !== latestPath && normalized.includes(path.toLowerCase()));
+  return matchedRequestedTargets.every((target) => pathsReferToSameTarget(target, latestPath));
 }
 
 function extractEmbeddedTaskContent(content: string) {
   const approvedProposalMatch = content.match(/\bApproved proposal:\s*([\s\S]+)$/i);
 
   if (approvedProposalMatch?.[1]?.trim()) {
-    return approvedProposalMatch[1].trim();
+    const firstLine = content.split(/\r?\n/, 1)[0]?.trim() ?? "";
+    const approvedProposal = approvedProposalMatch[1].trim();
+
+    if (/^The user replied ".+" and wants you to execute the immediately previous (?:rewrite |optimize |inspect )?proposal now\./.test(firstLine)) {
+      return `${firstLine}\n${approvedProposal}`;
+    }
+
+    return approvedProposal;
   }
 
   const originalTaskMatch = content.match(/\bOriginal task:\s*([\s\S]+)$/i);
 
   if (originalTaskMatch?.[1]?.trim()) {
     return originalTaskMatch[1].trim();
+  }
+
+  const previousContextMatch = content.match(/\bPrevious context request:\s*([^\n]+)/i);
+
+  if (previousContextMatch?.[1]?.trim()) {
+    const firstLine = content.split(/\r?\n/, 1)[0]?.trim() ?? "";
+    const previousContext = previousContextMatch[1].trim();
+
+    if (/^The user replied ".+"/.test(firstLine)) {
+      const pathMatches = previousContext.match(/[A-Za-z0-9_./-]+\.(?:tsx|json|mjs|cjs|ejs|html|css|js|ts|txt|md|csv)/g) ?? [];
+      const normalizedPaths = Array.from(new Set(pathMatches.map((path) =>
+        stripLineLocationSuffix(normalizePromptPath(path.trim()))
+      )));
+
+      if (normalizedPaths.length > 0) {
+        return `${firstLine}\n${normalizedPaths.join("\n")}`;
+      }
+
+      return firstLine;
+    }
+
+    return previousContext;
   }
 
   return content;
@@ -4263,7 +5229,20 @@ function looksLikeBlockingQuestion(content: string) {
   }
 
   return /\?\s*$/.test(normalized)
+    || /\b(do you want me to|should i|shall i|want me to|would you like me to)\b/i.test(normalized)
+    || /(要不要我|要我.*吗|是否要我|需不需要我)/u.test(normalized)
     || /\b(can you|could you|please provide|which|what path|what file)\b/i.test(normalized)
+    || /(能否|可以提供|请提供|哪个|什么路径|什么文件|需要你提供)/u.test(normalized);
+}
+
+function looksLikeUserInputBlockingQuestion(content: string) {
+  const normalized = content.trim();
+
+  if (!normalized) {
+    return false;
+  }
+
+  return /\b(can you|could you|please provide|which|what path|what file)\b/i.test(normalized)
     || /(能否|可以提供|请提供|哪个|什么路径|什么文件|需要你提供)/u.test(normalized);
 }
 
@@ -4278,11 +5257,15 @@ function looksLikeProgressOnlyAssistantReply(content: string) {
     return false;
   }
 
-  if (/\b(done|completed|finished|verified|confirmed|exactly)\b/i.test(normalized)) {
+  if (looksLikeAssistantProposal(normalized) && !looksLikeBlockingQuestion(normalized)) {
+    return true;
+  }
+
+  if (/\b(done|completed|finished|verified|confirmed|exactly|updated|fixed|created|optimized|improved|refactored|rewrote|changed)\b/i.test(normalized)) {
     return false;
   }
 
-  if (/(完成|已修复|已创建|已验证|已经|精确|确认)/u.test(normalized)) {
+  if (/(完成|已修复|已创建|已验证|已经|精确|确认|已更新|已优化|已改进|已重构|已重写|已修改)/u.test(normalized)) {
     return false;
   }
 
@@ -4310,8 +5293,8 @@ function looksLikeCompletionReply(content: string) {
     return false;
   }
 
-  return /\b(done|completed|finished|verified|confirmed|exactly|updated|fixed|created)\b/i.test(normalized)
-    || /(完成|已修复|已创建|已验证|已经|精确|确认|已更新)/u.test(normalized);
+  return /\b(done|completed|finished|verified|confirmed|exactly|updated|fixed|created|optimized|improved|refactored|rewrote|changed)\b/i.test(normalized)
+    || /(完成|已修复|已创建|已验证|已经|精确|确认|已更新|已优化|已改进|已重构|已重写|已修改)/u.test(normalized);
 }
 
 function looksLikeStageSummaryWithPendingWork(content: string) {
@@ -4321,12 +5304,70 @@ function looksLikeStageSummaryWithPendingWork(content: string) {
     return false;
   }
 
-  const hasCompletedStep = /\b(created|updated|fixed|repaired|read|reviewed|inspected|found|verified)\b/i.test(normalized)
-    || /(已创建|已更新|已修复|修好了|读取了|看了|检查了|找到了|已验证|发现了)/u.test(normalized);
+  const hasCompletedStep = /\b(created|updated|fixed|repaired|read|reviewed|inspected|found|verified|optimized|improved|refactored|rewrote|changed)\b/i.test(normalized)
+    || /(已创建|已更新|已修复|修好了|读取了|看了|检查了|找到了|已验证|发现了|已优化|已改进|已重构|已重写|已修改)/u.test(normalized);
   const hasNextStepCue = /\b(next|then|will|going to|after that|before verifying|and verify)\b/i.test(normalized)
     || /(接下来|下一步|然后|还会|还要|再去|再做|并验证|再验证)/u.test(normalized);
 
   return hasCompletedStep && hasNextStepCue;
+}
+
+function looksLikeCompletionToneWithPendingWork(content: string) {
+  const normalized = content.trim();
+
+  if (!normalized || containsToolCallMarkup(normalized) || !looksLikeCompletionReply(normalized)) {
+    return false;
+  }
+
+  return /\b(still needs?|still need to|still requires?|remaining|rest of the|cannot finish until|cannot succeed until|before verification can succeed|before it can succeed|before rerunning|before verifying|one more|another file still)\b/i.test(normalized)
+    || /(还需要|仍需|还要|还得|剩下|余下|还不能|在验证成功之前|在重新运行之前|还需修|还没法完成)/u.test(normalized);
+}
+
+function looksLikeLocalCompletionBeforeVerification(
+  originalRequest: string,
+  content: string,
+  latestToolResult: {
+    toolName: string;
+    summary: string;
+    rawOutput?: string;
+    errorMessage?: string;
+  }
+) {
+  if (
+    !looksLikeCompletionReply(content)
+    || (!looksLikeVerificationRequest(originalRequest) && !looksLikeExactOutputRequest(originalRequest))
+    || (latestToolResult.toolName !== "edit" && latestToolResult.toolName !== "write" && latestToolResult.toolName !== "files")
+  ) {
+    return false;
+  }
+
+  const latestPath = extractPathFromToolSummary(latestToolResult.summary);
+
+  if (!latestPath) {
+    return false;
+  }
+
+  if (latestToolResult.toolName === "files" && isFilesVerificationTerminal(originalRequest, latestToolResult.summary)) {
+    return false;
+  }
+
+  const normalized = content.toLowerCase();
+  const expectedOutput = extractExpectedExactOutput(originalRequest)?.toLowerCase();
+  const verificationCommand = extractVerificationCommandFromTaskRequest(originalRequest)?.toLowerCase();
+
+  if (!normalized.includes(latestPath.toLowerCase())) {
+    return false;
+  }
+
+  if (expectedOutput && normalized.includes(expectedOutput)) {
+    return false;
+  }
+
+  if (verificationCommand && normalized.includes(verificationCommand)) {
+    return false;
+  }
+
+  return true;
 }
 
 function looksLikeThinCompletionReply(
@@ -4349,14 +5390,6 @@ function looksLikeThinCompletionReply(
     return true;
   }
 
-  if (isSyntheticFollowUpRequest(originalRequest) && normalized.length < 90) {
-    return true;
-  }
-
-  if (normalized.length >= 60) {
-    return false;
-  }
-
   const anchors = [
     extractPathFromToolSummary(latestToolResult.summary),
     extractExpectedExactOutput(originalRequest),
@@ -4365,7 +5398,126 @@ function looksLikeThinCompletionReply(
   ].filter(Boolean) as string[];
 
   const hasAnchor = anchors.some((anchor) => normalized.toLowerCase().includes(anchor.toLowerCase()));
+
+  if (isSyntheticFollowUpRequest(originalRequest) && normalized.length < 90) {
+    return !hasAnchor;
+  }
+
+  if (normalized.length >= 60) {
+    return false;
+  }
+
   return !hasAnchor;
+}
+
+function looksLikeMissingExactOutputAnchorCompletionReply(
+  originalRequest: string,
+  content: string,
+  latestToolResult: {
+    toolName: string;
+    summary: string;
+    rawOutput?: string;
+    errorMessage?: string;
+  }
+) {
+  if (!looksLikeExactOutputRequest(originalRequest)) {
+    return false;
+  }
+
+  if (latestToolResult.toolName !== "shell" || !isLatestToolResultTaskTerminal(originalRequest, latestToolResult)) {
+    return false;
+  }
+
+  if (!looksLikeCompletionReply(content)) {
+    return false;
+  }
+
+  const expectedOutput = extractExpectedExactOutput(originalRequest);
+  const observedOutput = extractObservedShellOutput(latestToolResult.rawOutput);
+
+  if (!expectedOutput || !observedOutput || expectedOutput !== observedOutput) {
+    return false;
+  }
+
+  const normalized = content.toLowerCase();
+  return !normalized.includes(expectedOutput.toLowerCase());
+}
+
+function looksLikeMissingFileVerificationAnchorCompletionReply(
+  originalRequest: string,
+  content: string,
+  latestToolResult: {
+    toolName: string;
+    summary: string;
+    rawOutput?: string;
+    errorMessage?: string;
+  }
+) {
+  if (latestToolResult.toolName !== "files" || !isFilesVerificationTerminal(originalRequest, latestToolResult.summary)) {
+    return false;
+  }
+
+  if (!looksLikeCompletionReply(content)) {
+    return false;
+  }
+
+  const targetPath = extractPathFromToolSummary(latestToolResult.summary);
+
+  if (!targetPath) {
+    return false;
+  }
+
+  const mentionedPaths = extractExplicitFileTargets(content);
+  return !mentionedPaths.some((mentionedPath) => pathsReferToSameTarget(mentionedPath, targetPath));
+}
+
+function looksLikeMissingShellVerificationAnchorCompletionReply(
+  originalRequest: string,
+  content: string,
+  latestToolResult: {
+    toolName: string;
+    summary: string;
+    rawOutput?: string;
+    errorMessage?: string;
+  }
+) {
+  if (
+    latestToolResult.toolName !== "shell"
+    || !isLatestToolResultTaskTerminal(originalRequest, latestToolResult)
+    || !looksLikeVerificationRequest(originalRequest)
+    || looksLikeExactOutputRequest(originalRequest)
+  ) {
+    return false;
+  }
+
+  if (!looksLikeCompletionReply(content)) {
+    return false;
+  }
+
+  const normalized = content.toLowerCase();
+  const observedOutput = extractObservedShellOutput(latestToolResult.rawOutput);
+
+  if (observedOutput && normalized.includes(observedOutput.toLowerCase())) {
+    return false;
+  }
+
+  const command = extractShellCommandFromSummary(latestToolResult.summary);
+
+  if (!command) {
+    return false;
+  }
+
+  if (normalized.includes(command.toLowerCase())) {
+    return false;
+  }
+
+  const targetPath = extractPrimaryPathFromShellCommand(command);
+
+  if (targetPath && normalized.includes(targetPath.toLowerCase())) {
+    return false;
+  }
+
+  return true;
 }
 
 function looksLikeProcessHeavyCompletionReply(content: string) {
@@ -4432,7 +5584,9 @@ function looksLikeDistractedCompletionReply(
     allowedTargets.add(latestPath);
   }
 
-  return mentionedPaths.some((path) => !allowedTargets.has(path));
+  return mentionedPaths.some((path) =>
+    !Array.from(allowedTargets).some((allowedTarget) => pathsReferToSameTarget(path, allowedTarget))
+  );
 }
 
 function renderAssistantToolCallForPrompt(toolCall: ParsedAssistantToolCall) {

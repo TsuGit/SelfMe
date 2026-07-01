@@ -153,7 +153,7 @@ export function buildContextMessages(events: Awaited<ReturnType<TranscriptStore[
   const requestedVerificationCommand = latestUserRequest ? extractVerificationCommandFromRequest(latestUserRequest) : undefined;
   const requestedPaths = latestUserRequest ? extractTaskRelevantPaths(latestUserRequest, requestedVerificationCommand) : [];
   const recentRepairSummary = buildRecentRepairSummary(recentEntries, requestedPaths, requestedVerificationCommand);
-  const recentTaskState = buildRecentTaskState(recentEntries);
+  const recentTaskState = buildRecentTaskState(recentEntries, events);
 
   if (summary) {
     messages.push({
@@ -451,17 +451,24 @@ function extractObservedToolOutput(rawOutput?: string) {
   return undefined;
 }
 
-function buildRecentTaskState(entries: SessionTimelineEntry[]) {
-  const latestUserRequest = [...entries].reverse().find((entry) => entry.kind === "user")?.text;
+function buildRecentTaskState(
+  entries: SessionTimelineEntry[],
+  rawEvents: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>
+) {
+  const latestUserIndex = findLatestUserEntryIndex(entries);
+  const currentTaskEntries = latestUserIndex >= 0 ? entries.slice(latestUserIndex) : entries;
+  const latestUserRequest = currentTaskEntries.find((entry) => entry.kind === "user")?.text;
   const expectedOutput = latestUserRequest ? extractExpectedOutputFromRequest(latestUserRequest) : undefined;
   const requestedVerificationCommand = latestUserRequest ? extractVerificationCommandFromRequest(latestUserRequest) : undefined;
   const requestedPaths = latestUserRequest ? extractTaskRelevantPaths(latestUserRequest, requestedVerificationCommand) : [];
+  const pendingApproval = extractPendingApprovalState(rawEvents);
   const workingFiles = dedupeNotes(filterTaskRelevantWorkingFiles(
-    extractRecentWorkingFiles(entries),
+    extractRecentWorkingFiles(currentTaskEntries),
     requestedPaths,
     false
   )).slice(0, 4);
-  const lastRepairSummary = buildRecentRepairSummary(entries, requestedPaths, requestedVerificationCommand)
+  const pendingAssistantStep = extractPendingAssistantStep(currentTaskEntries, requestedPaths);
+  const lastRepairSummary = buildRecentRepairSummary(currentTaskEntries, requestedPaths, requestedVerificationCommand)
     .map((line) => line.replace(/^- /, ""))
     .filter(Boolean);
   const prioritizedRepairState = lastRepairSummary.filter((line) =>
@@ -472,11 +479,122 @@ function buildRecentTaskState(entries: SessionTimelineEntry[]) {
     latestUserRequest ? `Current request: ${createInlinePreview(latestUserRequest, 140)}` : "",
     expectedOutput ? `Target output: ${expectedOutput}` : "",
     requestedVerificationCommand ? `Target verification: ${requestedVerificationCommand}` : "",
+    pendingApproval ? `Pending approval: ${pendingApproval}` : "",
     workingFiles.length > 0 ? `Working files: ${workingFiles.join(", ")}` : "",
+    pendingAssistantStep ? `Pending next step: ${pendingAssistantStep}` : "",
     ...prioritizedRepairState
   ].filter(Boolean);
 
   return dedupeNotes(notes).slice(0, 8).map((note) => `- ${note}`);
+}
+
+function findLatestUserEntryIndex(entries: SessionTimelineEntry[]) {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    if (entries[index]?.kind === "user") {
+      return index;
+    }
+  }
+
+  return -1;
+}
+
+function extractPendingApprovalState(
+  events: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>
+) {
+  const latestUserEventIndex = findLatestUserEventIndex(events);
+  const relevantEvents = latestUserEventIndex >= 0 ? events.slice(latestUserEventIndex + 1) : events;
+  const resolvedApprovalIds = new Set<string>();
+
+  for (let index = relevantEvents.length - 1; index >= 0; index -= 1) {
+    const event = relevantEvents[index];
+
+    if (event?.type === "approval.resolved") {
+      resolvedApprovalIds.add(event.payload.approvalId);
+      continue;
+    }
+
+    if (event?.type !== "approval.requested") {
+      continue;
+    }
+
+    if (resolvedApprovalIds.has(event.payload.approvalId)) {
+      continue;
+    }
+
+    return renderPendingApprovalState(event.payload.toolName, event.payload.input, event.payload.reason);
+  }
+
+  return undefined;
+}
+
+function findLatestUserEventIndex(
+  events: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>
+) {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    if (events[index]?.type === "user.message.submitted") {
+      return index;
+    }
+  }
+
+  return -1;
+}
+
+function renderPendingApprovalState(toolName: string, input: unknown, reason: string) {
+  const target = renderContextApprovalTarget(toolName, input);
+  return target ? `${toolName} · ${target}` : `${toolName} · ${createInlinePreview(reason, 120)}`;
+}
+
+function renderContextApprovalTarget(toolName: string, input: unknown) {
+  if (toolName === "shell" && input && typeof input === "object" && "command" in input && typeof input.command === "string") {
+    return createInlinePreview(input.command, 96);
+  }
+
+  if (
+    (toolName === "files" || toolName === "write" || toolName === "edit")
+    && input
+    && typeof input === "object"
+    && "path" in input
+    && typeof input.path === "string"
+  ) {
+    if ("startLine" in input && typeof input.startLine === "number") {
+      const endLine = "endLine" in input && typeof input.endLine === "number"
+        ? input.endLine
+        : input.startLine;
+      return `${input.path}:${input.startLine}-${endLine}`;
+    }
+
+    return input.path;
+  }
+
+  return "";
+}
+
+function extractPendingAssistantStep(entries: SessionTimelineEntry[], requestedPaths: string[] = []) {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+
+    if (entry.kind !== "assistant") {
+      continue;
+    }
+
+    const normalized = normalizePreviewText(entry.text);
+
+    if (!normalized || !looksLikePendingAssistantStep(normalized)) {
+      continue;
+    }
+
+    if (requestedPaths.length > 0) {
+      const mentionedPaths = extractTaskRelevantPaths(normalized);
+
+      if (mentionedPaths.length > 0 && !mentionedPaths.some((path) => requestedPaths.includes(path))) {
+        continue;
+      }
+    }
+
+    return createInlinePreview(normalized, 160);
+  }
+
+  return undefined;
 }
 
 function extractExpectedOutputFromRequest(request: string) {
@@ -534,6 +652,21 @@ function extractTaskRelevantPaths(request: string, primaryVerificationCommand?: 
     ...directBacktickPaths,
     ...plainTextPaths
   ]);
+}
+
+function looksLikePendingAssistantStep(content: string) {
+  if (!content) {
+    return false;
+  }
+
+  const hasNextStepCue = /\b(next|then|after that|will continue|continue with|going to|before verifying)\b/i.test(content)
+    || /(接下来|下一步|然后|继续|再去|再做|还会|还要|并验证|再验证)/u.test(content);
+  const hasConcreteWorkCue = /\b(read|write|edit|fix|repair|create|update|change|modify|inspect|review|check|run|rewrite|optimize|improve|refactor)\b/i.test(content)
+    || /(读取|写入|编辑|修复|创建|更新|修改|检查|运行|重写|优化|改进|重构)/u.test(content);
+  const hasCompletionCue = /\b(done|completed|finished|verified|confirmed|exactly)\b/i.test(content)
+    || /(完成|已修复|已创建|已验证|已经|精确|确认)/u.test(content);
+
+  return hasNextStepCue && (hasConcreteWorkCue || hasCompletionCue);
 }
 
 function filterTaskRelevantWorkingFiles(files: string[], requestedPaths: string[], fallbackToAll = true) {
