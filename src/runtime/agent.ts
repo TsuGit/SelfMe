@@ -661,6 +661,20 @@ export class AgentRuntime {
 
           if (
             lastToolResult
+            && shouldForceWholeProjectInspectionContinuation(originalRequest, assistantPass.messageText, lastToolResult)
+          ) {
+            await commitAssistantStage();
+            nextPrompt = buildWholeProjectInspectionContinuationPrompt(
+              originalRequest,
+              assistantPass.messageText,
+              lastToolResult,
+              preferredLanguage
+            );
+            continue;
+          }
+
+          if (
+            lastToolResult
             && shouldForceProjectWorkfileContinuation(originalRequest, assistantPass.messageText, lastToolResult)
           ) {
             await commitAssistantStage();
@@ -1994,6 +2008,47 @@ function buildProjectWorkfileContinuationPrompt(
   return lines.join("\n");
 }
 
+function buildWholeProjectInspectionContinuationPrompt(
+  originalRequest: string,
+  assistantMessage: string,
+  input: {
+    toolName: string;
+    summary: string;
+    rawOutput?: string;
+    errorMessage?: string;
+  },
+  preferredLanguage: PreferredReplyLanguage
+) {
+  const lines = [
+    `Original user request: ${originalRequest}`,
+    "",
+    "You are in the middle of a whole-project inspection request.",
+    "Inspecting only the project entry is not enough here.",
+    "Continue now by reading the most likely core implementation file for this project.",
+    "If another tool is needed, return exactly one tool call block.",
+    "Only answer directly after you have inspected at least one core implementation file or truly hit a blocker.",
+    buildPreferredReplyLanguageInstruction(preferredLanguage),
+    "",
+    `Previous assistant message: ${assistantMessage.trim() || "(empty)"}`,
+    `Latest tool: ${input.toolName}`,
+    `Latest summary: ${input.summary}`
+  ];
+
+  const targetPath = extractPathFromToolSummary(input.summary);
+  const inspectionFile = targetPath ? deriveLikelyProjectWorkfileFromEntryPath(targetPath) : undefined;
+
+  if (inspectionFile) {
+    lines.push(`Likely inspection file: ${inspectionFile}`);
+  }
+
+  if (input.rawOutput && input.rawOutput.trim().length > 0) {
+    lines.push("Raw output (already shown to the user):");
+    lines.push(input.rawOutput);
+  }
+
+  return lines.join("\n");
+}
+
 function buildMultiTargetMutationContinuationPrompt(
   originalRequest: string,
   assistantMessage: string,
@@ -2377,6 +2432,15 @@ function buildToolContinuationActionHint(originalRequest: string, input: {
     const targetPath = extractPathFromToolSummary(input.summary);
 
     if (!targetPath || !looksLikeExecutionTask(originalRequest)) {
+      if (
+        targetPath
+        && looksLikeWholeProjectInspectionRequest(originalRequest)
+        && looksLikeProjectEntryPath(targetPath)
+        && !looksLikeEditableSourcePath(targetPath)
+      ) {
+        return "do not stop at the entry file; read the most likely core implementation file next so the user gets a fuller project-level inspection";
+      }
+
       if (
         targetPath
         && looksLikeBroadProjectImprovementRequest(originalRequest)
@@ -2929,52 +2993,116 @@ function resolveRunnableUserRequest(
   content: string,
   historyEvents: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>
 ) {
-  if (isResumeFollowUp(content)) {
-    const previousUserTask = extractPreviousActionableUserRequest(historyEvents);
+  const followUpContext = buildRecentFollowUpContext(historyEvents);
 
-    if (previousUserTask) {
-      return [
-        `The user replied "${content.trim()}" and wants to continue the most recent unfinished task.`,
-        "Resume that task now instead of treating this as a discussion question.",
-        "Do not start with an acknowledgement like 可以, 可以继续, 好的, sure, or okay.",
-        "Start with the concrete work result, current finding, or the next real action.",
-        "Continue from the latest task state already in context.",
-        `Original task: ${previousUserTask}`
-      ].join("\n");
+  if (isResumeFollowUp(content)) {
+    const interruptedResume = buildInterruptedTaskResumeForFollowUp({
+      content,
+      historyEvents,
+      acknowledgementMode: "discussion question",
+      requireInterruptedTask: false
+    });
+
+    if (interruptedResume) {
+      return interruptedResume;
+    }
+  }
+
+  if (isAffirmativeFollowUp(content)) {
+    const interruptedResume = buildInterruptedTaskResumeForFollowUp({
+      content,
+      historyEvents,
+      acknowledgementMode: "generic acknowledgement",
+      requireInterruptedTask: true,
+      allowProposalResumeOnlyAfterExecution: true,
+      previousAssistantProposal: followUpContext.previousAssistantProposal
+    });
+
+    if (interruptedResume) {
+      return interruptedResume;
     }
   }
 
   if (isVagueOptimizationFollowUp(content)) {
-    const previousUserTask = extractPreviousActionableUserRequest(historyEvents);
-    const recentEditableWorkingFile = extractRecentEditableWorkingFile(historyEvents);
+    const interruptedResume = buildInterruptedTaskResumeForFollowUp({
+      content,
+      historyEvents,
+      acknowledgementMode: "broad optimization follow-up",
+      requireInterruptedTask: true
+    });
 
-    if (previousUserTask || recentEditableWorkingFile) {
+    if (interruptedResume) {
+      return interruptedResume;
+    }
+
+    if (followUpContext.previousUserTask || followUpContext.recentEditableWorkingFile) {
+      return buildRecentContextFollowUpPrompt({
+        content,
+        intent: "optimize",
+        previousUserTask: followUpContext.previousUserTask,
+        recentEditableWorkingFile: followUpContext.recentEditableWorkingFile
+      });
+    }
+  }
+
+  if (isVagueRewriteFollowUp(content)) {
+    const interruptedResume = buildInterruptedTaskResumeForFollowUp({
+      content,
+      historyEvents,
+      acknowledgementMode: "broad rewrite follow-up",
+      requireInterruptedTask: true,
+      requireProposalExecution: true
+    });
+
+    if (interruptedResume) {
+      return interruptedResume;
+    }
+
+    if (followUpContext.previousAssistantProposal && looksLikeAssistantRewriteProposal(followUpContext.previousAssistantProposal)) {
       return [
-        `The user replied "${content.trim()}" and wants you to optimize the most recently inspected project or file now.`,
-        "Do the work now instead of stopping at analysis.",
+        `The user replied "${content.trim()}" and wants you to execute the immediately previous rewrite proposal now.`,
+        "Carry out that rewrite now instead of narrowing it to a single-file tweak.",
+        "Do the rewrite work now instead of stopping at analysis or another proposal.",
         "Do not ask which file to start from unless the current context truly lacks a concrete target.",
         "Start with the concrete work result, current finding, or the next real action.",
         "Continue from the latest task state and recent working files already in context.",
-        recentEditableWorkingFile ? `Recent editable working file: ${recentEditableWorkingFile}` : "",
-        `Previous context request: ${previousUserTask}`
+        followUpContext.recentEditableWorkingFile ? `Recent editable working file: ${followUpContext.recentEditableWorkingFile}` : "",
+        `Approved proposal: ${followUpContext.previousAssistantProposal}`
       ].filter(Boolean).join("\n");
+    }
+
+    if (followUpContext.previousUserTask || followUpContext.recentEditableWorkingFile) {
+      return buildRecentContextFollowUpPrompt({
+        content,
+        intent: "rewrite",
+        previousUserTask: followUpContext.previousUserTask,
+        recentEditableWorkingFile: followUpContext.recentEditableWorkingFile
+      });
     }
   }
 
   if (isVagueInspectionFollowUp(content)) {
-    const previousUserTask = extractPreviousActionableUserRequest(historyEvents);
-    const recentEditableWorkingFile = extractRecentEditableWorkingFile(historyEvents);
+    const interruptedResume = buildInterruptedTaskResumeForFollowUp({
+      content,
+      historyEvents,
+      acknowledgementMode: "broad inspection follow-up",
+      requireInterruptedTask: true
+    });
 
-    if (previousUserTask || recentEditableWorkingFile) {
-      return [
-        `The user replied "${content.trim()}" and wants you to inspect the most recently active project or file now.`,
-        "Inspect the most concrete current target instead of restarting broad exploration.",
-        "Do not ask what to inspect first unless the current context truly lacks a concrete target.",
-        "Start with the concrete finding, work result, or next real action.",
-        "Continue from the latest task state and recent working files already in context.",
-        recentEditableWorkingFile ? `Recent editable working file: ${recentEditableWorkingFile}` : "",
-        previousUserTask ? `Previous context request: ${previousUserTask}` : ""
-      ].filter(Boolean).join("\n");
+    if (interruptedResume) {
+      return interruptedResume;
+    }
+
+    if (followUpContext.previousUserTask || followUpContext.recentEditableWorkingFile) {
+      const wantsWholeProjectInspection = isWholeProjectInspectionFollowUp(content);
+
+      return buildRecentContextFollowUpPrompt({
+        content,
+        intent: "inspect",
+        previousUserTask: followUpContext.previousUserTask,
+        recentEditableWorkingFile: followUpContext.recentEditableWorkingFile,
+        wholeProjectInspection: wantsWholeProjectInspection
+      });
     }
   }
 
@@ -2982,9 +3110,7 @@ function resolveRunnableUserRequest(
     return content;
   }
 
-  const previousAssistantProposal = extractPreviousAssistantProposal(historyEvents);
-
-  if (!previousAssistantProposal) {
+  if (!followUpContext.previousAssistantProposal) {
     return content;
   }
 
@@ -2993,7 +3119,7 @@ function resolveRunnableUserRequest(
     "Carry out that approved proposal now instead of restating it.",
     "Do not start with an acknowledgement like 可以, 可以继续, 好的, sure, or okay.",
     "Start with the concrete work result, current finding, or the next real action.",
-    `Approved proposal: ${previousAssistantProposal}`
+    `Approved proposal: ${followUpContext.previousAssistantProposal}`
   ].join("\n");
 }
 
@@ -3044,6 +3170,21 @@ function isVagueOptimizationFollowUp(content: string) {
     || /^(?:optimize|improve|refactor)(?: it| this)?$/iu.test(normalized);
 }
 
+function isVagueRewriteFollowUp(content: string) {
+  const normalized = content.trim();
+
+  if (!normalized || normalized.startsWith("/")) {
+    return false;
+  }
+
+  if (normalized.length > 40) {
+    return false;
+  }
+
+  return /^(?:你能)?(?:帮我)?(?:重新写|重写)(?:这个|整个|项目)?(?:一下|下|吗)?$/iu.test(normalized)
+    || /^(?:rewrite|rebuild)(?: it| this| the project)?$/iu.test(normalized);
+}
+
 function isVagueInspectionFollowUp(content: string) {
   const normalized = content.trim();
 
@@ -3051,12 +3192,29 @@ function isVagueInspectionFollowUp(content: string) {
     return false;
   }
 
-  if (normalized.length > 24) {
+  if (normalized.length > 72) {
     return false;
   }
 
   return /^(?:帮我)?(?:看看|看下|检查下|瞅瞅)(?:这个|一下|下)?$/iu.test(normalized)
+    || isWholeProjectInspectionFollowUp(normalized)
     || /^(?:inspect|review|look at)(?: it| this)?$/iu.test(normalized);
+}
+
+function isWholeProjectInspectionFollowUp(content: string) {
+  const normalized = content.trim();
+
+  if (!normalized || normalized.startsWith("/")) {
+    return false;
+  }
+
+  if (normalized.length > 72) {
+    return false;
+  }
+
+  return /^(?:你能)?(?:不能)?(?:一次性)?(?:都)?(?:帮我)?(?:(?:看完|看看|检查|检查下|看下|审一下)).*(?:整个|完整|全部).*(?:项目|仓库|代码)(?:吗)?$/iu.test(normalized)
+    || /^(?:你能)?(?:帮我)?(?:把)?(?:整个|完整|全部).*(?:项目|仓库|代码).*(?:看完|看看|检查|检查下|看下|审一下)(?:吗)?$/iu.test(normalized)
+    || /^(?:inspect|review|look at).*(?:whole|entire|full).*(?:project|repo|repository|codebase)$/iu.test(normalized);
 }
 
 function detectNaturalApprovalDecision(content: string) {
@@ -3162,6 +3320,283 @@ function extractRecentEditableWorkingFile(
   return undefined;
 }
 
+function extractRecentToolAnchor(
+  historyEvents: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>
+) {
+  const timeline = projectSessionTimeline(historyEvents);
+  let skippedLatestUser = false;
+
+  for (let index = timeline.length - 1; index >= 0; index -= 1) {
+    const entry = timeline[index];
+
+    if (!skippedLatestUser) {
+      if (entry?.kind === "user") {
+        skippedLatestUser = true;
+      }
+
+      continue;
+    }
+
+    if (entry?.kind === "tool" && entry.toolName && entry.toolSummary) {
+      return {
+        toolName: entry.toolName,
+        summary: entry.toolSummary
+      };
+    }
+  }
+
+  return undefined;
+}
+
+function extractRecentInterruptedApprovalAnchor(
+  historyEvents: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>
+) {
+  const latestUserIndex = findLatestUserMessageIndex(historyEvents);
+  const relevantEvents = latestUserIndex >= 0
+    ? historyEvents.slice(0, latestUserIndex)
+    : historyEvents;
+
+  for (let index = relevantEvents.length - 1; index >= 0; index -= 1) {
+    const event = relevantEvents[index];
+
+    if (event?.type !== "approval.resolved" || event.payload.approved) {
+      continue;
+    }
+
+    let requestIndex = -1;
+
+    for (let candidateIndex = index - 1; candidateIndex >= 0; candidateIndex -= 1) {
+      const candidate = relevantEvents[candidateIndex];
+
+      if (
+        candidate?.type === "approval.requested"
+        && candidate.payload.approvalId === event.payload.approvalId
+      ) {
+        requestIndex = candidateIndex;
+        break;
+      }
+    }
+
+    if (requestIndex < 0) {
+      continue;
+    }
+
+    const interruptedAfterRequest = relevantEvents.slice(requestIndex + 1, index).some((candidate) =>
+      candidate.type === "runtime.interrupt.requested"
+    );
+
+    if (!interruptedAfterRequest) {
+      continue;
+    }
+
+    const request = relevantEvents[requestIndex];
+
+    if (request?.type !== "approval.requested") {
+      continue;
+    }
+
+    const target = renderApprovalTarget(request.payload.toolName, request.payload.input) || request.payload.reason;
+
+    return {
+      toolName: request.payload.toolName,
+      target
+    };
+  }
+
+  return undefined;
+}
+
+function findLatestUserMessageIndex(
+  historyEvents: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>
+) {
+  for (let index = historyEvents.length - 1; index >= 0; index -= 1) {
+    if (historyEvents[index]?.type === "user.message.submitted") {
+      return index;
+    }
+  }
+
+  return -1;
+}
+
+function buildRecentContextFollowUpPrompt(input: {
+  content: string;
+  intent: "optimize" | "rewrite" | "inspect";
+  previousUserTask?: string;
+  recentEditableWorkingFile?: string;
+  wholeProjectInspection?: boolean;
+}) {
+  const requestLine = input.intent === "inspect"
+    ? input.wholeProjectInspection
+      ? `The user replied "${input.content.trim()}" and wants you to inspect the most recently active whole project now.`
+      : `The user replied "${input.content.trim()}" and wants you to inspect the most recently active project or file now.`
+    : `The user replied "${input.content.trim()}" and wants you to ${input.intent} the most recently inspected project or file now.`;
+
+  const actionLine = input.intent === "optimize"
+    ? "Do the work now instead of stopping at analysis."
+    : input.intent === "rewrite"
+      ? "Do the rewrite work now instead of stopping at analysis or another proposal."
+      : input.wholeProjectInspection
+        ? "Treat this as a whole-project inspection follow-up, not a single-file peek."
+        : "Inspect the most concrete current target instead of restarting broad exploration.";
+
+  const targetingLine = input.intent === "inspect"
+    ? "Do not ask what to inspect first unless the current context truly lacks a concrete target."
+    : "Do not ask which file to start from unless the current context truly lacks a concrete target.";
+
+  return [
+    requestLine,
+    actionLine,
+    targetingLine,
+    "Start with the concrete work result, current finding, or the next real action.",
+    "Continue from the latest task state and recent working files already in context.",
+    input.recentEditableWorkingFile ? `Recent editable working file: ${input.recentEditableWorkingFile}` : "",
+    input.previousUserTask ? `Previous context request: ${input.previousUserTask}` : ""
+  ].filter(Boolean).join("\n");
+}
+
+function buildRecentFollowUpContext(
+  historyEvents: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>
+) {
+  return {
+    previousUserTask: extractPreviousActionableUserRequest(historyEvents),
+    previousAssistantProposal: extractPreviousAssistantProposal(historyEvents),
+    recentEditableWorkingFile: extractRecentEditableWorkingFile(historyEvents)
+  };
+}
+
+function buildInterruptedTaskResumeForFollowUp(input: {
+  content: string;
+  historyEvents: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>;
+  acknowledgementMode:
+    | "discussion question"
+    | "generic acknowledgement"
+    | "broad rewrite follow-up"
+    | "broad optimization follow-up"
+    | "broad inspection follow-up";
+  requireInterruptedTask: boolean;
+  requireProposalExecution?: boolean;
+  allowProposalResumeOnlyAfterExecution?: boolean;
+  previousAssistantProposal?: string;
+}) {
+  const previousUserTask = extractPreviousActionableUserRequest(input.historyEvents);
+
+  if (!previousUserTask) {
+    return undefined;
+  }
+
+  if (input.requireInterruptedTask && !hasRecentInterruptedAssistantTask(input.historyEvents)) {
+    return undefined;
+  }
+
+  if (input.requireProposalExecution && !hasRecentInterruptedProposalExecution(input.historyEvents)) {
+    return undefined;
+  }
+
+  if (input.allowProposalResumeOnlyAfterExecution) {
+    const previousAssistantProposal = input.previousAssistantProposal ?? extractPreviousAssistantProposal(input.historyEvents);
+
+    if (previousAssistantProposal && !hasRecentInterruptedProposalExecution(input.historyEvents)) {
+      return undefined;
+    }
+  }
+
+  return buildInterruptedTaskResumeRequest({
+    content: input.content,
+    previousUserTask,
+    historyEvents: input.historyEvents,
+    acknowledgementMode: input.acknowledgementMode
+  });
+}
+
+function buildInterruptedTaskResumeRequest(input: {
+  content: string;
+  previousUserTask: string;
+  historyEvents: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>;
+  acknowledgementMode:
+    | "discussion question"
+    | "generic acknowledgement"
+    | "broad rewrite follow-up"
+    | "broad optimization follow-up"
+    | "broad inspection follow-up";
+}) {
+  const recentEditableWorkingFile = extractRecentEditableWorkingFile(input.historyEvents);
+  const recentToolAnchor = extractRecentToolAnchor(input.historyEvents);
+  const interruptedApprovalAnchor = hasRecentInterruptedAssistantTask(input.historyEvents)
+    ? extractRecentInterruptedApprovalAnchor(input.historyEvents)
+    : undefined;
+
+  return [
+    `The user replied "${input.content.trim()}" and wants to continue the most recent unfinished task.`,
+    `Resume that task now instead of treating this as a ${input.acknowledgementMode}.`,
+    "Do not start with an acknowledgement like 可以, 可以继续, 好的, sure, or okay.",
+    "Start with the concrete work result, current finding, or the next real action.",
+    "Continue from the latest task state already in context.",
+    recentEditableWorkingFile ? `Recent editable working file: ${recentEditableWorkingFile}` : "",
+    recentToolAnchor ? `Latest tool in context: ${recentToolAnchor.toolName}` : "",
+    recentToolAnchor ? `Latest tool summary in context: ${recentToolAnchor.summary}` : "",
+    interruptedApprovalAnchor
+      ? `Interrupted pending approval: ${interruptedApprovalAnchor.toolName} · ${interruptedApprovalAnchor.target}`
+      : "",
+    interruptedApprovalAnchor
+      ? "The previous run stopped while waiting for that approval. Retry that concrete action first instead of restarting broader inspection."
+      : "",
+    `Original task: ${input.previousUserTask}`
+  ].filter(Boolean).join("\n");
+}
+
+function hasRecentInterruptedAssistantTask(
+  historyEvents: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>
+) {
+  for (let index = historyEvents.length - 1; index >= 0; index -= 1) {
+    const event = historyEvents[index];
+
+    if (event?.type !== "task.state.changed" || event.payload.title !== "Respond to user input") {
+      continue;
+    }
+
+    return event.payload.state === "cancelled" || event.payload.state === "failed";
+  }
+
+  return false;
+}
+
+function hasRecentInterruptedProposalExecution(
+  historyEvents: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>
+) {
+  return hasRecentInterruptedAssistantTask(historyEvents)
+    && hasToolActivitySinceLatestAssistantProposal(historyEvents);
+}
+
+function hasToolActivitySinceLatestAssistantProposal(
+  historyEvents: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>
+) {
+  const timeline = projectSessionTimeline(historyEvents);
+  let skippedLatestUser = false;
+  let sawToolAfterProposal = false;
+
+  for (let index = timeline.length - 1; index >= 0; index -= 1) {
+    const entry = timeline[index];
+
+    if (!skippedLatestUser) {
+      if (entry?.kind === "user") {
+        skippedLatestUser = true;
+      }
+
+      continue;
+    }
+
+    if (entry?.kind === "assistant" && looksLikeAssistantProposal(entry.text)) {
+      return sawToolAfterProposal;
+    }
+
+    if (entry?.kind === "tool") {
+      sawToolAfterProposal = true;
+    }
+  }
+
+  return false;
+}
+
 function looksLikeAssistantProposal(content: string) {
   const normalized = content.trim();
 
@@ -3175,6 +3610,20 @@ function looksLikeAssistantProposal(content: string) {
     || /(读取|写入|编辑|修复|创建|更新|修改|检查|运行|改)/u.test(normalized);
 
   return hasOffer && hasAction;
+}
+
+function looksLikeAssistantRewriteProposal(content: string) {
+  const normalized = content.trim();
+
+  if (!looksLikeAssistantProposal(normalized)) {
+    return false;
+  }
+
+  const hasRewriteCue = /\b(rewrite|rebuild)\b/i.test(normalized)
+    || /(重写|重新写)/u.test(normalized);
+  const mentionedTargets = extractExplicitFileTargets(normalized);
+
+  return hasRewriteCue || mentionedTargets.length >= 2;
 }
 
 function shouldForceTaskContinuation(originalRequest: string, assistantMessage: string, latestToolResult: {
@@ -3236,6 +3685,29 @@ function shouldForceProjectInspectionContinuation(originalRequest: string, assis
   return looksLikeBlockingQuestion(assistantMessage) || looksLikeProgressOnlyAssistantReply(assistantMessage);
 }
 
+function shouldForceWholeProjectInspectionContinuation(originalRequest: string, assistantMessage: string, latestToolResult: {
+  toolName: string;
+  summary: string;
+  rawOutput?: string;
+  errorMessage?: string;
+}) {
+  if (!looksLikeWholeProjectInspectionRequest(originalRequest)) {
+    return false;
+  }
+
+  if (latestToolResult.toolName !== "files") {
+    return false;
+  }
+
+  const targetPath = extractPathFromToolSummary(latestToolResult.summary);
+
+  if (!targetPath || !looksLikeProjectEntryPath(targetPath) || looksLikeEditableSourcePath(targetPath)) {
+    return false;
+  }
+
+  return looksLikeBlockingQuestion(assistantMessage) || looksLikeProgressOnlyAssistantReply(assistantMessage);
+}
+
 function shouldForceProjectWorkfileContinuation(originalRequest: string, assistantMessage: string, latestToolResult: {
   toolName: string;
   summary: string;
@@ -3282,6 +3754,17 @@ function shouldForceExecutionConvergence(originalRequest: string, assistantMessa
       return true;
     }
 
+    if (
+      latestToolResult.toolName === "shell"
+      && (
+        looksLikeVerificationRequest(originalRequest)
+        || looksLikeExactOutputRequest(originalRequest)
+        || looksLikeMultiTargetMutationTask(originalRequest)
+      )
+    ) {
+      return true;
+    }
+
     return latestToolResult.toolName === "files"
       && Boolean(extractPathFromToolSummary(latestToolResult.summary));
   }
@@ -3312,7 +3795,7 @@ function shouldForceMultiTargetMutationContinuation(originalRequest: string, ass
   }
 
   if (looksLikeBlockingQuestion(assistantMessage)) {
-    return false;
+    return true;
   }
 
   return looksLikeStageSummaryWithPendingWork(assistantMessage)
@@ -3515,19 +3998,25 @@ function hasMutationIntent(content: string) {
 }
 
 function looksLikeExtendedCodingTask(content: string) {
-  if (looksLikeDiscussionRequest(content)) {
+  const taskContent = extractEmbeddedTaskContent(content);
+
+  if (looksLikeDiscussionRequest(taskContent)) {
     return false;
   }
 
-  if (isDirectShellExecutionRequest(content)) {
+  if (isDirectShellExecutionRequest(taskContent)) {
     return false;
   }
 
-  if (!hasMutationIntent(content)) {
+  if (!hasMutationIntent(taskContent)) {
     return false;
   }
 
-  return looksLikeVerificationRequest(content) || looksLikeExactOutputRequest(content);
+  if (looksLikeVerificationRequest(taskContent) || looksLikeExactOutputRequest(taskContent)) {
+    return true;
+  }
+
+  return extractExplicitFileTargets(taskContent).length >= 3;
 }
 
 function looksLikeExecutionTask(content: string) {
@@ -3672,9 +4161,19 @@ function looksLikeDiscussionRequest(content: string) {
 function looksLikeProjectInspectionRequest(content: string) {
   const taskContent = extractEmbeddedTaskContent(content);
 
-  return /\b(look at|inspect|review|check|explore)\s+(the\s+)?(project|repo|repository|codebase)\b/i.test(taskContent)
+  return looksLikeWholeProjectInspectionRequest(taskContent)
+    || /\b(look at|inspect|review|check|explore)\s+(the\s+)?(project|repo|repository|codebase)\b/i.test(taskContent)
     || /(看看|检查|看下|瞅瞅).*(项目|仓库|代码)/u.test(taskContent)
     || /(项目|仓库|代码).*(看看|检查|看下|瞅瞅)/u.test(taskContent);
+}
+
+function looksLikeWholeProjectInspectionRequest(content: string) {
+  const taskContent = extractEmbeddedTaskContent(content);
+
+  return /\bwhole-project inspection\b/i.test(taskContent)
+    || /\b(whole|entire|full)\s+(project|repo|repository|codebase)\b/i.test(taskContent)
+    || /(整个|完整|全部).*(项目|仓库|代码)/u.test(taskContent)
+    || /(项目|仓库|代码).*(整个|完整|全部)/u.test(taskContent);
 }
 
 function looksLikeBroadProjectImprovementRequest(content: string) {
