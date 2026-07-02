@@ -3334,6 +3334,7 @@ async function main() {
   await verifyPlanningStyleRewriteProposalExecutesPreviousProposal();
   await verifyChineseRewriteProposalExecutesPreviousProposal("你能帮我重新写个项目吗");
   await verifyChineseRewriteProposalExecutesPreviousProposal("帮我重写项目");
+  await verifyChineseRewriteProposalExecutesPreviousProposal("重写这个项目");
   await verifyVagueInspectionResumesInterruptedProposalExecution();
   await verifyProjectWordedWholeProjectInspectionResumesInterruptedExecution();
   await verifyVagueOptimizationResumesInterruptedProposalExecution();
@@ -12082,7 +12083,7 @@ async function verifyPlanningStyleRewriteProposalExecutesPreviousProposal() {
 }
 
 async function verifyChineseRewriteProposalExecutesPreviousProposal(
-  followUpPrompt: "你能帮我重新写个项目吗" | "帮我重写项目"
+  followUpPrompt: "你能帮我重新写个项目吗" | "帮我重写项目" | "重写这个项目"
 ) {
   const root = await mkdtemp(join(tmpdir(), "selfme-agent-chinese-rewrite-proposal-"));
   const workspace = join(root, "workspace");
