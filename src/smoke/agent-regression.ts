@@ -1516,6 +1516,33 @@ async function main() {
     "expected direct whole-project inspection to continue beyond app.js into a second core project file"
   );
 
+  console.log("task: continue whole-project inspection after a long explanation at the project entry");
+  const entryExplanationWholeProjectInspectionResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "你能一次性都帮我看完整个项目吗？如果你读到 package.json 后先长解释，也要继续看下一个核心文件。"
+  });
+
+  assert.match(entryExplanationWholeProjectInspectionResult.assistantText, /node-todo/i);
+  assert.match(entryExplanationWholeProjectInspectionResult.assistantText, /app\.js/i);
+  assert.ok(
+    entryExplanationWholeProjectInspectionResult.toolSummaries.some((summary) => summary.startsWith("pwd && ls -la && find . -maxdepth 2 -type f")),
+    "expected entry-explanation whole-project inspection to start from a workspace listing"
+  );
+  assert.ok(
+    entryExplanationWholeProjectInspectionResult.toolSummaries.some((summary) => /^node-todo\/package\.json:1-\d+$/.test(summary)),
+    "expected entry-explanation whole-project inspection to read the project entry"
+  );
+  assert.ok(
+    entryExplanationWholeProjectInspectionResult.toolSummaries.some((summary) => /^node-todo\/app\.js:1-\d+/.test(summary)),
+    "expected entry-explanation whole-project inspection to continue from package.json into app.js"
+  );
+  assert.ok(
+    entryExplanationWholeProjectInspectionResult.toolSummaries.some((summary) => /^node-todo\/views\/index\.ejs:1-\d+/.test(summary)),
+    "expected entry-explanation whole-project inspection to continue beyond app.js into a second core file"
+  );
+
   console.log("task: continue whole-project inspection after a long explanation at the first core file");
   const longExplanationWholeProjectInspectionResult = await runAgentTask({
     bus,
@@ -22288,6 +22315,12 @@ function resolveProviderResponse(content: string) {
     });
   }
 
+  if (content === "你能一次性都帮我看完整个项目吗？如果你读到 package.json 后先长解释，也要继续看下一个核心文件。") {
+    return toolCall("shell", {
+      command: "pwd && ls -la && find . -maxdepth 2 -type f | sed 's#^./##' | sort | head -200"
+    });
+  }
+
   if (content === "看看项目然后帮我优化下") {
     return toolCall("shell", {
       command: "pwd && ls -la && find . -maxdepth 2 -type f | sed 's#^./##' | sort | head -200"
@@ -24254,6 +24287,54 @@ function resolveProviderResponse(content: string) {
       }
 
       return "node-todo/app.js 已经说明这个项目的主入口非常薄，当前只负责启动一个小型 Express 应用，而且这里几乎没有业务层、控制层和模板层之间的额外协调逻辑，所以如果目标是真正把整个项目看完整，单靠这一层解释还不够，因为还需要继续下钻到模板和用户可见输出对应的另一个核心文件，才能判断这个项目的整体结构是不是完整闭环。";
+    }
+
+    if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+      return "我已经继续看了 node-todo 的核心实现，包括 app.js 和 views/index.ejs；当前这个项目是一个小型 Express todo 应用。";
+    }
+  }
+
+  if (/^Original user request: 你能一次性都帮我看完整个项目吗？如果你读到 package\.json 后先长解释，也要继续看下一个核心文件。(?:\n|$)/.test(content)) {
+    const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
+    const summary = extractLine(content, "Summary:") ?? extractLine(content, "Latest summary:") ?? "";
+
+    if (toolName === "shell") {
+      if (/You are in the middle of a concrete project inspection request\./.test(content)) {
+        assert.match(content, /Likely project entry: node-todo\/package\.json/);
+        return toolCall("files", {
+          path: "node-todo/package.json",
+          startLine: 1,
+          endLine: 20
+        });
+      }
+
+      return "我先看了工作区列表，当前最像完整项目的是 node-todo。";
+    }
+
+    if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+      if (/You are in the middle of a whole-project inspection request\./.test(content)) {
+        assert.match(content, /Likely inspection file: node-todo\/app\.js/);
+        return toolCall("files", {
+          path: "node-todo/app.js",
+          startLine: 1,
+          endLine: 20
+        });
+      }
+
+      return "node-todo/package.json 已经说明这个项目是个很小的 Express todo 应用，依赖和脚本层都非常薄，所以如果目标是真正把整个项目看完整，仅仅停在入口清单和包描述还不够，因为还需要继续读到真正承载应用结构的核心实现文件，才能判断它的控制流和渲染输出是不是闭环。";
+    }
+
+    if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+      if (/You are in the middle of a whole-project inspection request\./.test(content)) {
+        assert.match(content, /Likely inspection file: node-todo\/views\/index\.ejs/);
+        return toolCall("files", {
+          path: "node-todo/views/index.ejs",
+          startLine: 1,
+          endLine: 20
+        });
+      }
+
+      return "我已经继续看了 node-todo 的核心实现 app.js；当前这个项目是一个小型 Express todo 应用。";
     }
 
     if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
