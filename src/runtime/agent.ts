@@ -4442,13 +4442,20 @@ function resolveInterruptedResumeFollowUp(input: {
       });
 
     case "rewrite":
-      return buildInterruptedTaskResumeForFollowUp({
-        content: input.content,
-        historyEvents: input.historyEvents,
-        acknowledgementMode: "broad rewrite follow-up",
-        requireInterruptedTask: true,
-        requireProposalExecution: true
-      });
+      {
+        const previousUserTask = extractPreviousActionableUserRequest(input.historyEvents);
+        const isInterruptedDirectRewriteTask = Boolean(
+          previousUserTask && looksLikeExecutableProjectRewriteRequest(previousUserTask)
+        );
+
+        return buildInterruptedTaskResumeForFollowUp({
+          content: input.content,
+          historyEvents: input.historyEvents,
+          acknowledgementMode: "broad rewrite follow-up",
+          requireInterruptedTask: true,
+          requireProposalExecution: !isInterruptedDirectRewriteTask
+        });
+      }
 
     case "inspect":
       return buildInterruptedTaskResumeForFollowUp({

@@ -3352,6 +3352,7 @@ async function main() {
   await verifyBareAffirmativeInImplicitGenericVerificationStageSummaryChain();
   await verifyVagueOptimizationInImplicitGenericVerificationStageSummaryChain();
   await verifyProjectWordedOptimizationInImplicitGenericVerificationStageSummaryChain();
+  await verifyProjectWordedRewriteInImplicitGenericVerificationStageSummaryChain();
   await verifyVagueInspectionInImplicitGenericVerificationStageSummaryChain();
   await verifyProjectWordedInspectionInImplicitGenericVerificationStageSummaryChain();
   await verifyVagueOptimizationInImplicitBroadProjectProposalChain();
@@ -3374,6 +3375,8 @@ async function main() {
   await verifyBareAffirmativeAfterApprovalWaitInProjectChain();
   await verifyVagueOptimizationAfterApprovalWaitInProjectChain();
   await verifyProjectWordedOptimizationAfterApprovalWaitInProjectChain();
+  await verifyResumeFollowUpAfterApprovalWaitInRewriteProjectChain();
+  await verifyProjectWordedRewriteAfterApprovalWaitInProjectChain();
   await verifyNaturalLanguageApprovalShortcuts();
   await verifyPendingNextStepContextGuidesMultiTargetContinuation();
   await verifyAssistantStageSummaryPromotesExplicitNextTarget();
@@ -14656,6 +14659,10 @@ async function verifyProjectWordedOptimizationInImplicitGenericVerificationStage
   await verifyImplicitGenericVerificationStageSummaryResume("帮我优化项目");
 }
 
+async function verifyProjectWordedRewriteInImplicitGenericVerificationStageSummaryChain() {
+  await verifyImplicitGenericVerificationStageSummaryRewriteResume("帮我重写项目");
+}
+
 async function verifyVagueInspectionInImplicitGenericVerificationStageSummaryChain() {
   await verifyImplicitGenericVerificationStageSummaryResume("帮我看看");
 }
@@ -16296,6 +16303,308 @@ async function verifyImplicitGenericVerificationStageSummaryResume(
   );
 }
 
+async function verifyImplicitGenericVerificationStageSummaryRewriteResume(
+  followUpPrompt: "帮我重写项目"
+) {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-implicit-generic-rewrite-stage-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "package.json"),
+    '{\n  "name": "node-todo",\n  "version": "1.0.0",\n  "scripts": {\n    "start": "node app.js"\n  }\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const express = require("express");\nconst app = express();\nconst PORT = 3000;\napp.listen(PORT, () => {\n  console.log(`Todo app is running at http://localhost:${PORT}`);\n});\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<!DOCTYPE html>\n<form action="/add" method="post">\n  <input name="title" />\n</form>\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "verify-generic-rewrite-resume.mjs"),
+    [
+      'import { readFileSync } from "node:fs";',
+      'const app = readFileSync(new URL("./app.js", import.meta.url), "utf8");',
+      'const view = readFileSync(new URL("./views/index.ejs", import.meta.url), "utf8");',
+      'const appReady = /process\\.env\\.PORT/.test(app);',
+      'const viewReady = /maxlength="100"/.test(view);',
+      'if (appReady && viewReady) {',
+      '  console.log("ready");',
+      '} else if (appReady) {',
+      '  console.log("app-only");',
+      '} else if (viewReady) {',
+      '  console.log("view-only");',
+      '} else {',
+      '  console.log("not-ready");',
+      '}'
+    ].join("\n") + "\n",
+    "utf8"
+  );
+
+  class ResumeImplicitGenericRewriteStageProvider implements ProviderClient {
+    readonly name = "resume-implicit-generic-rewrite-stage-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "看看项目，然后直接把 node-todo 重写到正确。你自己判断需要改什么，并运行 `node node-todo/verify-generic-rewrite-resume.mjs` 验证，直到它正确为止。";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "pwd && ls -la && find . -maxdepth 2 -type f | sed 's#^./##' | sort | head -200"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell") {
+          if (/You are in the middle of a concrete project inspection request\./.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/package.json",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+
+          if (/app-only/.test(input.content)) {
+            if (
+              /You are already inside the execution phase of a concrete task\./.test(input.content)
+              || /You are still inside the same multi-step task\./.test(input.content)
+            ) {
+              yield {
+                delta: toolCall("files", {
+                  path: "node-todo/views/index.ejs",
+                  startLine: 1,
+                  endLine: 4
+                })
+              };
+              return;
+            }
+
+            yield {
+              delta: [
+                "I rewrote node-todo/app.js and verification now reports app-only.",
+                "Next I will continue with node-todo/views/index.ejs, then rerun node node-todo/verify-generic-rewrite-resume.mjs."
+              ].join("\n")
+            };
+            return;
+          }
+
+          assert.match(input.content, /ready/);
+          yield { delta: "Completed the implicit generic rewrite stage-summary chain and verified the project is now correct." };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 3,
+              endLine: 3,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-generic-rewrite-resume.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 3,
+              endLine: 3,
+              replacement: '  <input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-generic-rewrite-resume.mjs"
+            })
+          };
+          return;
+        }
+      }
+
+      if (/^The user replied "帮我重写项目" and wants to continue the most recent unfinished task\./.test(input.content)) {
+        assert.match(input.content, /Resume that task now instead of treating this as a broad rewrite follow-up\./);
+        assert.match(input.content, /Original task: 看看项目，然后直接把 node-todo 重写到正确/);
+        assert.match(input.content, /Recent editable working file: node-todo\/app\.js/);
+        assert.match(input.content, /Pending next step target: node-todo\/views\/index\.ejs/);
+        assert.match(input.content, /Latest tool in context: shell/);
+        assert.match(input.content, /Latest tool summary in context: node node-todo\/verify-generic-rewrite-resume\.mjs · completed/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/views/index.ejs",
+            startLine: 1,
+            endLine: 4
+          })
+        };
+        return;
+      }
+
+      if (/^Original user request: The user replied "帮我重写项目" and wants to continue the most recent unfinished task\./.test(input.content)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 3,
+              endLine: 3,
+              replacement: '  <input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-generic-rewrite-resume.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell") {
+          assert.match(input.content, /ready/);
+          yield { delta: "Completed the implicit generic rewrite stage-summary chain and verified the project is now correct." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ResumeImplicitGenericRewriteStageProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  let approvalCount = 0;
+  bus.on("approval.requested", (event) => {
+    approvalCount += 1;
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const originalPrompt = "看看项目，然后直接把 node-todo 重写到正确。你自己判断需要改什么，并运行 `node node-todo/verify-generic-rewrite-resume.mjs` 验证，直到它正确为止。";
+  const completionPromise = waitForAssistantTaskCompletion(bus, session.sessionId);
+  const firstVerifyPromise = waitForToolExecutionCompleted(bus, session.sessionId, (summary) => summary.startsWith("node node-todo/verify-generic-rewrite-resume.mjs · completed"));
+
+  bus.emit(createUserMessageSubmittedEvent({
+    sessionId: session.sessionId,
+    content: originalPrompt
+  }));
+
+  await firstVerifyPromise;
+  await waitForBusyPhase(bus, session.sessionId, "assistant");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  bus.emit(createRuntimeInterruptRequestedEvent({
+    sessionId: session.sessionId,
+    reason: "cancel"
+  }));
+
+  const cancelledTask = await completionPromise;
+  assert.equal(cancelledTask.payload.state, "cancelled");
+
+  const resumedResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: followUpPrompt
+  });
+
+  const resumedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(resumedViewContent, /maxlength="100"/);
+  assert.match(resumedResult.assistantText, /correct|ready/i);
+  assert.doesNotMatch(resumedResult.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/package.json:1-")),
+    false,
+    "implicit generic rewrite resume follow-up should not restart from package.json"
+  );
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-")),
+    false,
+    "implicit generic rewrite resume follow-up should not reread app.js after the pending next target is already known"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-4")),
+    "implicit generic rewrite resume follow-up should continue directly into the pending view read"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:3-3 · updated")),
+    "implicit generic rewrite resume follow-up should complete the pending view edit"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node node-todo/verify-generic-rewrite-resume.mjs · completed")),
+    "implicit generic rewrite resume follow-up should finish the generic verification after the resumed view edit"
+  );
+  assert.equal(
+    approvalCount,
+    2,
+    "expected one approval before interruption and one approval for the resumed implicit generic rewrite stage-summary edit"
+  );
+}
+
 async function verifyResumeFollowUpDoesNotLeakStalePendingNextTarget() {
   const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-no-stale-target-"));
   const workspace = join(root, "workspace");
@@ -17399,6 +17708,14 @@ async function verifyProjectWordedOptimizationAfterApprovalWaitInProjectChain() 
   await verifyApprovalWaitResumeInProjectChain("帮我优化项目");
 }
 
+async function verifyResumeFollowUpAfterApprovalWaitInRewriteProjectChain() {
+  await verifyApprovalWaitResumeInRewriteProjectChain("还能继续吗");
+}
+
+async function verifyProjectWordedRewriteAfterApprovalWaitInProjectChain() {
+  await verifyApprovalWaitResumeInRewriteProjectChain("帮我重写项目");
+}
+
 async function verifyApprovalWaitResumeInProjectChain(
   followUpPrompt: "还能继续吗" | "可以" | "帮我优化下" | "帮我优化项目"
 ) {
@@ -17718,6 +18035,328 @@ async function verifyApprovalWaitResumeInProjectChain(
     approvalCount,
     3,
     "expected one approval for app.js, one denied approval at interruption, and one fresh approval for the resumed view edit"
+  );
+}
+
+async function verifyApprovalWaitResumeInRewriteProjectChain(
+  followUpPrompt: "还能继续吗" | "帮我重写项目"
+) {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-project-rewrite-approval-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "package.json"),
+    '{\n  "name": "node-todo",\n  "version": "1.0.0",\n  "scripts": {\n    "start": "node app.js"\n  }\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const express = require("express");\nconst app = express();\nconst PORT = 3000;\napp.listen(PORT, () => {\n  console.log(`Todo app is running at http://localhost:${PORT}`);\n});\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<!DOCTYPE html>\n<form action="/add" method="post">\n  <input name="title" />\n</form>\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "verify-setup.mjs"),
+    [
+      'import { readFileSync } from "node:fs";',
+      'const app = readFileSync(new URL("./app.js", import.meta.url), "utf8");',
+      'const view = readFileSync(new URL("./views/index.ejs", import.meta.url), "utf8");',
+      'const appReady = /process\\.env\\.PORT/.test(app);',
+      'const viewReady = /maxlength="100"/.test(view);',
+      'if (appReady && viewReady) {',
+      '  console.log("ready");',
+      '} else if (appReady) {',
+      '  console.log("app-only");',
+      '} else if (viewReady) {',
+      '  console.log("view-only");',
+      '} else {',
+      '  console.log("not-ready");',
+      '}'
+    ].join("\n") + "\n",
+    "utf8"
+  );
+
+  class ResumeProjectRewriteApprovalProvider implements ProviderClient {
+    readonly name = "resume-project-rewrite-approval-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "看看项目，然后直接重写 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100，并运行 `node node-todo/verify-setup.mjs` 验证，直到输出 exactly `ready`。";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "pwd && ls -la && find . -maxdepth 2 -type f | sed 's#^./##' | sort | head -200"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell") {
+          if (/You are in the middle of a concrete project inspection request\./.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/package.json",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+
+          if (/app-only/.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/views/index.ejs",
+                startLine: 1,
+                endLine: 4
+              })
+            };
+            return;
+          }
+
+          assert.match(input.content, /ready/);
+          yield { delta: "Completed the node-todo rewrite approval-wait chain after resuming from the pending view edit." };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 3,
+              endLine: 3,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-setup.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 3,
+              endLine: 3,
+              replacement: '  <input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-setup.mjs"
+            })
+          };
+          return;
+        }
+      }
+
+      if (/^The user replied "(还能继续吗|帮我重写项目)" and wants to continue the most recent unfinished task\./.test(input.content)) {
+        assert.match(input.content, /Original task: 看看项目，然后直接重写 node-todo/);
+        if (/帮我重写项目/.test(input.content)) {
+          assert.match(input.content, /Resume that task now instead of treating this as a broad rewrite follow-up\./);
+        }
+        assert.match(input.content, /Latest tool in context: files/);
+        assert.match(input.content, /Latest tool summary in context: node-todo\/views\/index\.ejs:1-4/);
+        assert.match(input.content, /Interrupted pending approval: edit · node-todo\/views\/index\.ejs:3-3/);
+        yield {
+          delta: toolCall("edit", {
+            path: "node-todo/views/index.ejs",
+            startLine: 3,
+            endLine: 3,
+            replacement: '  <input name="title" maxlength="100" />'
+          })
+        };
+        return;
+      }
+
+      if (/^Original user request: The user replied "(还能继续吗|帮我重写项目)" and wants to continue the most recent unfinished task\./.test(input.content)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-setup.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell") {
+          assert.match(input.content, /ready/);
+          yield { delta: "Completed the node-todo rewrite approval-wait chain after resuming from the pending view edit." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ResumeProjectRewriteApprovalProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  let approvalCount = 0;
+  let heldApprovalId: string | undefined;
+  let phaseTwo = false;
+  const secondApprovalPromise = new Promise<Extract<RuntimeEvent, { type: "approval.requested" }>>((resolve) => {
+    bus.on("approval.requested", (event) => {
+      approvalCount += 1;
+
+      if (!phaseTwo) {
+        if (approvalCount === 1) {
+          bus.emit(createTerminalCommandInvokedEvent({
+            sessionId: event.sessionId,
+            content: `/approve ${event.payload.approvalId}`
+          }));
+          return;
+        }
+
+        heldApprovalId = event.payload.approvalId;
+        resolve(event);
+        return;
+      }
+
+      bus.emit(createTerminalCommandInvokedEvent({
+        sessionId: event.sessionId,
+        content: `/approve ${event.payload.approvalId}`
+      }));
+    });
+  });
+
+  const originalPrompt = "看看项目，然后直接重写 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100，并运行 `node node-todo/verify-setup.mjs` 验证，直到输出 exactly `ready`。";
+  const completionPromise = waitForAssistantTaskCompletion(bus, session.sessionId);
+
+  bus.emit(createUserMessageSubmittedEvent({
+    sessionId: session.sessionId,
+    content: originalPrompt
+  }));
+
+  const pendingApproval = await secondApprovalPromise;
+  assert.equal(pendingApproval.payload.toolName, "edit");
+  assert.match(JSON.stringify(pendingApproval.payload.input), /maxlength="100"/);
+  bus.emit(createRuntimeInterruptRequestedEvent({
+    sessionId: session.sessionId,
+    reason: "cancel"
+  }));
+
+  const cancelledTask = await completionPromise;
+  assert.equal(cancelledTask.payload.state, "cancelled");
+
+  const interruptedEvents = await transcriptStore.readEventsBySession(session.sessionId);
+  assert.ok(
+    interruptedEvents.some((event) =>
+      event.type === "tool.execution.completed" && event.payload.summary.startsWith("node-todo/views/index.ejs:1-4")
+    ),
+    "interrupted rewrite approval-wait task should preserve the narrowed pending view file before stop"
+  );
+  assert.equal(
+    interruptedEvents.some((event) =>
+      event.type === "tool.execution.completed" && event.payload.summary.startsWith("node-todo/views/index.ejs:3-3 · updated")
+    ),
+    false,
+    "interrupted rewrite approval-wait task should stop before the pending approved edit is applied"
+  );
+  assert.ok(
+    interruptedEvents.some((event) =>
+      event.type === "approval.resolved"
+      && event.payload.approvalId === heldApprovalId
+      && !event.payload.approved
+    ),
+    "stopping during rewrite approval wait should resolve the held approval as denied for the cancelled run"
+  );
+
+  phaseTwo = true;
+  const resumedResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: followUpPrompt
+  });
+
+  const resumedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(resumedViewContent, /maxlength="100"/);
+  assert.match(resumedResult.assistantText, /pending view edit/i);
+  assert.doesNotMatch(resumedResult.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/package.json:1-")),
+    false,
+    "rewrite resume after approval wait should not restart from package.json"
+  );
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-")),
+    false,
+    "rewrite resume after approval wait should not reread app.js"
+  );
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-4")),
+    false,
+    "rewrite resume after approval wait should not reread the same view file before retrying the pending edit"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:3-3 · updated")),
+    "rewrite resume after approval wait should continue directly with the pending view edit"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node node-todo/verify-setup.mjs · completed")),
+    "rewrite resume after approval wait should finish verification after the resumed edit"
+  );
+  assert.equal(
+    approvalCount,
+    3,
+    "expected one approval for app.js, one denied approval at interruption, and one fresh approval for the resumed rewrite view edit"
   );
 }
 
