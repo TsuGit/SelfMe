@@ -3374,6 +3374,7 @@ async function main() {
   await verifyResumeFollowUpPullsCompletionToneBackIntoLatestFailurePoint();
   await verifyResumeFollowUpPullsBlockingQuestionBackIntoLatestFailurePoint();
   await verifyResumeFollowUpInProjectVerificationChain();
+  await verifyCompletionToneReplyInProjectVerificationChain();
   await verifyVagueOptimizationInProjectVerificationChain();
   await verifyProjectWordedOptimizationInProjectVerificationChain();
   await verifyVagueInspectionInProjectVerificationChain();
@@ -13649,6 +13650,12 @@ async function verifyResumeFollowUpInProjectVerificationChain() {
   await verifyProjectVerificationChainResume("还能继续吗");
 }
 
+async function verifyCompletionToneReplyInProjectVerificationChain() {
+  await verifyProjectVerificationChainResume("还能继续吗", {
+    resumeIntermediateReply: "completion"
+  });
+}
+
 async function verifyVagueOptimizationInProjectVerificationChain() {
   await verifyProjectVerificationChainResume("帮我优化下");
 }
@@ -13666,7 +13673,10 @@ async function verifyProjectWordedInspectionInProjectVerificationChain() {
 }
 
 async function verifyProjectVerificationChainResume(
-  followUpPrompt: "还能继续吗" | "帮我优化下" | "帮我优化项目" | "帮我看看" | "帮我看看项目"
+  followUpPrompt: "还能继续吗" | "帮我优化下" | "帮我优化项目" | "帮我看看" | "帮我看看项目",
+  options: {
+    resumeIntermediateReply?: "completion";
+  } = {}
 ) {
   const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-project-chain-"));
   const workspace = join(root, "workspace");
@@ -13714,6 +13724,7 @@ async function verifyProjectVerificationChainResume(
 
   class ResumeProjectChainProvider implements ProviderClient {
     readonly name = "resume-project-chain-provider";
+    private emittedResumeIntermediateReply = false;
 
     async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
       const originalPrompt = "看看项目，然后直接优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100，并运行 `node node-todo/verify-setup.mjs` 验证，直到输出 exactly `ready`。";
@@ -13825,6 +13836,13 @@ async function verifyProjectVerificationChainResume(
         assert.match(input.content, /Latest tool in context: files/);
         assert.match(input.content, /Latest tool summary in context: node-todo\/views\/index\.ejs:1-4/);
         assert.match(input.content, /Interrupted pending approval: edit · node-todo\/views\/index\.ejs:3-3/);
+        if (options.resumeIntermediateReply && !this.emittedResumeIntermediateReply) {
+          this.emittedResumeIntermediateReply = true;
+          yield {
+            delta: "The node-todo verification chain is basically finished overall."
+          };
+          return;
+        }
         yield {
           delta: toolCall("edit", {
             path: "node-todo/views/index.ejs",
@@ -13839,6 +13857,22 @@ async function verifyProjectVerificationChainResume(
       if (/^Original user request: The user replied "(还能继续吗|帮我优化下|帮我优化项目|帮我看看|帮我看看项目)" and wants to continue the most recent unfinished task\./.test(input.content)) {
         const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
         const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (options.resumeIntermediateReply && /You have not started the requested work yet\./.test(input.content)) {
+          const recentTaskState = input.contextMessages?.find((message) =>
+            message.role === "system" && message.content.includes("Recent task state:")
+          )?.content ?? "";
+          assert.match(recentTaskState, /Pending approval: edit · node-todo\/views\/index\.ejs:3-3/);
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 3,
+              endLine: 3,
+              replacement: '  <input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
 
         if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
           yield {
@@ -13939,6 +13973,17 @@ async function verifyProjectVerificationChainResume(
     sessionId: session.sessionId,
     prompt: followUpPrompt
   });
+
+  if (options.resumeIntermediateReply) {
+    const resumedEvents = await transcriptStore.readEventsBySession(session.sessionId);
+    assert.ok(
+      resumedEvents.some((event) =>
+        event.type === "assistant.delta.received"
+        && /The node-todo verification chain is basically finished overall\./.test(event.payload.delta)
+      ),
+      "project verification completion-tone resume should preserve the intermediate completion-tone reply before retrying the pending view edit"
+    );
+  }
 
   const resumedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
   assert.match(resumedViewContent, /maxlength="100"/);
