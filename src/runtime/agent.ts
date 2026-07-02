@@ -5559,6 +5559,10 @@ function extractRequestedMutationAnchor(originalRequest: string) {
   const taskContent = extractEmbeddedTaskContent(originalRequest);
 
   return taskContent.match(/\bprocess\.env\.[A-Za-z0-9_]+\b/)?.[0]
+    ?? taskContent.match(/\bprints?\s+exactly\s+["'`]([^"'`\n]+)["'`]/i)?.[1]
+    ?? taskContent.match(/\boutput\s+["'`]([^"'`\n]+)["'`]/i)?.[1]
+    ?? taskContent.match(/输出\s*["'“”`]?([^"'“”`\n。！!？?]+)["'“”`]?/u)?.[1]?.trim()
+    ?? taskContent.match(/改成输出\s*["'“”`]?([^"'“”`\n。！!？?]+)["'“”`]?/u)?.[1]?.trim()
     ?? taskContent.match(/\bmaxlength(?:\s*=|\s+)\d+\b/i)?.[0]?.replace(/\s*=\s*/g, "=");
 }
 
@@ -5901,7 +5905,7 @@ function getAgentToolStepBudget(content: string) {
 
 function hasMutationIntent(content: string) {
   return /\b(create|write|edit|fix|repair|update|change|modify|improve|optimize|refactor|rewrite|rebuild)\b/i.test(content)
-    || /(创建|写入|编辑|修复|更新|修改|优化|改进|重构|重写|重做)/u.test(content);
+    || /(创建|写入|编辑|修复|更新|修改|优化|改进|重构|重写|重做|改成|改为|改下|改一下|换成)/u.test(content);
 }
 
 function looksLikeExtendedCodingTask(content: string) {
@@ -5966,6 +5970,10 @@ function looksLikeActionableTaskRequest(content: string) {
     return true;
   }
 
+  if (looksLikeExplicitFileContentQuestion(taskContent)) {
+    return true;
+  }
+
   if (/\b(read|write|edit|fix|repair|create|inspect|run|running|verify|check|list|update|change|modify|improve|optimize|refactor)\b/i.test(taskContent)) {
     return true;
   }
@@ -5974,7 +5982,7 @@ function looksLikeActionableTaskRequest(content: string) {
     return true;
   }
 
-  if (/(读取|写入|编辑|修复|创建|检查|运行|验证|列出|修改|更新|优化|改进|重构)/u.test(taskContent)) {
+  if (/(读取|写入|编辑|修复|创建|检查|运行|验证|列出|修改|更新|优化|改进|重构|改成|改为|改下|改一下|换成)/u.test(taskContent)) {
     return true;
   }
 
@@ -6172,6 +6180,18 @@ function looksLikeMultiTargetMutationTask(content: string) {
   }
 
   return extractExplicitRequestedMutationTargets(taskContent).length >= 2;
+}
+
+function looksLikeExplicitFileContentQuestion(content: string) {
+  const taskContent = extractEmbeddedTaskContent(content);
+  const targets = extractExplicitFileTargets(taskContent);
+
+  if (targets.length === 0 || looksLikeDiscussionRequest(taskContent)) {
+    return false;
+  }
+
+  return /\b(what(?:'s| is)?|show|tell me|contents?|inside|line\s+\d+|first line|second line|prints?)\b/i.test(taskContent)
+    || /(内容|里面|写了什么|写了啥|第\s*\d+\s*行|第一行|第二行|是什么|是啥|输出什么|打印什么)/u.test(taskContent);
 }
 
 function extractExplicitFileTargets(content: string) {

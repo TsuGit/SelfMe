@@ -3283,6 +3283,35 @@ async function main() {
     "expected shell cmd alias normalization to avoid invalid-input recovery"
   );
 
+  console.log("task: start tool-grounded file inspection after an initial fabricated direct answer");
+  const fabricatedFileAnswerRecoveryResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "greet.mjs 第 1 行是什么？如果你先直接猜，也要恢复并实际读取。"
+  });
+
+  assert.match(fabricatedFileAnswerRecoveryResult.assistantText, /hello/i);
+  assert.ok(
+    fabricatedFileAnswerRecoveryResult.toolSummaries.some((summary) => summary.startsWith("greet.mjs:1-1")),
+    "expected explicit file-content question to recover by actually reading greet.mjs"
+  );
+
+  console.log("task: start tool-grounded chinese mutation after an initial proposal-only reply");
+  const chineseNaturalMutationRecoveryResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: '把 greet.mjs 改成输出 "Natural"。如果你先只说准备怎么改，也要继续实际修改。'
+  });
+
+  assert.match(chineseNaturalMutationRecoveryResult.assistantText, /natural/i);
+  assert.ok(
+    chineseNaturalMutationRecoveryResult.toolSummaries.some((summary) => summary.startsWith("greet.mjs:1-1 · updated")),
+    "expected natural Chinese mutation wording to execute a real edit instead of stopping at a proposal"
+  );
+  await writeFile(join(workspace, "greet.mjs"), 'console.log("Hello");\n', "utf8");
+
   console.log("task: accept loose files tool payload");
   const looseFilesPayloadResult = await runAgentTask({
     bus,
@@ -22679,6 +22708,14 @@ function resolveProviderResponse(content: string) {
     ].join("\n");
   }
 
+  if (content.startsWith("greet.mjs 第 1 行是什么？如果你先直接猜，也要恢复并实际读取。")) {
+    return '应该是 console.log("Hello");';
+  }
+
+  if (content.startsWith('把 greet.mjs 改成输出 "Natural"。如果你先只说准备怎么改，也要继续实际修改。')) {
+    return "我会先读取 greet.mjs，然后把输出改成 Natural。";
+  }
+
   if (content.startsWith("Read greet.mjs line 1 and tell me what it prints.")) {
     return [
       "<tool_call>",
@@ -26717,6 +26754,36 @@ function resolveProviderResponse(content: string) {
     assert.match(content, /Tool: shell/);
     assert.match(content, /Summary: pwd · completed/);
     return "The working directory is the current workspace root.";
+  }
+
+  if (content.startsWith("Original user request: greet.mjs 第 1 行是什么？如果你先直接猜，也要恢复并实际读取。")) {
+    if (!/Tool: files/.test(content)) {
+      assert.match(content, /For actionable requests, do the work now instead of describing what you will do\./);
+      return toolCall("files", {
+        path: "greet.mjs",
+        startLine: 1,
+        endLine: 1
+      });
+    }
+
+    assert.match(content, /Summary: greet\.mjs:1-1/);
+    assert.match(content, /Hello/i);
+    return 'greet.mjs 第 1 行是 `console.log("Hello");`。';
+  }
+
+  if (content.startsWith('Original user request: 把 greet.mjs 改成输出 "Natural"。如果你先只说准备怎么改，也要继续实际修改。')) {
+    if (!/Tool:/.test(content)) {
+      assert.match(content, /For actionable requests, do the work now instead of describing what you will do\./);
+      return toolCall("edit", {
+        path: "greet.mjs",
+        startLine: 1,
+        endLine: 1,
+        replacement: 'console.log("Natural");'
+      });
+    }
+
+    assert.match(content, /Summary: greet\.mjs:1-1 · updated/);
+    return '已把 greet.mjs 改成输出 "Natural"。';
   }
 
   if (content.startsWith("Original user request: Read greet.mjs line 1 and tell me what it prints.")) {
