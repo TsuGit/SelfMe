@@ -101,6 +101,7 @@ async function main() {
   await writeFile(join(workspace, "report.mjs"), 'import config from "./app.config.json" with { type: "json" };\nconsole.log(`name=${config.name}`);\nconsole.log(`port=${config.port}`);\n', "utf8");
   await writeFile(join(workspace, "failure-stop-report.mjs"), 'import config from "./app.conf.json" with { type: "json" };\nconsole.log(`${config.name}:${config.port}`);\n', "utf8");
   await writeFile(join(workspace, "failure-question-report.mjs"), 'import config from "./app.conf.json" with { type: "json" };\nconsole.log(`${config.name}:${config.port}`);\n', "utf8");
+  await writeFile(join(workspace, "failure-summary-report.mjs"), 'import config from "./app.conf.json" with { type: "json" };\nconsole.log(`${config.name}:${config.port}`);\n', "utf8");
   await writeFile(join(workspace, "converge-report.mjs"), 'import config from "./app.config.json" with { type: "json" };\nconsole.log(`${config.name}:${config.port}`);\nconsole.log("done");\n', "utf8");
   await writeFile(join(workspace, "converge-question-report.mjs"), 'import config from "./app.config.json" with { type: "json" };\nconsole.log(`${config.name}:${config.port}`);\nconsole.log("done");\n', "utf8");
   await writeFile(join(workspace, "premature-edit-report.mjs"), 'import config from "./app.config.json" with { type: "json" };\nconsole.log(`${config.name}-${config.port}`);\n', "utf8");
@@ -116,6 +117,8 @@ async function main() {
   await writeFile(join(workspace, "failure-recap-report.mjs"), 'import config from "./app.config.json" with { type: "json" };\nconsole.log(`${config.name}-${config.port}`);\n', "utf8");
   await writeFile(join(workspace, "unrelated-anchor-report.mjs"), 'import config from "./app.config.json" with { type: "json" };\nconsole.log(`${config.name}-${config.port}`);\n', "utf8");
   await writeFile(join(workspace, "over-verify-report.mjs"), 'import config from "./app.config.json" with { type: "json" };\nconsole.log(`${config.name}-${config.port}`);\n', "utf8");
+  await writeFile(join(workspace, "option-start-report.mjs"), 'console.log("pending");\n', "utf8");
+  await writeFile(join(workspace, "question-start-report.mjs"), 'console.log("pending");\n', "utf8");
   await writeFile(
     join(workspace, "node-todo", "package.json"),
     '{\n  "name": "node-todo",\n  "version": "1.0.0",\n  "description": "Simple todo app",\n  "main": "app.js",\n  "scripts": {\n    "start": "node app.js"\n  },\n  "dependencies": {\n    "ejs": "^3.1.10",\n    "express": "^4.19.2"\n  }\n}\n',
@@ -374,6 +377,54 @@ async function main() {
   assert.ok(
     crossFileChainResult.toolSummaries.some((summary) => summary.startsWith("node print-config.mjs · completed")),
     "expected successful verification after repair"
+  );
+
+  console.log("task: force direct execution when an actionable request starts with a proposal");
+  const initialProposalAutostartResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: 'Fix option-start-report.mjs so running `node option-start-report.mjs` prints exactly `ready`. Do the change directly and verify before finishing.'
+  });
+
+  const initialProposalAutostartContent = await readFile(join(workspace, "option-start-report.mjs"), "utf8");
+  assert.equal(initialProposalAutostartContent, 'console.log("ready");\n');
+  assert.match(initialProposalAutostartResult.assistantText, /ready/);
+  assert.ok(
+    initialProposalAutostartResult.toolSummaries.some((summary) => summary.startsWith("option-start-report.mjs:1-1")),
+    "expected actionable request to break out of the opening proposal and inspect the target file"
+  );
+  assert.ok(
+    initialProposalAutostartResult.toolSummaries.some((summary) => summary.startsWith("option-start-report.mjs:1-1 · updated")),
+    "expected actionable request to continue into the concrete file edit after the opening proposal"
+  );
+  assert.ok(
+    initialProposalAutostartResult.toolSummaries.some((summary) => summary.startsWith("node option-start-report.mjs · completed")),
+    "expected actionable request to finish with shell verification after the opening proposal"
+  );
+
+  console.log("task: force direct execution when an actionable request starts with a non-blocking question");
+  const initialQuestionAutostartResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: 'Fix question-start-report.mjs so running `node question-start-report.mjs` prints exactly `ready`. Verify it before finishing.'
+  });
+
+  const initialQuestionAutostartContent = await readFile(join(workspace, "question-start-report.mjs"), "utf8");
+  assert.equal(initialQuestionAutostartContent, 'console.log("ready");\n');
+  assert.match(initialQuestionAutostartResult.assistantText, /ready/);
+  assert.ok(
+    initialQuestionAutostartResult.toolSummaries.some((summary) => summary.startsWith("question-start-report.mjs:1-1")),
+    "expected explicit-target request to start by reading the named file instead of stopping at a blocking question"
+  );
+  assert.ok(
+    initialQuestionAutostartResult.toolSummaries.some((summary) => summary.startsWith("question-start-report.mjs:1-1 · updated")),
+    "expected explicit-target request to continue into the concrete edit after the blocking question"
+  );
+  assert.ok(
+    initialQuestionAutostartResult.toolSummaries.some((summary) => summary.startsWith("node question-start-report.mjs · completed")),
+    "expected explicit-target request to finish with shell verification after the blocking question"
   );
 
   console.log("task: treat affirmative follow-up as approval to execute the previous proposal");
@@ -1193,6 +1244,29 @@ async function main() {
       || summary.startsWith("failure-question-report.mjs:1-3 · updated")
     ),
     "expected repair edit after failure-question assistant reply"
+  );
+
+  console.log("task: continue after a failure summary that sounds completed");
+  const failureSummaryRecoveryResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Read app.config.json and fix failure-summary-report.mjs so running `node failure-summary-report.mjs` prints exactly `SelfMe:3000` on one line. Keep working until the output is exact."
+  });
+
+  const failureSummaryReportContent = await readFile(join(workspace, "failure-summary-report.mjs"), "utf8");
+  assert.match(failureSummaryReportContent, /app\.config\.json/);
+  assert.match(failureSummaryRecoveryResult.assistantText, /SelfMe:3000/);
+  assert.ok(
+    failureSummaryRecoveryResult.toolSummaries.some((summary) => summary.startsWith("node failure-summary-report.mjs · failed (1)")),
+    "expected failed verification before runtime forced continued repair after a misleading failure summary"
+  );
+  assert.ok(
+    failureSummaryRecoveryResult.toolSummaries.some((summary) =>
+      summary.startsWith("failure-summary-report.mjs:1-2 · updated")
+      || summary.startsWith("failure-summary-report.mjs:1-3 · updated")
+    ),
+    "expected repair edit after misleading failure summary reply"
   );
 
   console.log("task: keep repairing across a failure and then a near-miss verification");
@@ -3119,6 +3193,143 @@ async function main() {
     "expected repaired shell tool call to run"
   );
 
+  console.log("task: recover from malformed tool call payload");
+  const malformedToolCallRecoveryResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Tell me the current working directory one more time, and recover if your first shell tool call is malformed."
+  });
+
+  assert.match(malformedToolCallRecoveryResult.assistantText, /working directory/i);
+  assert.ok(
+    malformedToolCallRecoveryResult.toolSummaries.some((summary) => summary.startsWith("pwd · completed")),
+    "expected malformed shell tool call to be retried and then run"
+  );
+  assert.equal(
+    malformedToolCallRecoveryResult.runtimeErrors.some((message) => /malformed tool call/i.test(message)),
+    false,
+    "expected malformed tool call recovery not to fail the task"
+  );
+
+  console.log("task: recover from unknown tool request");
+  const unknownToolRecoveryResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Tell me the current working directory yet again, and recover if your first tool name is wrong."
+  });
+
+  assert.match(unknownToolRecoveryResult.assistantText, /working directory/i);
+  assert.ok(
+    unknownToolRecoveryResult.toolSummaries.some((summary) => summary.startsWith("pwd · completed")),
+    "expected unknown tool request to be retried with a valid shell tool call"
+  );
+  assert.equal(
+    unknownToolRecoveryResult.runtimeErrors.some((message) => /Unknown tool requested by model/i.test(message)),
+    false,
+    "expected unknown tool recovery not to fail the task"
+  );
+
+  console.log("task: recover from invalid tool input");
+  const invalidToolInputRecoveryResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Tell me the current working directory once again, and recover if your first shell tool input is invalid."
+  });
+
+  assert.match(invalidToolInputRecoveryResult.assistantText, /working directory/i);
+  assert.ok(
+    invalidToolInputRecoveryResult.toolSummaries.some((summary) => summary.startsWith("pwd · completed")),
+    "expected invalid shell tool input to be retried with corrected fields"
+  );
+  assert.equal(
+    invalidToolInputRecoveryResult.runtimeErrors.some((message) => /Invalid \/?shell input/i.test(message)),
+    false,
+    "expected invalid tool input recovery not to fail the task"
+  );
+
+  console.log("task: accept shell cmd alias payload");
+  const shellCmdAliasResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Tell me the current working directory again using a shell cmd alias payload."
+  });
+
+  assert.match(shellCmdAliasResult.assistantText, /working directory|workspace/i);
+  assert.ok(
+    shellCmdAliasResult.toolSummaries.some((summary) => summary.startsWith("pwd · completed")),
+    "expected shell cmd alias payload to run as a normal pwd command"
+  );
+  assert.equal(
+    shellCmdAliasResult.runtimeErrors.some((message) => /Invalid \/?shell input/i.test(message)),
+    false,
+    "expected shell cmd alias normalization to avoid invalid-input recovery"
+  );
+
+  console.log("task: accept loose files tool payload");
+  const looseFilesPayloadResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Read greet.mjs line 1 and tell me what it prints."
+  });
+
+  assert.match(looseFilesPayloadResult.assistantText, /hello/i);
+  assert.ok(
+    looseFilesPayloadResult.toolSummaries.some((summary) => summary.startsWith("greet.mjs:1-1")),
+    "expected loose files payload to read the requested line"
+  );
+
+  console.log("task: accept path-scoped files tool payload");
+  const pathScopedFilesPayloadResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Read greet.mjs path-scoped line 1 and tell me what it prints."
+  });
+
+  assert.match(pathScopedFilesPayloadResult.assistantText, /hello/i);
+  assert.ok(
+    pathScopedFilesPayloadResult.toolSummaries.some((summary) => summary.startsWith("greet.mjs:1-1")),
+    "expected path-scoped files payload to read the requested line"
+  );
+
+  console.log("task: accept loose edit tool payload");
+  const looseEditPayloadResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: 'Change greet.mjs so it prints exactly "Loose".'
+  });
+
+  const looseEditContent = await readFile(join(workspace, "greet.mjs"), "utf8");
+  assert.match(looseEditContent, /Loose/);
+  assert.match(looseEditPayloadResult.assistantText, /greet\.mjs|completed|已完成/i);
+  assert.ok(
+    looseEditPayloadResult.toolSummaries.some((summary) => summary.startsWith("greet.mjs:1-1 · updated")),
+    "expected loose edit payload to update greet.mjs"
+  );
+  await writeFile(join(workspace, "greet.mjs"), 'console.log("Hello, SelfMe!");\n', "utf8");
+
+  console.log("task: accept aliased edit tool payload");
+  const aliasedEditPayloadResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: 'Change greet.mjs through aliased range fields so it prints exactly "Alias".'
+  });
+
+  const aliasedEditContent = await readFile(join(workspace, "greet.mjs"), "utf8");
+  assert.match(aliasedEditContent, /Alias/);
+  assert.ok(
+    aliasedEditPayloadResult.toolSummaries.some((summary) => summary.startsWith("greet.mjs:1-1 · updated")),
+    "expected aliased edit payload to update greet.mjs"
+  );
+  await writeFile(join(workspace, "greet.mjs"), 'console.log("Hello, SelfMe!");\n', "utf8");
+
   console.log("task: handle missing file failure");
   const missingFileResult = await runAgentTask({
     bus,
@@ -3247,60 +3458,67 @@ async function main() {
   const greetAfterDeniedShell = await readFile(join(workspace, "greet.mjs"), "utf8");
   assert.equal(greetAfterDeniedShell, 'console.log("Hello, SelfMe!");\n');
 
-  console.log("task: allow final answer after six tool steps");
-  const sixToolStepResult = await runAgentTask({
+  console.log("task: allow final answer after eight tool steps");
+  const eightToolStepResult = await runAgentTask({
     bus,
     transcriptStore,
     sessionId: session.sessionId,
-    prompt: "Read app.config.json, greet.mjs, report.mjs, serve.mjs, dashboard.mjs, and status.mjs, then answer exactly FINAL-SIX-STEPS."
+    prompt: "Read app.config.json, greet.mjs, report.mjs, serve.mjs, dashboard.mjs, status.mjs, smoke-a.mjs, and node-todo/app.js, then answer FINAL-EIGHT-STEPS."
   });
 
-  assert.equal(sixToolStepResult.assistantText, "FINAL-SIX-STEPS");
+  assert.equal(eightToolStepResult.assistantText, "FINAL-EIGHT-STEPS");
   assert.deepEqual(
-    sixToolStepResult.toolSummaries.filter((summary) =>
+    eightToolStepResult.toolSummaries.filter((summary) =>
       summary.startsWith("app.config.json:")
       || summary.startsWith("greet.mjs:")
       || summary.startsWith("report.mjs:")
       || summary.startsWith("serve.mjs:")
       || summary.startsWith("dashboard.mjs:")
       || summary.startsWith("status.mjs:")
+      || summary.startsWith("smoke-a.mjs:")
+      || summary.startsWith("node-todo/app.js:")
     ).length,
-    6
+    8
   );
 
-  console.log("task: fail deterministically on seventh tool step");
-  const sevenToolStepResult = await runAgentTask({
+  console.log("task: fail deterministically on ninth tool step");
+  const nineToolStepResult = await runAgentTask({
     bus,
     transcriptStore,
     sessionId: session.sessionId,
-    prompt: "Read app.config.json, greet.mjs, report.mjs, serve.mjs, dashboard.mjs, status.mjs, and console.mjs, then answer exactly SHOULD-NOT-HAPPEN.",
+    prompt: "Read app.config.json, greet.mjs, report.mjs, serve.mjs, dashboard.mjs, status.mjs, smoke-a.mjs, node-todo/app.js, and node-todo/views/index.ejs, then answer SHOULD-NOT-HAPPEN.",
     expectedState: "failed"
   });
 
-  assert.equal(sevenToolStepResult.assistantText, "");
+  assert.equal(nineToolStepResult.assistantText, "");
   assert.ok(
-    sevenToolStepResult.runtimeErrors.some((message) => message.includes("Agent stopped after 6 tool steps")),
+    nineToolStepResult.runtimeErrors.some((message) => message.includes("Agent stopped after 8 tool steps")),
     "expected deterministic step-limit runtime error"
   );
   assert.equal(
-    sevenToolStepResult.toolSummaries.filter((summary) =>
+    nineToolStepResult.toolSummaries.filter((summary) =>
       summary.startsWith("app.config.json:")
       || summary.startsWith("greet.mjs:")
       || summary.startsWith("report.mjs:")
       || summary.startsWith("serve.mjs:")
       || summary.startsWith("dashboard.mjs:")
       || summary.startsWith("status.mjs:")
+      || summary.startsWith("smoke-a.mjs:")
+      || summary.startsWith("node-todo/app.js:")
     ).length,
-    6
+    8
   );
   assert.equal(
-    sevenToolStepResult.toolSummaries.some((summary) => summary.startsWith("console.mjs:")),
+    nineToolStepResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:")),
     false,
-    "expected seventh tool request to stop before execution"
+    "expected ninth tool request to stop before execution"
   );
 
   assert.ok(approvals.length >= 2, "expected at least two approvals to be auto-approved");
 
+  await verifyRepeatedIdenticalToolResultsAbortAsStalled();
+  await verifyBareCompletionReplyStillTriggersVerification();
+  await verifyRepeatedIdenticalAssistantRepliesAbortAsStalled();
   await verifyHelpCommandAvailableWhileBusy();
   await verifyResumeFollowUpAfterStop();
   await verifyBareContinueResumesInterruptedTask();
@@ -3497,6 +3715,312 @@ async function runAgentTask(input: {
     toolSummaries,
     runtimeErrors
   };
+}
+
+async function verifyRepeatedIdenticalToolResultsAbortAsStalled() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-repeated-tool-stall-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "stuck-report.mjs"), 'console.log("stuck");\n', "utf8");
+
+  class RepeatedToolStallProvider implements ProviderClient {
+    readonly name = "repeated-tool-stall-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "Fix stuck-report.mjs so running `node stuck-report.mjs` prints exactly `ready`. Verify it before finishing.";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "stuck-report.mjs",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        yield {
+          delta: toolCall("files", {
+            path: "stuck-report.mjs",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new RepeatedToolStallProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Fix stuck-report.mjs so running `node stuck-report.mjs` prints exactly `ready`. Verify it before finishing.",
+    expectedState: "failed"
+  });
+
+  assert.equal(
+    result.toolSummaries.filter((summary) => summary.startsWith("stuck-report.mjs:1-1")).length,
+    3,
+    "expected the runtime to allow one stalled retry prompt before aborting repeated identical file reads"
+  );
+  assert.ok(
+    result.runtimeErrors.some((message) => /Agent stalled after repeated identical files results/.test(message)),
+    "expected a repeated-tool stall runtime error"
+  );
+  assert.ok(
+    result.runtimeErrors.some((message) => /stuck-report\.mjs/.test(message)),
+    "expected the repeated-tool stall runtime error to identify the stuck file"
+  );
+}
+
+async function verifyBareCompletionReplyStillTriggersVerification() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-bare-completion-verify-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "app.config.json"), '{\n  "name": "SelfMe",\n  "port": 3000\n}\n', "utf8");
+  await writeFile(
+    join(workspace, "bare-verify-report.mjs"),
+    'import config from "./app.config.json" with { type: "json" };\nconsole.log(`${config.name}-${config.port}`);\n',
+    "utf8"
+  );
+
+  class BareCompletionVerificationProvider implements ProviderClient {
+    readonly name = "bare-completion-verification-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "Fix bare-verify-report.mjs so running `node bare-verify-report.mjs` prints exactly `SelfMe:3000`. Verify it before finishing.";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "app.config.json",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /app\.config\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "bare-verify-report.mjs",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /bare-verify-report\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "bare-verify-report.mjs",
+              startLine: 2,
+              endLine: 2,
+              replacement: 'console.log(`${config.name}:${config.port}`);'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /bare-verify-report\.mjs/.test(summary)) {
+          if (/Done\./.test(input.content)) {
+            yield {
+              delta: toolCall("shell", {
+                command: "node bare-verify-report.mjs"
+              })
+            };
+            return;
+          }
+
+          yield { delta: "Done." };
+          return;
+        }
+
+        if (toolName === "shell" && /node bare-verify-report\.mjs/.test(summary)) {
+          yield { delta: "Completed bare-verify-report.mjs and verified it prints exactly SelfMe:3000." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new BareCompletionVerificationProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  bus.on("approval.requested", (event) => {
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Fix bare-verify-report.mjs so running `node bare-verify-report.mjs` prints exactly `SelfMe:3000`. Verify it before finishing."
+  });
+
+  const finalContent = await readFile(join(workspace, "bare-verify-report.mjs"), "utf8");
+  assert.match(finalContent, /\$\{config\.name\}:\$\{config\.port\}/);
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node bare-verify-report.mjs · completed")),
+    "expected runtime to keep going into shell verification after a bare completion reply"
+  );
+  assert.match(result.assistantText, /SelfMe:3000/);
+}
+
+async function verifyRepeatedIdenticalAssistantRepliesAbortAsStalled() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-repeated-assistant-stall-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "app.config.json"), '{\n  "name": "SelfMe",\n  "port": 3000\n}\n', "utf8");
+  await writeFile(
+    join(workspace, "assistant-stall-report.mjs"),
+    'import config from "./app.conf.json" with { type: "json" };\nconsole.log(`${config.name}:${config.port}`);\n',
+    "utf8"
+  );
+
+  class RepeatedAssistantStallProvider implements ProviderClient {
+    readonly name = "repeated-assistant-stall-provider";
+    private stallReplyCount = 0;
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "Read app.config.json and fix assistant-stall-report.mjs so running `node assistant-stall-report.mjs` prints exactly `SelfMe:3000` on one line. Keep working until the output is exact.";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "app.config.json",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /app\.config\.json/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node assistant-stall-report.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /failed \(1\)/.test(summary)) {
+          this.stallReplyCount += 1;
+          yield {
+            delta: this.stallReplyCount % 2 === 1
+              ? "The failure is understood and the remaining repair is clear in assistant-stall-report.mjs."
+              : "Okay, the remaining repair is still clear in `assistant-stall-report.mjs`, and the failure is already understood."
+          };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new RepeatedAssistantStallProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Read app.config.json and fix assistant-stall-report.mjs so running `node assistant-stall-report.mjs` prints exactly `SelfMe:3000` on one line. Keep working until the output is exact.",
+    expectedState: "failed"
+  });
+
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node assistant-stall-report.mjs · failed (1)")),
+    "expected the stalled assistant-reply case to reach a real failed verification first"
+  );
+  assert.ok(
+    result.runtimeErrors.some((message) => /Agent stalled after repeated identical assistant replies/.test(message)),
+    "expected repeated identical assistant replies to fail fast with a stall error"
+  );
+  assert.equal(
+    result.runtimeErrors.some((message) => message.includes("Agent stopped after 96 assistant passes")),
+    false,
+    "expected repeated assistant stall to fail before the broad assistant-pass ceiling"
+  );
 }
 
 async function verifyHelpCommandAvailableWhileBusy() {
@@ -21777,6 +22301,14 @@ function resolveProviderResponse(content: string) {
     });
   }
 
+  if (content.startsWith("Read app.config.json and fix failure-summary-report.mjs")) {
+    return toolCall("files", {
+      path: "app.config.json",
+      startLine: 1,
+      endLine: 20
+    });
+  }
+
   if (content.startsWith("Read app.config.json and fix stubborn-proposal-report.mjs")) {
     return toolCall("files", {
       path: "app.config.json",
@@ -22103,6 +22635,77 @@ function resolveProviderResponse(content: string) {
     ].join("\n");
   }
 
+  if (content.startsWith("Tell me the current working directory one more time, and recover if your first shell tool call is malformed.")) {
+    return [
+      "Okay.",
+      "<tool_call>",
+      '{"tool":"shell","input":{"command":"pwd}'
+    ].join("\n");
+  }
+
+  if (content.startsWith("Tell me the current working directory yet again, and recover if your first tool name is wrong.")) {
+    return toolCall("shells", {
+      command: "pwd"
+    });
+  }
+
+  if (content.startsWith("Tell me the current working directory once again, and recover if your first shell tool input is invalid.")) {
+    return toolCall("shell", {});
+  }
+
+  if (content.startsWith("Tell me the current working directory again using a shell cmd alias payload.")) {
+    return [
+      "<tool_call>",
+      '{"tool":"shell","input":{"cmd":"pwd"}}',
+      "</tool_call>"
+    ].join("\n");
+  }
+
+  if (content.startsWith("Read greet.mjs line 1 and tell me what it prints.")) {
+    return [
+      "<tool_call>",
+      '{"tool":"files","path":"greet.mjs","startLine":"1","endLine":"1"}',
+      "</tool_call>"
+    ].join("\n");
+  }
+
+  if (content.startsWith("Read greet.mjs path-scoped line 1 and tell me what it prints.")) {
+    return [
+      "<tool_call>",
+      '{"tool":"files","path":"greet.mjs:1-1"}',
+      "</tool_call>"
+    ].join("\n");
+  }
+
+  if (content.startsWith('Change greet.mjs so it prints exactly "Loose".')) {
+    return [
+      "<tool_call>",
+      '{"tool":"edit","path":"greet.mjs","startLine":"1","endLine":"1","replacement":"console.log(\\"Loose\\");"}',
+      "</tool_call>"
+    ].join("\n");
+  }
+
+  if (content.startsWith('Change greet.mjs through aliased range fields so it prints exactly "Alias".')) {
+    return [
+      "<tool_call>",
+      '{"tool":"edit","path":"greet.mjs","start":"1","end":"1","replacement":"console.log(\\"Alias\\");"}',
+      "</tool_call>"
+    ].join("\n");
+  }
+
+  if (content.startsWith('Fix option-start-report.mjs so running `node option-start-report.mjs` prints exactly `ready`. Do the change directly and verify before finishing.')) {
+    return [
+      "I can handle this in three steps:",
+      "1. Read option-start-report.mjs to confirm the current output.",
+      "2. Patch the file so it prints exactly ready.",
+      "3. Run node option-start-report.mjs to verify the final output."
+    ].join("\n");
+  }
+
+  if (content.startsWith('Fix question-start-report.mjs so running `node question-start-report.mjs` prints exactly `ready`. Verify it before finishing.')) {
+    return "Should I inspect question-start-report.mjs first before changing anything?";
+  }
+
   if (content.startsWith("运行 sh -lc 'echo out; echo err 1>&2; exit 1'")) {
     return toolCall("shell", {
       command: "sh -lc 'echo out; echo err 1>&2; exit 1'"
@@ -22139,7 +22742,7 @@ function resolveProviderResponse(content: string) {
     });
   }
 
-  if (content.startsWith("Read app.config.json, greet.mjs, report.mjs, serve.mjs, dashboard.mjs, and status.mjs")) {
+  if (content.startsWith("Read app.config.json, greet.mjs, report.mjs, serve.mjs, dashboard.mjs, status.mjs, smoke-a.mjs, and node-todo/app.js")) {
     return toolCall("files", {
       path: "app.config.json",
       startLine: 1,
@@ -22147,7 +22750,7 @@ function resolveProviderResponse(content: string) {
     });
   }
 
-  if (content.startsWith("Read app.config.json, greet.mjs, report.mjs, serve.mjs, dashboard.mjs, status.mjs, and console.mjs")) {
+  if (content.startsWith("Read app.config.json, greet.mjs, report.mjs, serve.mjs, dashboard.mjs, status.mjs, smoke-a.mjs, node-todo/app.js, and node-todo/views/index.ejs")) {
     return toolCall("files", {
       path: "app.config.json",
       startLine: 1,
@@ -23182,6 +23785,52 @@ function resolveProviderResponse(content: string) {
     if (toolName === "edit" && /failure-question-report\.mjs/.test(summary)) {
       return toolCall("shell", {
         command: "node failure-question-report.mjs"
+      });
+    }
+  }
+
+  if (content.startsWith("Original user request: Read app.config.json and fix failure-summary-report.mjs")) {
+    const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
+    const summary = extractLine(content, "Summary:") ?? extractLine(content, "Latest summary:") ?? "";
+
+    if (toolName === "files" && /app\.config\.json/.test(summary)) {
+      return toolCall("shell", {
+        command: "node failure-summary-report.mjs"
+      });
+    }
+
+    if (toolName === "shell") {
+      if (/A single failed tool result does not complete this task\./.test(content)) {
+        return toolCall("files", {
+          path: "failure-summary-report.mjs",
+          startLine: 1,
+          endLine: 20
+        });
+      }
+
+      if (/The latest tool attempt failed\./.test(content)) {
+        return "The failure summary is complete: the command failed with a bad config import path, and the remaining repair is at the latest failure point in failure-summary-report.mjs.";
+      }
+
+      assert.match(content, /SelfMe:3000/);
+      return "Repaired failure-summary-report.mjs and confirmed it now prints exactly SelfMe:3000.";
+    }
+
+    if (toolName === "files" && /failure-summary-report\.mjs/.test(summary)) {
+      return toolCall("edit", {
+        path: "failure-summary-report.mjs",
+        startLine: 1,
+        endLine: 2,
+        replacement: [
+          'import config from "./app.config.json" with { type: "json" };',
+          'console.log(`${config.name}:${config.port}`);'
+        ].join("\n")
+      });
+    }
+
+    if (toolName === "edit" && /failure-summary-report\.mjs/.test(summary)) {
+      return toolCall("shell", {
+        command: "node failure-summary-report.mjs"
       });
     }
   }
@@ -24300,6 +24949,8 @@ function resolveProviderResponse(content: string) {
     if (toolName === "edit" && /premature-edit-report\.mjs/.test(summary)) {
       if (
         /The latest tool result does not satisfy the task yet/.test(content)
+        || /Continue the task instead of ending on explanation alone\./.test(content)
+        || /Take the next concrete step that moves the task forward\./.test(content)
         || /Your previous assistant message was only a progress update, not a completed result\./.test(content)
         || /Do not stop until the original request is actually completed\./.test(content)
         || /Preferred next action: .*rerun the established verification command/i.test(content)
@@ -25996,6 +26647,146 @@ function resolveProviderResponse(content: string) {
     return "The current working directory is the active workspace.";
   }
 
+  if (content.startsWith("Original user request: Tell me the current working directory one more time, and recover if your first shell tool call is malformed.")) {
+    if (/Malformed tool call preview:/i.test(content)) {
+      return toolCall("shell", {
+        command: "pwd"
+      });
+    }
+
+    assert.match(content, /Tool: shell/);
+    assert.match(content, /pwd/);
+    return "The working directory is the current workspace root.";
+  }
+
+  if (content.startsWith("Original user request: Tell me the current working directory yet again, and recover if your first tool name is wrong.")) {
+    if (/unknown tool/i.test(content) || /available tools are:/i.test(content)) {
+      return toolCall("shell", {
+        command: "pwd"
+      });
+    }
+
+    assert.match(content, /Tool: shell/);
+    assert.match(content, /pwd/);
+    return "The working directory is the current workspace root.";
+  }
+
+  if (content.startsWith("Original user request: Tell me the current working directory once again, and recover if your first shell tool input is invalid.")) {
+    if (/Validation error:/i.test(content) || /input was invalid/i.test(content)) {
+      return toolCall("shell", {
+        command: "pwd"
+      });
+    }
+
+    assert.match(content, /Tool: shell/);
+    assert.match(content, /pwd/);
+    return "The working directory is the current workspace root.";
+  }
+
+  if (content.startsWith("Original user request: Tell me the current working directory again using a shell cmd alias payload.")) {
+    assert.match(content, /Tool: shell/);
+    assert.match(content, /Summary: pwd · completed/);
+    return "The working directory is the current workspace root.";
+  }
+
+  if (content.startsWith("Original user request: Read greet.mjs line 1 and tell me what it prints.")) {
+    assert.match(content, /Tool: files/);
+    assert.match(content, /Summary: greet\.mjs:1-1/);
+    assert.match(content, /Hello/i);
+    return 'greet.mjs prints "Hello".';
+  }
+
+  if (content.startsWith("Original user request: Read greet.mjs path-scoped line 1 and tell me what it prints.")) {
+    assert.match(content, /Tool: files/);
+    assert.match(content, /Summary: greet\.mjs:1-1/);
+    assert.match(content, /Hello/i);
+    return 'greet.mjs prints "Hello".';
+  }
+
+  if (content.startsWith('Original user request: Change greet.mjs so it prints exactly "Loose".')) {
+    if (/Tool: edit/i.test(content)) {
+      assert.match(content, /Summary: greet\.mjs:1-1 · updated/);
+      return 'Updated greet.mjs so it now prints exactly "Loose".';
+    }
+
+    return 'Updated greet.mjs so it now prints exactly "Loose".';
+  }
+
+  if (content.startsWith('Original user request: Change greet.mjs through aliased range fields so it prints exactly "Alias".')) {
+    assert.match(content, /Tool: edit/);
+    assert.match(content, /Summary: greet\.mjs:1-1 · updated/);
+    return 'Updated greet.mjs so it now prints exactly "Alias".';
+  }
+
+  if (content.startsWith('Original user request: Fix option-start-report.mjs so running `node option-start-report.mjs` prints exactly `ready`. Do the change directly and verify before finishing.')) {
+    const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
+    const summary = extractLine(content, "Summary:") ?? extractLine(content, "Latest summary:") ?? "";
+
+    if (!toolName) {
+      assert.match(content, /For actionable requests, do the work now instead of describing what you will do\./);
+      return toolCall("files", {
+        path: "option-start-report.mjs",
+        startLine: 1,
+        endLine: 20
+      });
+    }
+
+    if (toolName === "files" && /option-start-report\.mjs/.test(summary)) {
+      return toolCall("edit", {
+        path: "option-start-report.mjs",
+        startLine: 1,
+        endLine: 1,
+        replacement: 'console.log("ready");'
+      });
+    }
+
+    if (toolName === "edit" && /option-start-report\.mjs/.test(summary)) {
+      return toolCall("shell", {
+        command: "node option-start-report.mjs"
+      });
+    }
+
+    assert.match(content, /Tool: shell/);
+    assert.match(content, /Summary: node option-start-report\.mjs · completed/);
+    assert.match(content, /ready/);
+    return "Fixed option-start-report.mjs and verified it now prints exactly ready.";
+  }
+
+  if (content.startsWith('Original user request: Fix question-start-report.mjs so running `node question-start-report.mjs` prints exactly `ready`. Verify it before finishing.')) {
+    const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
+    const summary = extractLine(content, "Summary:") ?? extractLine(content, "Latest summary:") ?? "";
+
+    if (!toolName) {
+      assert.match(content, /For actionable requests, do the work now instead of describing what you will do\./);
+      assert.match(content, /Do not ask for permission to begin unless the user explicitly asked for discussion first\./);
+      return toolCall("files", {
+        path: "question-start-report.mjs",
+        startLine: 1,
+        endLine: 20
+      });
+    }
+
+    if (toolName === "files" && /question-start-report\.mjs/.test(summary)) {
+      return toolCall("edit", {
+        path: "question-start-report.mjs",
+        startLine: 1,
+        endLine: 1,
+        replacement: 'console.log("ready");'
+      });
+    }
+
+    if (toolName === "edit" && /question-start-report\.mjs/.test(summary)) {
+      return toolCall("shell", {
+        command: "node question-start-report.mjs"
+      });
+    }
+
+    assert.match(content, /Tool: shell/);
+    assert.match(content, /Summary: node question-start-report\.mjs · completed/);
+    assert.match(content, /ready/);
+    return "Fixed question-start-report.mjs and verified it now prints exactly ready.";
+  }
+
   if (content.startsWith("Original user request: Tell me the current working directory by running pwd.")) {
     assert.match(content, /Tool: shell/);
     assert.match(content, /pwd/);
@@ -26023,7 +26814,7 @@ function resolveProviderResponse(content: string) {
     return "I couldn't run rm greet.mjs because the shell action was denied.";
   }
 
-  if (content.startsWith("Original user request: Read app.config.json, greet.mjs, report.mjs, serve.mjs, dashboard.mjs, and status.mjs")) {
+  if (content.startsWith("Original user request: Read app.config.json, greet.mjs, report.mjs, serve.mjs, dashboard.mjs, status.mjs, smoke-a.mjs, and node-todo/app.js")) {
     const toolName = extractLine(content, "Tool:");
     const summary = extractLine(content, "Summary:") ?? "";
 
@@ -26068,11 +26859,27 @@ function resolveProviderResponse(content: string) {
     }
 
     if (toolName === "files" && /status\.mjs/.test(summary)) {
-      return "FINAL-SIX-STEPS";
+      return toolCall("files", {
+        path: "smoke-a.mjs",
+        startLine: 1,
+        endLine: 20
+      });
+    }
+
+    if (toolName === "files" && /smoke-a\.mjs/.test(summary)) {
+      return toolCall("files", {
+        path: "node-todo/app.js",
+        startLine: 1,
+        endLine: 20
+      });
+    }
+
+    if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+      return "FINAL-EIGHT-STEPS";
     }
   }
 
-  if (content.startsWith("Original user request: Read app.config.json, greet.mjs, report.mjs, serve.mjs, dashboard.mjs, status.mjs, and console.mjs")) {
+  if (content.startsWith("Original user request: Read app.config.json, greet.mjs, report.mjs, serve.mjs, dashboard.mjs, status.mjs, smoke-a.mjs, node-todo/app.js, and node-todo/views/index.ejs")) {
     const toolName = extractLine(content, "Tool:");
     const summary = extractLine(content, "Summary:") ?? "";
 
@@ -26118,7 +26925,23 @@ function resolveProviderResponse(content: string) {
 
     if (toolName === "files" && /status\.mjs/.test(summary)) {
       return toolCall("files", {
-        path: "console.mjs",
+        path: "smoke-a.mjs",
+        startLine: 1,
+        endLine: 20
+      });
+    }
+
+    if (toolName === "files" && /smoke-a\.mjs/.test(summary)) {
+      return toolCall("files", {
+        path: "node-todo/app.js",
+        startLine: 1,
+        endLine: 20
+      });
+    }
+
+    if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+      return toolCall("files", {
+        path: "node-todo/views/index.ejs",
         startLine: 1,
         endLine: 20
       });

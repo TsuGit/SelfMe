@@ -29,9 +29,16 @@ import {
 } from "./events.js";
 import { extractExpectedOutputFromTaskRequest } from "./task-intent.js";
 
-const STANDARD_AGENT_TOOL_STEPS = 6;
-const EXTENDED_AGENT_TOOL_STEPS = 12;
+const STANDARD_AGENT_TOOL_STEPS = 8;
+const EXTENDED_AGENT_TOOL_STEPS = 16;
+const VERIFICATION_AGENT_TOOL_STEPS = 24;
+const PROJECT_AGENT_TOOL_STEPS = 32;
 const ASSISTANT_PASS_MULTIPLIER = 4;
+const MAX_REPEATED_IDENTICAL_TOOL_RESULTS = 2;
+const MAX_REPEATED_IDENTICAL_ASSISTANT_MESSAGES = 2;
+const MAX_MALFORMED_TOOL_CALL_RETRIES = 1;
+const MAX_UNKNOWN_TOOL_RETRIES = 1;
+const MAX_INVALID_TOOL_INPUT_RETRIES = 1;
 const TOOL_CALL_OPEN = "<tool_call>";
 const TOOL_CALL_CLOSE = "</tool_call>";
 const TOOL_CALL_DENIED_PROMPT = "The requested tool action was denied by the user. Continue without that action. If you can still help, answer directly. If another tool is needed, return exactly one tool call block.";
@@ -577,6 +584,11 @@ export class AgentRuntime {
     let lastToolResult: RuntimeToolResult | undefined;
     let lastAssistantMessageSignature: string | undefined;
     let repeatedAssistantMessageCount = 0;
+    let lastAssistantLoopSignature: string | undefined;
+    let repeatedAssistantLoopCount = 0;
+    let malformedToolCallRetryCount = 0;
+    let unknownToolRetryCount = 0;
+    let invalidToolInputRetryCount = 0;
     const activeRun = this.startActiveRun(sessionId, responseTaskId);
     this.taskOriginalRequests.set(responseTaskId, originalRequest);
     this.taskKnownPaths.set(responseTaskId, new Set(extractWritableTaskPaths(originalRequest)));
@@ -606,7 +618,26 @@ export class AgentRuntime {
           signal: activeRun.controller.signal
         });
 
+        if (assistantPass.kind === "malformed_tool_call") {
+          malformedToolCallRetryCount += 1;
+
+          if (malformedToolCallRetryCount > MAX_MALFORMED_TOOL_CALL_RETRIES) {
+            throw new Error(`Model emitted a malformed tool call: ${createMalformedToolCallPreview(assistantPass.rawBuffer)}`);
+          }
+
+          nextPrompt = buildMalformedToolCallRepairPrompt(
+            originalRequest,
+            assistantPass.rawBuffer,
+            preferredLanguage
+          );
+          continue;
+        }
+
+        malformedToolCallRetryCount = 0;
+
         if (assistantPass.kind === "message") {
+          unknownToolRetryCount = 0;
+          invalidToolInputRetryCount = 0;
           if (
             !assistantPass.messageText.trim()
             && lastToolResult
@@ -630,6 +661,11 @@ export class AgentRuntime {
             ? repeatedAssistantMessageCount + 1
             : 0;
           lastAssistantMessageSignature = assistantMessageSignature;
+          const assistantLoopSignature = createAssistantLoopSignature(assistantPass.messageText) ?? "__empty__";
+          repeatedAssistantLoopCount = assistantLoopSignature === lastAssistantLoopSignature
+            ? repeatedAssistantLoopCount + 1
+            : 0;
+          lastAssistantLoopSignature = assistantLoopSignature;
 
           const messageStep = await this.processAssistantMessagePass({
             sessionId,
@@ -658,7 +694,58 @@ export class AgentRuntime {
             return;
           }
 
+          if (
+            shouldAbortForRepeatedAssistantStall({
+              originalRequest,
+              repeatedAssistantMessageCount: repeatedAssistantLoopCount,
+              assistantMessage: assistantPass.messageText,
+              latestToolResult: lastToolResult
+            })
+          ) {
+            throw new Error(buildRepeatedAssistantStallError(assistantPass.messageText));
+          }
+
           nextPrompt = messageStep.nextPrompt;
+          continue;
+        }
+
+        const requestedTool = this.input.tools.get(assistantPass.toolCall.tool);
+
+        if (!requestedTool) {
+          unknownToolRetryCount += 1;
+
+          if (unknownToolRetryCount > MAX_UNKNOWN_TOOL_RETRIES) {
+            throw new Error(`Unknown tool requested by model: ${assistantPass.toolCall.tool}`);
+          }
+
+          nextPrompt = buildUnknownToolRepairPrompt(
+            originalRequest,
+            assistantPass.toolCall.tool,
+            this.input.tools.list().map((tool) => tool.name),
+            preferredLanguage
+          );
+          continue;
+        }
+
+        unknownToolRetryCount = 0;
+        let validatedToolInput: unknown;
+
+        try {
+          validatedToolInput = parseToolInput(requestedTool, assistantPass.toolCall.input);
+          invalidToolInputRetryCount = 0;
+        } catch (error) {
+          invalidToolInputRetryCount += 1;
+
+          if (invalidToolInputRetryCount > MAX_INVALID_TOOL_INPUT_RETRIES) {
+            throw error;
+          }
+
+          nextPrompt = buildInvalidToolInputRepairPrompt(
+            originalRequest,
+            requestedTool.name,
+            error,
+            preferredLanguage
+          );
           continue;
         }
 
@@ -673,7 +760,9 @@ export class AgentRuntime {
           taskId: responseTaskId,
           originalRequest,
           preferredLanguage,
+          tool: requestedTool,
           toolCall: assistantPass.toolCall,
+          toolInput: validatedToolInput,
           previousToolResult: lastToolResult,
           previousRepeatedToolResultCount: repeatedToolResultCount,
           signal: activeRun.controller.signal
@@ -690,6 +779,17 @@ export class AgentRuntime {
             directAnswer: toolStep.directAnswer
           });
           return;
+        }
+
+        if (
+          lastToolResult
+          && shouldAbortForRepeatedToolStall({
+            originalRequest,
+            repeatedToolResultCount,
+            latestToolResult: lastToolResult
+          })
+        ) {
+          throw new Error(buildRepeatedToolStallError(lastToolResult));
         }
 
         nextPrompt = toolStep.nextPrompt;
@@ -955,7 +1055,9 @@ export class AgentRuntime {
     taskId: string;
     originalRequest: string;
     preferredLanguage: PreferredReplyLanguage;
+    tool: ToolImplementation;
     toolCall: ParsedAssistantToolCall;
+    toolInput: unknown;
     previousToolResult?: RuntimeToolResult;
     previousRepeatedToolResultCount: number;
     signal: AbortSignal;
@@ -979,18 +1081,11 @@ export class AgentRuntime {
       };
     }
 
-    const tool = this.input.tools.get(input.toolCall.tool);
-
-    if (!tool) {
-      throw new Error(`Unknown tool requested by model: ${input.toolCall.tool}`);
-    }
-
-    const toolInput = parseToolInput(tool, input.toolCall.input);
     const toolTaskResult = await this.requestToolFromAssistant({
       sessionId: input.sessionId,
       rootTaskId: input.taskId,
-      tool,
-      input: toolInput,
+      tool: input.tool,
+      input: input.toolInput,
       signal: input.signal
     });
 
@@ -1148,7 +1243,10 @@ export class AgentRuntime {
 
     if (!parsedToolCall) {
       if (looksLikeToolCallBuffer(buffer)) {
-        throw new Error(`Model emitted a malformed tool call: ${createMalformedToolCallPreview(buffer)}`);
+        return {
+          kind: "malformed_tool_call" as const,
+          rawBuffer: buffer
+        };
       }
 
       const sanitizedMessage = sanitizeAssistantMessageForRuntime(input.content, buffer);
@@ -2447,6 +2545,70 @@ function buildFollowUpReplyTighteningPrompt(
   pushRawOutputSection(lines, input.rawOutput);
 
   return lines.join("\n");
+}
+
+function buildMalformedToolCallRepairPrompt(
+  originalRequest: string,
+  rawBuffer: string,
+  preferredLanguage: PreferredReplyLanguage
+) {
+  return [
+    `Original user request: ${originalRequest}`,
+    preferredLanguage === "zh"
+      ? "你上一条回复尝试调用工具，但 tool call 格式损坏了。"
+      : "Your previous reply attempted to call a tool, but the tool call payload was malformed.",
+    preferredLanguage === "zh"
+      ? "如果仍然需要工具，立即只返回一个合法的 <tool_call> JSON 块。"
+      : "If a tool is still needed, immediately return exactly one valid <tool_call> JSON block.",
+    preferredLanguage === "zh"
+      ? "如果不需要工具，就直接简短回答。不要附加多余说明。"
+      : "If no tool is needed, answer directly and briefly. Do not include extra commentary.",
+    `Malformed tool call preview: ${createMalformedToolCallPreview(rawBuffer)}`
+  ].join("\n");
+}
+
+function buildUnknownToolRepairPrompt(
+  originalRequest: string,
+  toolName: string,
+  availableTools: string[],
+  preferredLanguage: PreferredReplyLanguage
+) {
+  return [
+    `Original user request: ${originalRequest}`,
+    preferredLanguage === "zh"
+      ? `你上一条回复请求了不存在的工具：${toolName}。`
+      : `Your previous reply requested an unknown tool: ${toolName}.`,
+    preferredLanguage === "zh"
+      ? `可用工具只有：${availableTools.join(", ")}。`
+      : `The only available tools are: ${availableTools.join(", ")}.`,
+    preferredLanguage === "zh"
+      ? "如果仍然需要工具，立即只返回一个合法的 <tool_call> JSON 块，并使用可用工具名。"
+      : "If a tool is still needed, immediately return exactly one valid <tool_call> JSON block using one of those tool names.",
+    preferredLanguage === "zh"
+      ? "如果不需要工具，就直接简短回答。不要附加多余说明。"
+      : "If no tool is needed, answer directly and briefly. Do not include extra commentary."
+  ].join("\n");
+}
+
+function buildInvalidToolInputRepairPrompt(
+  originalRequest: string,
+  toolName: string,
+  error: unknown,
+  preferredLanguage: PreferredReplyLanguage
+) {
+  return [
+    `Original user request: ${originalRequest}`,
+    preferredLanguage === "zh"
+      ? `你上一条回复调用了工具 ${toolName}，但输入参数不合法。`
+      : `Your previous reply called the ${toolName} tool, but its input was invalid.`,
+    `Validation error: ${formatDirectCommandInputError(toolName, error)}`,
+    preferredLanguage === "zh"
+      ? "如果仍然需要工具，立即只返回一个合法的 <tool_call> JSON 块，并修正输入字段。"
+      : "If a tool is still needed, immediately return exactly one valid <tool_call> JSON block with corrected input fields.",
+    preferredLanguage === "zh"
+      ? "如果不需要工具，就直接简短回答。不要附加多余说明。"
+      : "If no tool is needed, answer directly and briefly. Do not include extra commentary."
+  ].join("\n");
 }
 
 function buildDeniedContinuationPrompt(originalRequest: string, preferredLanguage: PreferredReplyLanguage) {
@@ -4966,6 +5128,7 @@ function shouldForceFailureRecovery(originalRequest: string, assistantMessage: s
   }
 
   return !looksLikeCompletionReply(assistantMessage)
+    || looksLikeFailureSummarizingCompletionReply(assistantMessage)
     || looksLikeStageSummaryWithPendingWork(assistantMessage)
     || looksLikeCompletionToneWithPendingWork(assistantMessage);
 }
@@ -5116,6 +5279,9 @@ function shouldForceExecutionConvergence(originalRequest: string, assistantMessa
     && !looksLikeCompletionToneWithPendingWork(assistantMessage)
     && !looksLikeAssistantProposal(assistantMessage)
     && !looksLikeBlockingQuestion(assistantMessage)
+    && !looksLikeVerificationRequest(originalRequest)
+    && !looksLikeExactOutputRequest(originalRequest)
+    && !looksLikeMultiTargetMutationTask(originalRequest)
   ) {
     return false;
   }
@@ -5463,6 +5629,20 @@ function shouldForceInitialTaskStart(originalRequest: string, assistantMessage: 
     return false;
   }
 
+  const explicitTargets = extractExplicitFileTargets(originalRequest);
+
+  if (
+    explicitTargets.length > 0
+    && looksLikeBlockingQuestion(assistantMessage)
+    && !looksLikeUserInputBlockingQuestion(assistantMessage)
+  ) {
+    return true;
+  }
+
+  if (looksLikeAssistantProposal(assistantMessage) && !looksLikeBlockingQuestion(assistantMessage)) {
+    return true;
+  }
+
   if (looksLikeProgressOnlyAssistantReply(assistantMessage)) {
     return true;
   }
@@ -5568,10 +5748,114 @@ function buildToolResultSignature(input: {
   ].join("\n---\n");
 }
 
+function shouldAbortForRepeatedToolStall(input: {
+  originalRequest: string;
+  repeatedToolResultCount: number;
+  latestToolResult: {
+    toolName: string;
+    summary: string;
+    rawOutput?: string;
+    errorMessage?: string;
+  };
+}) {
+  if (input.repeatedToolResultCount < MAX_REPEATED_IDENTICAL_TOOL_RESULTS) {
+    return false;
+  }
+
+  if (
+    !looksLikeLongRunningTask(input.originalRequest)
+    && !looksLikeExecutionTask(input.originalRequest)
+    && !looksLikeProjectInspectionRequest(input.originalRequest)
+  ) {
+    return false;
+  }
+
+  if (isLatestToolResultTaskTerminal(input.originalRequest, input.latestToolResult)) {
+    return false;
+  }
+
+  return true;
+}
+
+function buildRepeatedToolStallError(latestToolResult: {
+  toolName: string;
+  summary: string;
+}) {
+  const location = extractPathFromToolSummary(latestToolResult.summary)
+    || extractShellCommandFromSummary(latestToolResult.summary)
+    || latestToolResult.summary;
+
+  return `Agent stalled after repeated identical ${latestToolResult.toolName} results${location ? ` (${location})` : ""}`;
+}
+
+function shouldAbortForRepeatedAssistantStall(input: {
+  originalRequest: string;
+  repeatedAssistantMessageCount: number;
+  assistantMessage: string;
+  latestToolResult?: {
+    toolName: string;
+    summary: string;
+    rawOutput?: string;
+    errorMessage?: string;
+  };
+}) {
+  if (input.repeatedAssistantMessageCount < MAX_REPEATED_IDENTICAL_ASSISTANT_MESSAGES) {
+    return false;
+  }
+
+  if (
+    !looksLikeLongRunningTask(input.originalRequest)
+    && !looksLikeExecutionTask(input.originalRequest)
+    && !looksLikeProjectInspectionRequest(input.originalRequest)
+  ) {
+    return false;
+  }
+
+  if (looksLikeBlockingQuestion(input.assistantMessage)) {
+    return false;
+  }
+
+  if (input.latestToolResult && isLatestToolResultTaskTerminal(input.originalRequest, input.latestToolResult)) {
+    return false;
+  }
+
+  return true;
+}
+
+function buildRepeatedAssistantStallError(assistantMessage: string) {
+  const normalized = assistantMessage.trim().replace(/\s+/g, " ");
+  const preview = normalized.length > 96 ? `${normalized.slice(0, 93)}...` : normalized;
+  return `Agent stalled after repeated identical assistant replies${preview ? ` (${preview})` : ""}`;
+}
+
 function getAgentToolStepBudget(content: string) {
-  return looksLikeExtendedCodingTask(content)
-    ? EXTENDED_AGENT_TOOL_STEPS
-    : STANDARD_AGENT_TOOL_STEPS;
+  const taskContent = extractEmbeddedTaskContent(content);
+
+  if (looksLikeDiscussionRequest(taskContent)) {
+    return STANDARD_AGENT_TOOL_STEPS;
+  }
+
+  if (looksLikeBroadProjectImprovementRequest(taskContent) || looksLikeExecutableProjectRewriteRequest(taskContent)) {
+    return PROJECT_AGENT_TOOL_STEPS;
+  }
+
+  if (
+    looksLikeVerificationRequest(taskContent)
+    || looksLikeExactOutputRequest(taskContent)
+    || looksLikeMultiTargetMutationTask(taskContent)
+  ) {
+    return VERIFICATION_AGENT_TOOL_STEPS;
+  }
+
+  if (
+    looksLikeExtendedCodingTask(taskContent)
+    || looksLikeProjectInspectionRequest(taskContent)
+    || looksLikeLongRunningTask(taskContent)
+  ) {
+    return EXTENDED_AGENT_TOOL_STEPS;
+  }
+
+  return STANDARD_AGENT_TOOL_STEPS;
 }
 
 function hasMutationIntent(content: string) {
@@ -6175,6 +6459,21 @@ function looksLikeCompletionToneWithPendingWork(content: string) {
     || /(还需要|仍需|还要|还得|剩下|余下|还不能|在验证成功之前|在重新运行之前|还需修|还没法完成)/u.test(normalized);
 }
 
+function looksLikeFailureSummarizingCompletionReply(content: string) {
+  const normalized = content.trim();
+
+  if (!normalized || containsToolCallMarkup(normalized) || !looksLikeCompletionReply(normalized)) {
+    return false;
+  }
+
+  const hasFailureCue = /\b(failed|failure|error|broken|crash|exception|exit code|module not found|still failing)\b/i.test(normalized)
+    || /(失败|错误|报错|坏了|崩溃|异常|退出码|找不到模块|仍然失败)/u.test(normalized);
+  const hasRecoveryCue = /\b(repair|fix|continue|retry|rerun|latest failure point|remaining issue)\b/i.test(normalized)
+    || /(修复|继续|重试|重新运行|最新失败点|剩余问题)/u.test(normalized);
+
+  return hasFailureCue && hasRecoveryCue;
+}
+
 function looksLikeLocalCompletionBeforeVerification(
   originalRequest: string,
   content: string,
@@ -6207,10 +6506,6 @@ function looksLikeLocalCompletionBeforeVerification(
   const expectedOutput = extractExpectedExactOutput(originalRequest)?.toLowerCase();
   const verificationCommand = extractVerificationCommandFromTaskRequest(originalRequest)?.toLowerCase();
 
-  if (!normalized.includes(latestPath.toLowerCase())) {
-    return false;
-  }
-
   if (expectedOutput && normalized.includes(expectedOutput)) {
     return false;
   }
@@ -6219,7 +6514,16 @@ function looksLikeLocalCompletionBeforeVerification(
     return false;
   }
 
-  return true;
+  if (normalized.includes(latestPath.toLowerCase())) {
+    return true;
+  }
+
+  return (latestToolResult.toolName === "edit" || latestToolResult.toolName === "write")
+    && normalized.length <= 160
+    && !looksLikeStageSummaryWithPendingWork(content)
+    && !looksLikeCompletionToneWithPendingWork(content)
+    && !looksLikeAssistantProposal(content)
+    && !looksLikeBlockingQuestion(content);
 }
 
 function looksLikeThinCompletionReply(
@@ -6479,6 +6783,40 @@ function createAssistantStageSignature(content: string) {
   return normalized || undefined;
 }
 
+function createAssistantLoopSignature(content: string) {
+  if (looksLikeFailureSummarizingCompletionReply(content)) {
+    return "__failure-summary__";
+  }
+
+  if (looksLikeStageSummaryWithPendingWork(content)) {
+    return "__stage-summary__";
+  }
+
+  if (looksLikeCompletionToneWithPendingWork(content)) {
+    return "__completion-pending__";
+  }
+
+  if (looksLikeAssistantProposal(content)) {
+    return "__proposal__";
+  }
+
+  if (looksLikeProgressOnlyAssistantReply(content)) {
+    return "__progress__";
+  }
+
+  const normalized = stripLowValueAcknowledgementPrefix(content)
+    .replace(/`[^`]+`/g, "`<code>`")
+    .replace(/"[^"\n]{1,120}"/g, "\"<quote>\"")
+    .replace(/'[^'\n]{1,120}'/g, "'<quote>'")
+    .replace(/\b[A-Za-z0-9_./-]+\.(?:tsx|json|mjs|cjs|ejs|html|css|js|ts|txt|md|csv)\b/g, "<path>")
+    .replace(/\bnode\s+[A-Za-z0-9_./-]+\.(?:mjs|cjs|js|ts)\b/gi, "node <path>")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+
+  return normalized || undefined;
+}
+
 function looksLikeLowValueAcknowledgementPrefix(content: string) {
   return stripLowValueAcknowledgementPrefix(content) !== content;
 }
@@ -6647,7 +6985,7 @@ function parseAssistantToolCall(content: string): ParsedAssistantToolCall | unde
 
   return {
     tool: parsed.tool.trim(),
-    input: derivedInput
+    input: normalizeParsedToolInput(parsed.tool.trim(), derivedInput)
   };
 }
 
@@ -6781,7 +7119,7 @@ function parseLooseAssistantToolCall(content: string): ParsedAssistantToolCall |
   }
 
   if (toolName === "shell") {
-    const command = extractLooseQuotedField(content, "command");
+    const command = extractLooseQuotedField(content, "command") ?? extractLooseQuotedField(content, "cmd");
 
     if (!command) {
       return undefined;
@@ -6792,6 +7130,46 @@ function parseLooseAssistantToolCall(content: string): ParsedAssistantToolCall |
       input: {
         command
       }
+    };
+  }
+
+  if (toolName === "files" || toolName === "edit" || toolName === "write") {
+    const path = extractLooseQuotedField(content, "path");
+
+    if (!path) {
+      return undefined;
+    }
+
+    const input: Record<string, unknown> = { path };
+    const startLine = extractLooseNumericField(content, "startLine");
+    const endLine = extractLooseNumericField(content, "endLine");
+    const maxBytes = extractLooseNumericField(content, "maxBytes");
+    const replacement = extractLooseQuotedField(content, "replacement");
+    const fileContent = extractLooseQuotedField(content, "content");
+
+    if (typeof startLine === "number") {
+      input.startLine = startLine;
+    }
+
+    if (typeof endLine === "number") {
+      input.endLine = endLine;
+    }
+
+    if (typeof maxBytes === "number") {
+      input.maxBytes = maxBytes;
+    }
+
+    if (typeof replacement === "string") {
+      input.replacement = replacement;
+    }
+
+    if (typeof fileContent === "string") {
+      input.content = fileContent;
+    }
+
+    return {
+      tool: toolName,
+      input
     };
   }
 
@@ -6808,6 +7186,93 @@ function extractLooseQuotedField(content: string, fieldName: string) {
   }
 
   return match[1].trim();
+}
+
+function extractLooseNumericField(content: string, fieldName: string) {
+  const escapedField = fieldName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = content.match(new RegExp(`"${escapedField}"\\s*:\\s*"?(-?\\d+)"?`, "i"));
+
+  if (!match?.[1]) {
+    return undefined;
+  }
+
+  const parsed = Number.parseInt(match[1], 10);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function normalizeParsedToolInput(toolName: string, input: unknown) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return input;
+  }
+
+  const record = { ...(input as Record<string, unknown>) };
+  normalizeFileStyleToolAliases(toolName, record);
+
+  if (toolName === "files" || toolName === "edit") {
+    coerceKnownNumericField(record, "startLine");
+    coerceKnownNumericField(record, "endLine");
+  }
+
+  if (toolName === "files") {
+    coerceKnownNumericField(record, "maxBytes");
+  }
+
+  normalizeFileStylePathRange(record);
+
+  return record;
+}
+
+function coerceKnownNumericField(record: Record<string, unknown>, fieldName: string) {
+  const value = record[fieldName];
+
+  if (typeof value !== "string" || !/^-?\d+$/.test(value.trim())) {
+    return;
+  }
+
+  const parsed = Number.parseInt(value.trim(), 10);
+
+  if (Number.isFinite(parsed)) {
+    record[fieldName] = parsed;
+  }
+}
+
+function normalizeFileStyleToolAliases(toolName: string, record: Record<string, unknown>) {
+  if (toolName === "shell") {
+    moveAliasField(record, "cmd", "command");
+    return;
+  }
+
+  if (toolName !== "files" && toolName !== "edit" && toolName !== "write") {
+    return;
+  }
+
+  moveAliasField(record, "start", "startLine");
+  moveAliasField(record, "end", "endLine");
+  moveAliasField(record, "max_bytes", "maxBytes");
+}
+
+function moveAliasField(record: Record<string, unknown>, from: string, to: string) {
+  if (!(from in record) || to in record) {
+    return;
+  }
+
+  record[to] = record[from];
+}
+
+function normalizeFileStylePathRange(record: Record<string, unknown>) {
+  if (typeof record.path !== "string" || "startLine" in record || "endLine" in record) {
+    return;
+  }
+
+  const match = record.path.match(/^(.*?):(\d+)(?:-(\d+))?$/);
+
+  if (!match) {
+    return;
+  }
+
+  record.path = match[1];
+  record.startLine = Number.parseInt(match[2], 10);
+  record.endLine = Number.parseInt(match[3] ?? match[2], 10);
 }
 
 function createMalformedToolCallPreview(content: string, maxLength = 220) {
