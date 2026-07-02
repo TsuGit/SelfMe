@@ -275,6 +275,20 @@ async function main() {
     "expected successful shell verification after repair"
   );
 
+  console.log("task: start tool-grounded execution after an initial fabricated direct answer");
+  const fabricatedDirectAnswerRecoveryResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Tell me the current working directory by running pwd, and recover if you first answer directly without running it."
+  });
+
+  assert.match(fabricatedDirectAnswerRecoveryResult.assistantText, /working directory|workspace/i);
+  assert.ok(
+    fabricatedDirectAnswerRecoveryResult.toolSummaries.some((summary) => summary.startsWith("pwd · completed")),
+    "expected fabricated direct-answer flow to recover by actually running pwd"
+  );
+
   console.log("task: complete multi-step file and shell chain");
   const approvalsBeforeMultiStepChain = approvals.length;
   const multiStepChainResult = await runAgentTask({
@@ -22635,6 +22649,10 @@ function resolveProviderResponse(content: string) {
     ].join("\n");
   }
 
+  if (content.startsWith("Tell me the current working directory by running pwd, and recover if you first answer directly without running it.")) {
+    return "The current working directory is the active workspace root.";
+  }
+
   if (content.startsWith("Tell me the current working directory one more time, and recover if your first shell tool call is malformed.")) {
     return [
       "Okay.",
@@ -26645,6 +26663,18 @@ function resolveProviderResponse(content: string) {
     assert.match(content, /Tool: shell/);
     assert.match(content, /Summary: pwd · completed/);
     return "The current working directory is the active workspace.";
+  }
+
+  if (content.startsWith("Original user request: Tell me the current working directory by running pwd, and recover if you first answer directly without running it.")) {
+    if (!/Tool: shell/.test(content)) {
+      assert.match(content, /For actionable requests, do the work now instead of describing what you will do\./);
+      return toolCall("shell", {
+        command: "pwd"
+      });
+    }
+
+    assert.match(content, /Summary: pwd · completed/);
+    return "The working directory is the current workspace root.";
   }
 
   if (content.startsWith("Original user request: Tell me the current working directory one more time, and recover if your first shell tool call is malformed.")) {

@@ -5629,6 +5629,13 @@ function shouldForceInitialTaskStart(originalRequest: string, assistantMessage: 
     return false;
   }
 
+  if (
+    requiresToolGroundedInitialExecution(originalRequest)
+    && !looksLikeUserInputBlockingQuestion(assistantMessage)
+  ) {
+    return true;
+  }
+
   const explicitTargets = extractExplicitFileTargets(originalRequest);
 
   if (
@@ -5656,6 +5663,40 @@ function shouldForceProposalNarrowing(originalRequest: string, assistantMessage:
   }
 
   return looksLikeBroadProposalReply(assistantMessage);
+}
+
+function requiresToolGroundedInitialExecution(content: string) {
+  const taskContent = extractEmbeddedTaskContent(content);
+
+  if (looksLikeDiscussionRequest(taskContent) || looksLikeNextStepProposalRequest(taskContent)) {
+    return false;
+  }
+
+  if (isDirectShellExecutionRequest(taskContent)) {
+    return true;
+  }
+
+  if (
+    looksLikeVerificationRequest(taskContent)
+    || looksLikeExactOutputRequest(taskContent)
+    || looksLikeProjectInspectionRequest(taskContent)
+    || looksLikeBroadProjectImprovementRequest(taskContent)
+    || looksLikeExecutableProjectRewriteRequest(taskContent)
+  ) {
+    return true;
+  }
+
+  if (extractExplicitFileTargets(taskContent).length > 0) {
+    return true;
+  }
+
+  if (hasMutationIntent(taskContent)) {
+    return true;
+  }
+
+  return /\b(read|list|run|running)\b/i.test(taskContent)
+    || /\bby running\b/i.test(taskContent)
+    || /(读取|列出|运行)/u.test(taskContent);
 }
 
 function shouldUseStalledContinuationPrompt(originalRequest: string, repeatedToolResultCount: number, latestToolResult: {
@@ -5925,7 +5966,11 @@ function looksLikeActionableTaskRequest(content: string) {
     return true;
   }
 
-  if (/\b(read|write|edit|fix|repair|create|inspect|run|verify|check|list|update|change|modify|improve|optimize|refactor)\b/i.test(taskContent)) {
+  if (/\b(read|write|edit|fix|repair|create|inspect|run|running|verify|check|list|update|change|modify|improve|optimize|refactor)\b/i.test(taskContent)) {
+    return true;
+  }
+
+  if (/\bby running\b/i.test(taskContent)) {
     return true;
   }
 
@@ -6856,6 +6901,10 @@ function looksLikeStandaloneShellCommand(content: string) {
   const trimmed = content.trim();
 
   if (!trimmed) {
+    return false;
+  }
+
+  if (/^[A-Z][A-Za-z0-9_-]*(?:\s|$)/.test(trimmed)) {
     return false;
   }
 
