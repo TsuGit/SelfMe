@@ -3349,6 +3349,7 @@ async function main() {
   await verifyResumeFollowUpInImplicitProjectStageSummaryChain();
   await verifyResumeFollowUpInImplicitGenericVerificationStageSummaryChain();
   await verifyResumeFollowUpInImplicitGenericVerificationCompletionToneChain();
+  await verifyProjectWordedRewriteInImplicitGenericVerificationCompletionToneChain();
   await verifyBareAffirmativeInImplicitGenericVerificationStageSummaryChain();
   await verifyVagueOptimizationInImplicitGenericVerificationStageSummaryChain();
   await verifyProjectWordedOptimizationInImplicitGenericVerificationStageSummaryChain();
@@ -14644,6 +14645,303 @@ async function verifyResumeFollowUpInImplicitGenericVerificationCompletionToneCh
     approvalCount,
     2,
     "expected one approval before interruption and one approval for the resumed implicit generic completion-tone edit"
+  );
+}
+
+async function verifyProjectWordedRewriteInImplicitGenericVerificationCompletionToneChain() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-implicit-generic-rewrite-completion-tone-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "package.json"),
+    '{\n  "name": "node-todo",\n  "version": "1.0.0",\n  "scripts": {\n    "start": "node app.js"\n  }\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const express = require("express");\nconst app = express();\nconst PORT = 3000;\napp.listen(PORT, () => {\n  console.log(`Todo app is running at http://localhost:${PORT}`);\n});\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<!DOCTYPE html>\n<form action="/add" method="post">\n  <input name="title" />\n</form>\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "verify-generic-rewrite-tone.mjs"),
+    [
+      'import { readFileSync } from "node:fs";',
+      'const app = readFileSync(new URL("./app.js", import.meta.url), "utf8");',
+      'const view = readFileSync(new URL("./views/index.ejs", import.meta.url), "utf8");',
+      'const appReady = /process\\.env\\.PORT/.test(app);',
+      'const viewReady = /maxlength="100"/.test(view);',
+      'if (appReady && viewReady) {',
+      '  console.log("ready");',
+      '} else if (appReady) {',
+      '  console.log("app-only");',
+      '} else if (viewReady) {',
+      '  console.log("view-only");',
+      '} else {',
+      '  console.log("not-ready");',
+      '}'
+    ].join("\n") + "\n",
+    "utf8"
+  );
+
+  class ResumeImplicitGenericRewriteCompletionToneProvider implements ProviderClient {
+    readonly name = "resume-implicit-generic-rewrite-completion-tone-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "看看项目，然后直接把 node-todo 重写到正确。你自己判断需要改什么，并运行 `node node-todo/verify-generic-rewrite-tone.mjs` 验证，直到它正确为止。";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "pwd && ls -la && find . -maxdepth 2 -type f | sed 's#^./##' | sort | head -200"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell") {
+          if (/You are in the middle of a concrete project inspection request\./.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/package.json",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+
+          if (/app-only/.test(input.content)) {
+            if (
+              /You are already inside the execution phase of a concrete task\./.test(input.content)
+              || /Pending next step target: node-todo\/views\/index\.ejs/.test(input.content)
+            ) {
+              yield {
+                delta: toolCall("files", {
+                  path: "node-todo/views/index.ejs",
+                  startLine: 1,
+                  endLine: 4
+                })
+              };
+              return;
+            }
+
+            yield {
+              delta: "node-todo/app.js is rewritten and verification now reaches app-only, but node-todo/views/index.ejs still needs maxlength=\"100\" before the rewrite can finish."
+            };
+            return;
+          }
+
+          assert.match(input.content, /ready/);
+          yield { delta: "Completed the implicit generic rewrite completion-tone chain and verified the project is now correct." };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 3,
+              endLine: 3,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-generic-rewrite-tone.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 3,
+              endLine: 3,
+              replacement: '  <input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-generic-rewrite-tone.mjs"
+            })
+          };
+          return;
+        }
+      }
+
+      if (input.content.startsWith('The user replied "帮我重写项目" and wants to continue the most recent unfinished task.')) {
+        assert.match(input.content, /Resume that task now instead of treating this as a broad rewrite follow-up\./);
+        assert.match(input.content, /Original task: 看看项目，然后直接把 node-todo 重写到正确/);
+        assert.match(input.content, /Recent editable working file: node-todo\/app\.js/);
+        assert.match(input.content, /Pending next step target: node-todo\/views\/index\.ejs/);
+        assert.match(input.content, /Latest tool in context: shell/);
+        assert.match(input.content, /Latest tool summary in context: node node-todo\/verify-generic-rewrite-tone\.mjs · completed/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/views/index.ejs",
+            startLine: 1,
+            endLine: 4
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith('Original user request: The user replied "帮我重写项目" and wants to continue the most recent unfinished task.')) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 3,
+              endLine: 3,
+              replacement: '  <input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node node-todo/verify-generic-rewrite-tone.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell") {
+          assert.match(input.content, /ready/);
+          yield { delta: "Completed the implicit generic rewrite completion-tone chain and verified the project is now correct." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ResumeImplicitGenericRewriteCompletionToneProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  let approvalCount = 0;
+  bus.on("approval.requested", (event) => {
+    approvalCount += 1;
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const originalPrompt = "看看项目，然后直接把 node-todo 重写到正确。你自己判断需要改什么，并运行 `node node-todo/verify-generic-rewrite-tone.mjs` 验证，直到它正确为止。";
+  const completionPromise = waitForAssistantTaskCompletion(bus, session.sessionId);
+  const firstVerifyPromise = waitForToolExecutionCompleted(bus, session.sessionId, (summary) => summary.startsWith("node node-todo/verify-generic-rewrite-tone.mjs · completed"));
+
+  bus.emit(createUserMessageSubmittedEvent({
+    sessionId: session.sessionId,
+    content: originalPrompt
+  }));
+
+  await firstVerifyPromise;
+  await waitForBusyPhase(bus, session.sessionId, "assistant");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  bus.emit(createRuntimeInterruptRequestedEvent({
+    sessionId: session.sessionId,
+    reason: "cancel"
+  }));
+
+  const cancelledTask = await completionPromise;
+  assert.equal(cancelledTask.payload.state, "cancelled");
+
+  const resumedResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "帮我重写项目"
+  });
+
+  const resumedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(resumedViewContent, /maxlength="100"/);
+  assert.match(resumedResult.assistantText, /correct|ready/i);
+  assert.doesNotMatch(resumedResult.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/package.json:1-")),
+    false,
+    "implicit generic rewrite completion-tone resume follow-up should not restart from package.json"
+  );
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-")),
+    false,
+    "implicit generic rewrite completion-tone resume follow-up should not reread app.js after the pending next target is already known"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-4")),
+    "implicit generic rewrite completion-tone resume follow-up should continue directly into the pending view read"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:3-3 · updated")),
+    "implicit generic rewrite completion-tone resume follow-up should complete the pending view edit"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node node-todo/verify-generic-rewrite-tone.mjs · completed")),
+    "implicit generic rewrite completion-tone resume follow-up should finish the generic verification after the resumed view edit"
+  );
+  assert.equal(
+    approvalCount,
+    2,
+    "expected one approval before interruption and one approval for the resumed implicit generic rewrite completion-tone edit"
   );
 }
 
