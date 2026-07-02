@@ -18,9 +18,9 @@ What is already real:
 
 What is still being hardened:
 
-- continuation behavior after stage summaries and progress-only replies
-- long multi-step project execution stability
-- full green status for `pnpm smoke:agent`
+- long multi-step project execution stability in live sessions
+- interrupted-task resume quality after real stop / approval edges
+- agent behavior that still feels too eager to explain instead of continuing work
 
 If you are reading this from GitHub, treat the repository as a serious WIP baseline rather than a finished agent product.
 
@@ -265,12 +265,13 @@ The current development checkpoint is:
 
 - npm CLI packaging is in place and published under `selfme`
 - terminal UX baseline is established enough to keep runtime work moving
+- `pnpm smoke:agent` is green on the current continuation / resume / multi-step baseline
 - the active work is still runtime hardening, not feature expansion
 
 The next runtime questions remain:
 
-- can it continue after stage summaries and progress-only replies?
-- can it finish long multi-step project tasks without stopping early?
-- can it drive `pnpm smoke:agent` to a stable green baseline?
+- can it keep that continuation behavior in real interactive sessions, not just smoke fixtures?
+- can it finish long multi-step project tasks without falling back to one-tool-one-stop behavior?
+- can interrupted tasks resume cleanly from the latest real execution point after stop / approval edges?
 
 If you are resuming work later, start from `docs/agent-cli-roadmap.html` first. That file is the canonical checkpoint for current product scope and next priorities.

@@ -197,7 +197,7 @@
         </div>
         <div class="rule">
           <strong>当前状态说明：</strong>
-          仓库已经具备可运行的 CLI、真实工具调用、审批链路和一批 runtime 回归，但当前仍处于持续收敛阶段；尤其是 stage summary / progress-only reply 之后的 continuation 行为还在打磨，<code>pnpm smoke:agent</code> 也还不是完全全绿状态。
+          仓库已经具备可运行的 CLI、真实工具调用、审批链路和一批 runtime 回归；stage summary / progress-only reply 之后的 continuation、resume 和多步骤执行基线已经进入回归保护，<code>pnpm smoke:agent</code> 当前是全绿状态。接下来的重点不再是补 smoke 闭环本身，而是把这套收敛能力继续压实到真实交互场景里。
         </div>
       </section>
 
@@ -245,7 +245,7 @@
           </article>
           <article class="card">
             <h3>Project Inspection</h3>
-            <p>像“看看项目”这类请求，agent 现在会在目录 listing 之后优先继续读取最像项目入口的 <code>package.json</code>、<code>README</code> 或主源文件，而不是停在泛泛追问；如果用户明确要看“整个项目”而不是只看入口，runtime 也会在读完项目入口后继续下钻到核心实现文件，而不是停在 <code>package.json</code> 层就收口；如果用户语义已经带有“帮我优化下”这类改造意图，读到项目入口后还会继续落到更像工作对象的实现文件，而不是停在“下一步我可以看 app.js”这种半路说明；如果同一轮请求里已经明确点了多个具体文件，runtime 也会在第一处成功改动后继续推进到下一处具体文件，而不是把“我下一步会继续改 views”这种阶段性说明误当成最终完成；如果用户先看完项目、下一句才单独说“帮我优化下”或“你能帮我重新写个项目吗”，runtime 也会优先锚到最近刚 inspected 的项目/文件上下文，而不是把它当成完全无锚点的新问题；如果前一轮 assistant 已经给出明确的项目级 rewrite proposal，后面再来一句宽泛的“重新写个项目”，runtime 也会直接执行那套跨文件 proposal，而不是缩水成单文件试探；如果前一轮 assistant 已经给出明确的项目级 optimize proposal，后面再来一句宽泛的“帮我优化下”，runtime 也会继续落回那条项目级执行上下文，而不是退回泛化建议；如果普通项目执行链本身已经跑到一半又被 stop，后续一句宽泛的“帮我优化下”或“帮我看看”，现在也会优先恢复那条中断执行链，而不是重新回到 listing、package 或泛化分析；如果这套 rewrite proposal 本身还带有 verify / exact-output 约束，后续宽 follow-up 也会继续把整条改动和验证链跑完，而不是只把 proposal 执行到 edit 阶段就停住；如果这套 rewrite proposal 已经实际执行到一半又被 stop，后续 bare `可以`、宽泛的“重新写个项目”，以及对应的 optimize / inspect follow-up，runtime 也会优先恢复那条已经开跑的执行链，而不是回到 proposal 起点重读和重改前半段；如果用户先要 rewrite 方案、后面再用一句“可以”批准，runtime 也会把这句批准绑定回刚才的项目级提议并直接开始跨文件执行，而不是重新回到只读或解释态；如果最近已经有明确的 editable working file，宽 follow-up 会优先直接回到这个文件，而不是倒退去重读更宽的项目入口；这条锚点策略现在不仅覆盖优化类 follow-up，也覆盖“帮我看看 / 看看这个”这类 inspect follow-up。</p>
+            <p>像“看看项目”这类请求，agent 现在会在目录 listing 之后优先继续读取最像项目入口的 <code>package.json</code>、<code>README</code> 或主源文件，而不是停在泛泛追问；如果用户明确要看“整个项目”而不是只看入口，runtime 也会在读完项目入口后继续下钻到核心实现文件，而且不会在第一个入口实现文件就急着收口；如果用户语义已经带有“帮我优化下”这类改造意图，读到项目入口后还会继续落到更像工作对象的实现文件，而不是停在“下一步我可以看 app.js”这种半路说明；如果同一轮请求里已经明确点了多个具体文件，runtime 也会在第一处成功改动后继续推进到下一处具体文件，而不是把“我下一步会继续改 views”这种阶段性说明误当成最终完成；如果用户先看完项目、下一句才单独说“帮我优化下”或“你能帮我重新写个项目吗”，runtime 也会优先锚到最近刚 inspected 的项目/文件上下文，而不是把它当成完全无锚点的新问题；如果前一轮 assistant 已经给出明确的项目级 rewrite proposal，后面再来一句宽泛的“重新写个项目”，runtime 也会直接执行那套跨文件 proposal，而不是缩水成单文件试探；如果前一轮 assistant 已经给出明确的项目级 optimize proposal，后面再来一句宽泛的“帮我优化下”，runtime 也会继续落回那条项目级执行上下文，而不是退回泛化建议；如果普通项目执行链本身已经跑到一半又被 stop，后续一句宽泛的“帮我优化下”或“帮我看看”，现在也会优先恢复那条中断执行链，而不是重新回到 listing、package 或泛化分析；如果这套 rewrite proposal 本身还带有 verify / exact-output 约束，后续宽 follow-up 也会继续把整条改动和验证链跑完，而不是只把 proposal 执行到 edit 阶段就停住；如果这套 rewrite proposal 已经实际执行到一半又被 stop，后续 bare `可以`、宽泛的“重新写个项目”，以及对应的 optimize / inspect follow-up，runtime 也会优先恢复那条已经开跑的执行链，而不是回到 proposal 起点重读和重改前半段；如果用户先要 rewrite 方案、后面再用一句“可以”批准，runtime 也会把这句批准绑定回刚才的项目级提议并直接开始跨文件执行，而不是重新回到只读或解释态；如果最近已经有明确的 editable working file，宽 follow-up 会优先直接回到这个文件，而不是倒退去重读更宽的项目入口；这条锚点策略现在不仅覆盖优化类 follow-up，也覆盖“帮我看看 / 看看这个”这类 inspect follow-up。</p>
           </article>
         </div>
       </section>
@@ -256,12 +256,13 @@
         <ul>
           <li>截至 2026-07-02，npm 包名已经定为 <code>selfme</code>，安装命令是 <code>npm i -g selfme</code>，可执行命令是 <code>selfme</code>。</li>
           <li>当前仓库的终端交互、审批、工具消息和基础恢复链已经够用，后续主线不再回到“先补产品壳层”或“先扩表面功能”。</li>
-          <li>下次继续时，优先看 runtime 是否还会在 stage summary、progress-only reply、长链多步骤任务里提早停住。</li>
-          <li>如果需要快速判断当前是不是跑偏，直接看 <code>pnpm smoke:agent</code> 的失败点是否仍然围绕 continuation、resume、multi-step execution。</li>
+          <li><code>pnpm smoke:agent</code> 已经覆盖 continuation、resume、project inspection、rewrite / optimize follow-up、exact-output / verify 收口等关键 runtime 收敛路径，并保持全绿。</li>
+          <li>下次继续时，优先看真实交互里是否仍然存在“一次工具、一句收尾、提前停住”的体感问题，而不是先回头补更多 smoke 文案分支。</li>
+          <li>如果需要快速判断当前是不是跑偏，先跑 <code>pnpm smoke:agent</code> 守住基线，再去复现真实会话里的 continuation / resume / long-task 行为。</li>
         </ul>
         <div class="rule">
           <strong>下次继续的默认顺序：</strong>
-          先读这个 checkpoint，再跑 smoke / 复现当前失败点，然后只修 runtime 收敛和执行稳定性，不扩新表面。
+          先读这个 checkpoint，先用 <code>pnpm smoke:agent</code> 守住已收敛基线，再复现真实会话里的执行连续性问题；后续主线只修 runtime 收敛和执行稳定性，不扩新表面。
         </div>
       </section>
 
