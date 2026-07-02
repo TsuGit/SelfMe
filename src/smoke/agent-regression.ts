@@ -3379,6 +3379,7 @@ async function main() {
   await verifyVagueOptimizationAfterApprovalWaitInProjectChain();
   await verifyProjectWordedOptimizationAfterApprovalWaitInProjectChain();
   await verifyResumeFollowUpAfterApprovalWaitInRewriteProjectChain();
+  await verifyBareAffirmativeAfterApprovalWaitInRewriteProjectChain();
   await verifyProjectWordedRewriteAfterApprovalWaitInProjectChain();
   await verifyNaturalLanguageApprovalShortcuts();
   await verifyPendingNextStepContextGuidesMultiTargetContinuation();
@@ -18030,6 +18031,10 @@ async function verifyResumeFollowUpAfterApprovalWaitInRewriteProjectChain() {
   await verifyApprovalWaitResumeInRewriteProjectChain("还能继续吗");
 }
 
+async function verifyBareAffirmativeAfterApprovalWaitInRewriteProjectChain() {
+  await verifyApprovalWaitResumeInRewriteProjectChain("可以");
+}
+
 async function verifyProjectWordedRewriteAfterApprovalWaitInProjectChain() {
   await verifyApprovalWaitResumeInRewriteProjectChain("帮我重写项目");
 }
@@ -18357,7 +18362,7 @@ async function verifyApprovalWaitResumeInProjectChain(
 }
 
 async function verifyApprovalWaitResumeInRewriteProjectChain(
-  followUpPrompt: "还能继续吗" | "帮我重写项目"
+  followUpPrompt: "还能继续吗" | "可以" | "帮我重写项目"
 ) {
   const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-project-rewrite-approval-"));
   const workspace = join(root, "workspace");
@@ -18504,7 +18509,7 @@ async function verifyApprovalWaitResumeInRewriteProjectChain(
         }
       }
 
-      if (/^The user replied "(还能继续吗|帮我重写项目)" and wants to continue the most recent unfinished task\./.test(input.content)) {
+      if (/^The user replied "(还能继续吗|可以|帮我重写项目)" and wants to continue the most recent unfinished task\./.test(input.content)) {
         assert.match(input.content, /Original task: 看看项目，然后直接重写 node-todo/);
         if (/帮我重写项目/.test(input.content)) {
           assert.match(input.content, /Resume that task now instead of treating this as a broad rewrite follow-up\./);
@@ -18523,7 +18528,7 @@ async function verifyApprovalWaitResumeInRewriteProjectChain(
         return;
       }
 
-      if (/^Original user request: The user replied "(还能继续吗|帮我重写项目)" and wants to continue the most recent unfinished task\./.test(input.content)) {
+      if (/^Original user request: The user replied "(还能继续吗|可以|帮我重写项目)" and wants to continue the most recent unfinished task\./.test(input.content)) {
         const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
         const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
 
