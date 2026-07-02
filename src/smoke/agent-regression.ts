@@ -490,6 +490,37 @@ async function main() {
     "expected project-worded vague rewrite follow-up to perform a concrete edit"
   );
 
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const express = require("express");\nconst app = express();\nconst PORT = 3000;\napp.listen(PORT, () => {\n  console.log(`Todo app is running at http://localhost:${PORT}`);\n});\n',
+    "utf8"
+  );
+
+  console.log("task: anchor an alternate project-worded vague rewrite follow-up to the most recently inspected project");
+  const alternateProjectWordedRewriteFollowUpResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "重写这个项目"
+  });
+
+  const alternateProjectWordedRewriteAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  assert.match(alternateProjectWordedRewriteAppContent, /process\.env\.PORT/);
+  assert.match(alternateProjectWordedRewriteFollowUpResult.assistantText, /process\.env\.PORT|node-todo\/app\.js/i);
+  assert.equal(
+    alternateProjectWordedRewriteFollowUpResult.toolSummaries.filter((summary) => /^node-todo\/package\.json:1-\d+$/.test(summary)).length,
+    1,
+    "expected alternate project-worded vague rewrite follow-up to anchor to the package entry once"
+  );
+  assert.ok(
+    alternateProjectWordedRewriteFollowUpResult.toolSummaries.some((summary) => /^node-todo\/app\.js:1-\d+/.test(summary)),
+    "expected alternate project-worded vague rewrite follow-up to jump straight to the latest editable working file"
+  );
+  assert.ok(
+    alternateProjectWordedRewriteFollowUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:3-3 · updated")),
+    "expected alternate project-worded vague rewrite follow-up to perform a concrete edit"
+  );
+
   console.log("task: execute a broader approved project rewrite proposal instead of stopping at the plan");
   const rewriteProposalResult = await runAgentTask({
     bus,
@@ -21024,7 +21055,7 @@ function resolveProviderResponse(content: string) {
     });
   }
 
-  if (/^The user replied "(?:你能帮我重新写个项目吗|帮我重写项目)" and wants you to rewrite the most recently inspected project or file now\./.test(content)) {
+  if (/^The user replied "(?:你能帮我重新写个项目吗|帮我重写项目|重写这个项目)" and wants you to rewrite the most recently inspected project or file now\./.test(content)) {
     if (/Recent editable working file: node-todo\/app\.js/.test(content)) {
       return toolCall("files", {
         path: "node-todo/app.js",
@@ -23428,7 +23459,7 @@ function resolveProviderResponse(content: string) {
     }
   }
 
-  if (/^Original user request: The user replied "(?:你能帮我重新写个项目吗|帮我重写项目)" and wants you to rewrite the most recently inspected project or file now\./.test(content)) {
+  if (/^Original user request: The user replied "(?:你能帮我重新写个项目吗|帮我重写项目|重写这个项目)" and wants you to rewrite the most recently inspected project or file now\./.test(content)) {
     const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
     const summary = extractLine(content, "Summary:") ?? extractLine(content, "Latest summary:") ?? "";
 
