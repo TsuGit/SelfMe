@@ -3386,6 +3386,7 @@ async function main() {
   await verifyResumeFollowUpInImplicitGenericVerificationStageSummaryChain();
   await verifyCompletionToneReplyInImplicitGenericVerificationStageSummaryChain();
   await verifyResumeFollowUpInImplicitGenericVerificationCompletionToneChain();
+  await verifyCompletionToneReplyInImplicitGenericVerificationCompletionToneChain();
   await verifyBareAffirmativeInImplicitGenericVerificationCompletionToneRewriteChain();
   await verifyProjectWordedRewriteInImplicitGenericVerificationCompletionToneChain();
   await verifyAlternateProjectWordedRewriteInImplicitGenericVerificationCompletionToneChain();
@@ -14747,6 +14748,21 @@ async function verifyCompletionToneReplyInImplicitGenericVerificationStageSummar
 }
 
 async function verifyResumeFollowUpInImplicitGenericVerificationCompletionToneChain() {
+  await verifyImplicitGenericVerificationCompletionToneResume("还能继续吗");
+}
+
+async function verifyCompletionToneReplyInImplicitGenericVerificationCompletionToneChain() {
+  await verifyImplicitGenericVerificationCompletionToneResume("还能继续吗", {
+    resumeIntermediateReply: "completion"
+  });
+}
+
+async function verifyImplicitGenericVerificationCompletionToneResume(
+  followUpPrompt: "还能继续吗",
+  options: {
+    resumeIntermediateReply?: "completion";
+  } = {}
+) {
   const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-implicit-generic-completion-tone-"));
   const workspace = join(root, "workspace");
   const transcriptPath = join(root, "transcript.jsonl");
@@ -14793,6 +14809,7 @@ async function verifyResumeFollowUpInImplicitGenericVerificationCompletionToneCh
 
   class ResumeImplicitGenericCompletionToneProvider implements ProviderClient {
     readonly name = "resume-implicit-generic-completion-tone-provider";
+    private emittedResumeIntermediateReply = false;
 
     async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
       const originalPrompt = "看看项目，然后直接把 node-todo 优化到正确。你自己判断需要改什么，并运行 `node node-todo/verify-generic-resume-tone.mjs` 验证，直到它正确为止。";
@@ -14902,12 +14919,19 @@ async function verifyResumeFollowUpInImplicitGenericVerificationCompletionToneCh
         }
       }
 
-      if (input.content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+      if (input.content.startsWith(`The user replied "${followUpPrompt}" and wants to continue the most recent unfinished task.`)) {
         assert.match(input.content, /Original task: 看看项目，然后直接把 node-todo 优化到正确/);
         assert.match(input.content, /Recent editable working file: node-todo\/app\.js/);
         assert.match(input.content, /Pending next step target: node-todo\/views\/index\.ejs/);
         assert.match(input.content, /Latest tool in context: shell/);
         assert.match(input.content, /Latest tool summary in context: node node-todo\/verify-generic-resume-tone\.mjs · completed/);
+        if (options.resumeIntermediateReply && !this.emittedResumeIntermediateReply) {
+          this.emittedResumeIntermediateReply = true;
+          yield {
+            delta: "The implicit generic completion-tone chain is basically finished overall."
+          };
+          return;
+        }
         yield {
           delta: toolCall("files", {
             path: "node-todo/views/index.ejs",
@@ -14918,9 +14942,24 @@ async function verifyResumeFollowUpInImplicitGenericVerificationCompletionToneCh
         return;
       }
 
-      if (input.content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+      if (input.content.startsWith(`Original user request: The user replied "${followUpPrompt}" and wants to continue the most recent unfinished task.`)) {
         const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
         const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (options.resumeIntermediateReply && /You have not started the requested work yet\./.test(input.content)) {
+          const recentTaskState = input.contextMessages?.find((message) =>
+            message.role === "system" && message.content.includes("Recent task state:")
+          )?.content ?? "";
+          assert.match(recentTaskState, /Pending next step target: node-todo\/views\/index\.ejs/);
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 4
+            })
+          };
+          return;
+        }
 
         if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
           yield {
@@ -15006,8 +15045,19 @@ async function verifyResumeFollowUpInImplicitGenericVerificationCompletionToneCh
     bus,
     transcriptStore,
     sessionId: session.sessionId,
-    prompt: "还能继续吗"
+    prompt: followUpPrompt
   });
+
+  if (options.resumeIntermediateReply) {
+    const resumedEvents = await transcriptStore.readEventsBySession(session.sessionId);
+    assert.ok(
+      resumedEvents.some((event) =>
+        event.type === "assistant.delta.received"
+        && /The implicit generic completion-tone chain is basically finished overall\./.test(event.payload.delta)
+      ),
+      "implicit generic completion-tone resume should preserve the intermediate completion-tone reply before retrying the pending view read"
+    );
+  }
 
   const resumedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
   assert.match(resumedViewContent, /maxlength="100"/);
