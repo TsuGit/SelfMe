@@ -3380,6 +3380,7 @@ async function main() {
   await verifyVagueInspectionInProjectVerificationChain();
   await verifyProjectWordedInspectionInProjectVerificationChain();
   await verifyResumeFollowUpInProjectStageSummaryChain();
+  await verifyCompletionToneReplyInProjectStageSummaryChain();
   await verifyResumeFollowUpInImplicitProjectStageSummaryChain();
   await verifyResumeFollowUpInImplicitGenericVerificationStageSummaryChain();
   await verifyResumeFollowUpInImplicitGenericVerificationCompletionToneChain();
@@ -14020,6 +14021,21 @@ async function verifyProjectVerificationChainResume(
 }
 
 async function verifyResumeFollowUpInProjectStageSummaryChain() {
+  await verifyProjectStageSummaryResume("还能继续吗");
+}
+
+async function verifyCompletionToneReplyInProjectStageSummaryChain() {
+  await verifyProjectStageSummaryResume("还能继续吗", {
+    resumeIntermediateReply: "completion"
+  });
+}
+
+async function verifyProjectStageSummaryResume(
+  followUpPrompt: "还能继续吗",
+  options: {
+    resumeIntermediateReply?: "completion";
+  } = {}
+) {
   const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-project-stage-"));
   const workspace = join(root, "workspace");
   const transcriptPath = join(root, "transcript.jsonl");
@@ -14066,6 +14082,7 @@ async function verifyResumeFollowUpInProjectStageSummaryChain() {
 
   class ResumeProjectStageProvider implements ProviderClient {
     readonly name = "resume-project-stage-provider";
+    private emittedResumeIntermediateReply = false;
 
     async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
       const originalPrompt = "看看项目，然后直接优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100，并运行 `node node-todo/verify-setup.mjs` 验证，直到输出 exactly `ready`。";
@@ -14179,8 +14196,15 @@ async function verifyResumeFollowUpInProjectStageSummaryChain() {
         }
       }
 
-      if (input.content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+      if (input.content.startsWith(`The user replied "${followUpPrompt}" and wants to continue the most recent unfinished task.`)) {
         assert.match(input.content, /Original task: 看看项目，然后直接优化 node-todo/);
+        if (options.resumeIntermediateReply && !this.emittedResumeIntermediateReply) {
+          this.emittedResumeIntermediateReply = true;
+          yield {
+            delta: "The node-todo stage-summary chain is basically finished overall."
+          };
+          return;
+        }
         yield {
           delta: toolCall("files", {
             path: "node-todo/views/index.ejs",
@@ -14191,9 +14215,24 @@ async function verifyResumeFollowUpInProjectStageSummaryChain() {
         return;
       }
 
-      if (input.content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+      if (input.content.startsWith(`Original user request: The user replied "${followUpPrompt}" and wants to continue the most recent unfinished task.`)) {
         const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
         const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (options.resumeIntermediateReply && /You have not started the requested work yet\./.test(input.content)) {
+          const recentTaskState = input.contextMessages?.find((message) =>
+            message.role === "system" && message.content.includes("Recent task state:")
+          )?.content ?? "";
+          assert.match(recentTaskState, /Pending next step target: node-todo\/views\/index\.ejs/);
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 4
+            })
+          };
+          return;
+        }
 
         if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
           yield {
@@ -14300,8 +14339,19 @@ async function verifyResumeFollowUpInProjectStageSummaryChain() {
     bus,
     transcriptStore,
     sessionId: session.sessionId,
-    prompt: "还能继续吗"
+    prompt: followUpPrompt
   });
+
+  if (options.resumeIntermediateReply) {
+    const resumedEvents = await transcriptStore.readEventsBySession(session.sessionId);
+    assert.ok(
+      resumedEvents.some((event) =>
+        event.type === "assistant.delta.received"
+        && /The node-todo stage-summary chain is basically finished overall\./.test(event.payload.delta)
+      ),
+      "project stage-summary completion-tone resume should preserve the intermediate completion-tone reply before retrying the pending view read"
+    );
+  }
 
   const resumedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
   assert.match(resumedViewContent, /maxlength="100"/);
