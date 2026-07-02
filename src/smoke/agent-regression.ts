@@ -3312,6 +3312,42 @@ async function main() {
   );
   await writeFile(join(workspace, "greet.mjs"), 'console.log("Hello");\n', "utf8");
 
+  console.log("task: start tool-grounded workspace inspection after an initial fabricated summary");
+  const fabricatedWorkspaceSummaryRecoveryResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "当前目录有哪些文件？如果你先概括，也要恢复并实际查看。"
+  });
+
+  assert.match(fabricatedWorkspaceSummaryRecoveryResult.assistantText, /greet\.mjs|app\.config\.json|node-todo/i);
+  assert.ok(
+    fabricatedWorkspaceSummaryRecoveryResult.toolSummaries.some((summary) => summary.startsWith("ls -la · completed")),
+    "expected workspace inspection question to recover by actually listing the current directory"
+  );
+
+  console.log("task: start tool-grounded file existence check after an initial fabricated answer");
+  const beforeExistenceEvents = await transcriptStore.readEventsBySession(session.sessionId);
+  const fabricatedExistenceRecoveryResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "missing.txt 在吗？如果你先猜，也要恢复并实际检查。"
+  });
+
+  const existenceEvents = (await transcriptStore.readEventsBySession(session.sessionId)).slice(beforeExistenceEvents.length);
+  assert.match(fabricatedExistenceRecoveryResult.assistantText, /不存在|does not exist/i);
+  assert.ok(
+    existenceEvents.some((event) =>
+      event.type === "tool.execution.requested" && event.payload.toolName === "files"
+    ),
+    "expected file existence question to recover by actually calling the files tool"
+  );
+  assert.ok(
+    existenceEvents.some((event) => event.type === "runtime.error.raised"),
+    "expected file existence question to recover by actually checking missing.txt"
+  );
+
   console.log("task: accept loose files tool payload");
   const looseFilesPayloadResult = await runAgentTask({
     bus,
@@ -22716,6 +22752,14 @@ function resolveProviderResponse(content: string) {
     return "我会先读取 greet.mjs，然后把输出改成 Natural。";
   }
 
+  if (content.startsWith("当前目录有哪些文件？如果你先概括，也要恢复并实际查看。")) {
+    return "当前目录里应该就是一些脚本、配置和项目文件。";
+  }
+
+  if (content.startsWith("missing.txt 在吗？如果你先猜，也要恢复并实际检查。")) {
+    return "应该在当前目录里。";
+  }
+
   if (content.startsWith("Read greet.mjs line 1 and tell me what it prints.")) {
     return [
       "<tool_call>",
@@ -26784,6 +26828,45 @@ function resolveProviderResponse(content: string) {
 
     assert.match(content, /Summary: greet\.mjs:1-1 · updated/);
     return '已把 greet.mjs 改成输出 "Natural"。';
+  }
+
+  if (content.startsWith("Original user request: 当前目录有哪些文件？如果你先概括，也要恢复并实际查看。")) {
+    if (!/Tool: shell/.test(content)) {
+      assert.match(content, /For actionable requests, do the work now instead of describing what you will do\./);
+      return toolCall("shell", {
+        command: "ls -la"
+      });
+    }
+
+    assert.match(content, /Summary: ls -la · completed/);
+    assert.match(content, /greet\.mjs/);
+    assert.match(content, /app\.config\.json/);
+    assert.match(content, /node-todo/);
+    return "当前目录里有 greet.mjs、app.config.json、node-todo 等条目。";
+  }
+
+  if (content.startsWith("Original user request: missing.txt 在吗？如果你先猜，也要恢复并实际检查。")) {
+    if (!/(?:Tool|Latest tool): files/.test(content)) {
+      assert.match(content, /For actionable requests, do the work now instead of describing what you will do\./);
+      return toolCall("files", {
+        path: "missing.txt",
+        startLine: 1,
+        endLine: 20
+      });
+    }
+
+    assert.match(content, /The latest tool attempt failed\./);
+    assert.match(content, /ENOENT|no such file or directory/i);
+
+    if (/Latest tool: files/.test(content)) {
+      assert.match(content, /A single failed tool result does not complete this task\./);
+    }
+
+    if (/Tool: files/.test(content)) {
+      assert.match(content, /Preferred answer style: say in one sentence that the file does not exist/i);
+    }
+
+    return "missing.txt 不存在。";
   }
 
   if (content.startsWith("Original user request: Read greet.mjs line 1 and tell me what it prints.")) {

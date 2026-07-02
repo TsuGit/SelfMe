@@ -5123,6 +5123,10 @@ function shouldForceFailureRecovery(originalRequest: string, assistantMessage: s
     return false;
   }
 
+  if (isLatestToolResultTaskTerminal(originalRequest, latestToolResult)) {
+    return false;
+  }
+
   if (looksLikeUserInputBlockingQuestion(assistantMessage)) {
     return false;
   }
@@ -5410,6 +5414,14 @@ function shouldForceCompletionTightening(originalRequest: string, assistantMessa
     return true;
   }
 
+  if (
+    looksLikeExplicitFileExistenceQuestion(originalRequest)
+    && latestToolResult.toolName === "files"
+    && looksLikeFileExistenceCompletionReply(assistantMessage)
+  ) {
+    return false;
+  }
+
   return !looksLikeCompletionReply(assistantMessage)
     || looksLikeThinCompletionReply(originalRequest, assistantMessage, latestToolResult)
     || looksLikeMissingExactOutputAnchorCompletionReply(originalRequest, assistantMessage, latestToolResult)
@@ -5677,6 +5689,14 @@ function requiresToolGroundedInitialExecution(content: string) {
   }
 
   if (isDirectShellExecutionRequest(taskContent)) {
+    return true;
+  }
+
+  if (looksLikeWorkspaceInspectionQuestion(taskContent)) {
+    return true;
+  }
+
+  if (looksLikeExplicitFileExistenceQuestion(taskContent)) {
     return true;
   }
 
@@ -5974,6 +5994,14 @@ function looksLikeActionableTaskRequest(content: string) {
     return true;
   }
 
+  if (looksLikeExplicitFileExistenceQuestion(taskContent)) {
+    return true;
+  }
+
+  if (looksLikeWorkspaceInspectionQuestion(taskContent)) {
+    return true;
+  }
+
   if (/\b(read|write|edit|fix|repair|create|inspect|run|running|verify|check|list|update|change|modify|improve|optimize|refactor)\b/i.test(taskContent)) {
     return true;
   }
@@ -6056,6 +6084,13 @@ function isLatestToolResultTaskTerminal(originalRequest: string, latestToolResul
   }
 
   if (latestToolResult.toolName === "files") {
+    if (
+      looksLikeExplicitFileExistenceQuestion(originalRequest)
+      && /ENOENT|no such file or directory/i.test(latestToolResult.errorMessage ?? latestToolResult.rawOutput ?? "")
+    ) {
+      return true;
+    }
+
     return isFilesVerificationTerminal(originalRequest, latestToolResult.summary);
   }
 
@@ -6192,6 +6227,34 @@ function looksLikeExplicitFileContentQuestion(content: string) {
 
   return /\b(what(?:'s| is)?|show|tell me|contents?|inside|line\s+\d+|first line|second line|prints?)\b/i.test(taskContent)
     || /(内容|里面|写了什么|写了啥|第\s*\d+\s*行|第一行|第二行|是什么|是啥|输出什么|打印什么)/u.test(taskContent);
+}
+
+function looksLikeWorkspaceInspectionQuestion(content: string) {
+  const taskContent = extractEmbeddedTaskContent(content);
+
+  if (looksLikeDiscussionRequest(taskContent) || extractExplicitFileTargets(taskContent).length > 0) {
+    return false;
+  }
+
+  return /\b(current|working)\s+(directory|folder|workspace)\b/i.test(taskContent)
+    || /\b(files?|entries?)\s+(in|under)\s+(the\s+)?(current|working)\s+(directory|folder|workspace)\b/i.test(taskContent)
+    || /\bwhat(?:'s| is)\s+in\s+(the\s+)?(current|working)\s+(directory|folder|workspace)\b/i.test(taskContent)
+    || /(当前|工作).*(目录|文件夹|工作区)/u.test(taskContent)
+    || /(目录|文件夹|工作区).*(有哪些|有什么|内容|文件)/u.test(taskContent)
+    || /(当前目录|当前文件夹|当前工作区).*(有哪些|有什么|内容|文件)/u.test(taskContent);
+}
+
+function looksLikeExplicitFileExistenceQuestion(content: string) {
+  const taskContent = extractEmbeddedTaskContent(content);
+  const targets = extractExplicitFileTargets(taskContent);
+
+  if (targets.length === 0 || looksLikeDiscussionRequest(taskContent)) {
+    return false;
+  }
+
+  return /\b(exists?|there)\b/i.test(taskContent)
+    || /\b(is|are)\s+.+\s+there\b/i.test(taskContent)
+    || /(在吗|存在吗|有没有|找得到吗|是否存在)/u.test(taskContent);
 }
 
 function extractExplicitFileTargets(content: string) {
@@ -6611,6 +6674,14 @@ function looksLikeThinCompletionReply(
     return true;
   }
 
+  if (
+    looksLikeExplicitFileExistenceQuestion(originalRequest)
+    && latestToolResult.toolName === "files"
+    && looksLikeFileExistenceCompletionReply(normalized)
+  ) {
+    return false;
+  }
+
   const anchors = [
     extractPathFromToolSummary(latestToolResult.summary),
     extractExpectedExactOutput(originalRequest),
@@ -6690,6 +6761,18 @@ function looksLikeMissingFileVerificationAnchorCompletionReply(
 
   const mentionedPaths = extractExplicitFileTargets(content);
   return !mentionedPaths.some((mentionedPath) => pathsReferToSameTarget(mentionedPath, targetPath));
+}
+
+function looksLikeFileExistenceCompletionReply(content: string) {
+  const normalized = content.trim();
+
+  if (!normalized || looksLikeBlockingQuestion(normalized)) {
+    return false;
+  }
+
+  return /\bdoes not exist\b/i.test(normalized)
+    || /\bexists?\b/i.test(normalized)
+    || /(不存在|不在|存在|在的|在呢)/u.test(normalized);
 }
 
 function looksLikeMissingShellVerificationAnchorCompletionReply(
