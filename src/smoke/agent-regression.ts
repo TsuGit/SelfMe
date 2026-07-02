@@ -3383,11 +3383,13 @@ async function main() {
   await verifyResumeFollowUpInImplicitGenericVerificationCompletionToneChain();
   await verifyBareAffirmativeInImplicitGenericVerificationCompletionToneRewriteChain();
   await verifyProjectWordedRewriteInImplicitGenericVerificationCompletionToneChain();
+  await verifyAlternateProjectWordedRewriteInImplicitGenericVerificationCompletionToneChain();
   await verifyBareAffirmativeInImplicitGenericVerificationStageSummaryChain();
   await verifyVagueOptimizationInImplicitGenericVerificationStageSummaryChain();
   await verifyProjectWordedOptimizationInImplicitGenericVerificationStageSummaryChain();
   await verifyBareAffirmativeInImplicitGenericVerificationStageSummaryRewriteChain();
   await verifyProjectWordedRewriteInImplicitGenericVerificationStageSummaryChain();
+  await verifyAlternateProjectWordedRewriteInImplicitGenericVerificationStageSummaryChain();
   await verifyVagueInspectionInImplicitGenericVerificationStageSummaryChain();
   await verifyProjectWordedInspectionInImplicitGenericVerificationStageSummaryChain();
   await verifyVagueOptimizationInImplicitBroadProjectProposalChain();
@@ -14687,12 +14689,16 @@ async function verifyProjectWordedRewriteInImplicitGenericVerificationCompletion
   await verifyImplicitGenericVerificationCompletionToneRewriteResume("帮我重写项目");
 }
 
+async function verifyAlternateProjectWordedRewriteInImplicitGenericVerificationCompletionToneChain() {
+  await verifyImplicitGenericVerificationCompletionToneRewriteResume("重写这个项目");
+}
+
 async function verifyBareAffirmativeInImplicitGenericVerificationCompletionToneRewriteChain() {
   await verifyImplicitGenericVerificationCompletionToneRewriteResume("可以");
 }
 
 async function verifyImplicitGenericVerificationCompletionToneRewriteResume(
-  followUpPrompt: "帮我重写项目" | "可以"
+  followUpPrompt: "帮我重写项目" | "重写这个项目" | "可以"
 ) {
   const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-implicit-generic-rewrite-completion-tone-"));
   const workspace = join(root, "workspace");
@@ -14850,7 +14856,7 @@ async function verifyImplicitGenericVerificationCompletionToneRewriteResume(
       }
 
       if (input.content.startsWith(`The user replied "${followUpPrompt}" and wants to continue the most recent unfinished task.`)) {
-        if (followUpPrompt === "帮我重写项目") {
+        if (followUpPrompt === "帮我重写项目" || followUpPrompt === "重写这个项目") {
           assert.match(input.content, /Resume that task now instead of treating this as a broad rewrite follow-up\./);
         }
         assert.match(input.content, /Original task: 看看项目，然后直接把 node-todo 重写到正确/);
@@ -15006,6 +15012,10 @@ async function verifyProjectWordedOptimizationInImplicitGenericVerificationStage
 
 async function verifyProjectWordedRewriteInImplicitGenericVerificationStageSummaryChain() {
   await verifyImplicitGenericVerificationStageSummaryRewriteResume("帮我重写项目");
+}
+
+async function verifyAlternateProjectWordedRewriteInImplicitGenericVerificationStageSummaryChain() {
+  await verifyImplicitGenericVerificationStageSummaryRewriteResume("重写这个项目");
 }
 
 async function verifyBareAffirmativeInImplicitGenericVerificationStageSummaryRewriteChain() {
@@ -16653,7 +16663,7 @@ async function verifyImplicitGenericVerificationStageSummaryResume(
 }
 
 async function verifyImplicitGenericVerificationStageSummaryRewriteResume(
-  followUpPrompt: "帮我重写项目" | "可以"
+  followUpPrompt: "帮我重写项目" | "重写这个项目" | "可以"
 ) {
   const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-implicit-generic-rewrite-stage-"));
   const workspace = join(root, "workspace");
@@ -16813,8 +16823,8 @@ async function verifyImplicitGenericVerificationStageSummaryRewriteResume(
         }
       }
 
-      if (/^The user replied "(帮我重写项目|可以)" and wants to continue the most recent unfinished task\./.test(input.content)) {
-        if (/帮我重写项目/.test(input.content)) {
+      if (/^The user replied "(帮我重写项目|重写这个项目|可以)" and wants to continue the most recent unfinished task\./.test(input.content)) {
+        if (/(帮我重写项目|重写这个项目)/.test(input.content)) {
           assert.match(input.content, /Resume that task now instead of treating this as a broad rewrite follow-up\./);
         }
         assert.match(input.content, /Original task: 看看项目，然后直接把 node-todo 重写到正确/);
@@ -16832,7 +16842,7 @@ async function verifyImplicitGenericVerificationStageSummaryRewriteResume(
         return;
       }
 
-      if (/^Original user request: The user replied "(帮我重写项目|可以)" and wants to continue the most recent unfinished task\./.test(input.content)) {
+      if (/^Original user request: The user replied "(帮我重写项目|重写这个项目|可以)" and wants to continue the most recent unfinished task\./.test(input.content)) {
         const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
         const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
 
