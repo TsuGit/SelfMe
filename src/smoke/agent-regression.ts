@@ -3415,6 +3415,7 @@ async function main() {
   await verifyResumeFollowUpAfterApprovalWaitInRewriteProjectChain();
   await verifyBareAffirmativeAfterApprovalWaitInRewriteProjectChain();
   await verifyProjectWordedRewriteAfterApprovalWaitInProjectChain();
+  await verifyAlternateProjectWordedRewriteAfterApprovalWaitInProjectChain();
   await verifyNaturalLanguageApprovalShortcuts();
   await verifyPendingNextStepContextGuidesMultiTargetContinuation();
   await verifyAssistantStageSummaryPromotesExplicitNextTarget();
@@ -18081,6 +18082,10 @@ async function verifyProjectWordedRewriteAfterApprovalWaitInProjectChain() {
   await verifyApprovalWaitResumeInRewriteProjectChain("帮我重写项目");
 }
 
+async function verifyAlternateProjectWordedRewriteAfterApprovalWaitInProjectChain() {
+  await verifyApprovalWaitResumeInRewriteProjectChain("重写这个项目");
+}
+
 async function verifyApprovalWaitResumeInProjectChain(
   followUpPrompt: "还能继续吗" | "可以" | "帮我优化下" | "帮我优化项目"
 ) {
@@ -18404,7 +18409,7 @@ async function verifyApprovalWaitResumeInProjectChain(
 }
 
 async function verifyApprovalWaitResumeInRewriteProjectChain(
-  followUpPrompt: "还能继续吗" | "可以" | "帮我重写项目"
+  followUpPrompt: "还能继续吗" | "可以" | "帮我重写项目" | "重写这个项目"
 ) {
   const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-project-rewrite-approval-"));
   const workspace = join(root, "workspace");
@@ -18551,9 +18556,9 @@ async function verifyApprovalWaitResumeInRewriteProjectChain(
         }
       }
 
-      if (/^The user replied "(还能继续吗|可以|帮我重写项目)" and wants to continue the most recent unfinished task\./.test(input.content)) {
+      if (/^The user replied "(还能继续吗|可以|帮我重写项目|重写这个项目)" and wants to continue the most recent unfinished task\./.test(input.content)) {
         assert.match(input.content, /Original task: 看看项目，然后直接重写 node-todo/);
-        if (/帮我重写项目/.test(input.content)) {
+        if (/(帮我重写项目|重写这个项目)/.test(input.content)) {
           assert.match(input.content, /Resume that task now instead of treating this as a broad rewrite follow-up\./);
         }
         assert.match(input.content, /Latest tool in context: files/);
@@ -18570,7 +18575,7 @@ async function verifyApprovalWaitResumeInRewriteProjectChain(
         return;
       }
 
-      if (/^Original user request: The user replied "(还能继续吗|可以|帮我重写项目)" and wants to continue the most recent unfinished task\./.test(input.content)) {
+      if (/^Original user request: The user replied "(还能继续吗|可以|帮我重写项目|重写这个项目)" and wants to continue the most recent unfinished task\./.test(input.content)) {
         const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
         const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
 
