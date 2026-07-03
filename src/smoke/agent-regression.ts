@@ -3875,6 +3875,7 @@ async function main() {
   await verifyChineseRewriteProposalExecutesPreviousProposal("帮我重写项目");
   await verifyChineseRewriteProposalExecutesPreviousProposal("重写这个项目");
   await verifyVagueInspectionResumesInterruptedProposalExecution();
+  await verifyResumeAfterWholeProjectEntryStageSummary();
   await verifyProjectWordedWholeProjectInspectionResumesInterruptedExecution();
   await verifyVagueOptimizationResumesInterruptedProposalExecution();
   await verifyResumeFollowUpAtLatestFailurePoint();
@@ -14197,6 +14198,182 @@ async function verifyProjectWordedWholeProjectInspectionResumesInterruptedExecut
   assert.ok(
     resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1")),
     "project-worded whole-project inspection resume should continue directly into the pending view file"
+  );
+}
+
+async function verifyResumeAfterWholeProjectEntryStageSummary() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-whole-project-entry-stage-resume-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  const originalPrompt = "你能一次性都帮我看完整个项目吗？如果你读到 package.json 后先长解释，也要继续看下一个核心文件。";
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "package.json"),
+    '{\n  "name": "node-todo",\n  "version": "1.0.0",\n  "main": "app.js"\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const app = {};\nmodule.exports = app;\n',
+    "utf8"
+  );
+
+  class ResumeWholeProjectEntryStageProvider implements ProviderClient {
+    readonly name = "resume-whole-project-entry-stage-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "pwd && ls -la && find . -maxdepth 2 -type f | sed 's#^./##' | sort | head -200"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell") {
+          if (/You are in the middle of a concrete project inspection request\./.test(input.content)) {
+            assert.match(input.content, /Likely project entry: node-todo\/package\.json/);
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/package.json",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+
+          yield { delta: "我先看了工作区列表，当前最像完整项目的是 node-todo。" };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          if (/You are in the middle of a whole-project inspection request\./.test(input.content)) {
+            assert.match(input.content, /Likely inspection file: node-todo\/app\.js/);
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/app.js",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+
+          yield {
+            delta: "node-todo/package.json 已经说明这个项目是个很小的 Express todo 应用，依赖和脚本层都非常薄，所以如果目标是真正把整个项目看完整，仅仅停在入口清单和包描述还不够，因为还需要继续读到真正承载应用结构的核心实现文件，才能判断它的控制流和渲染输出是不是闭环。"
+          };
+          return;
+        }
+      }
+
+      if (input.content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+        assert.match(input.content, /Original task: 你能一次性都帮我看完整个项目吗？如果你读到 package\.json 后先长解释，也要继续看下一个核心文件。/);
+        assert.match(input.content, /Pending next step target: node-todo\/app\.js/);
+        assert.match(input.content, /Latest tool in context: files/);
+        assert.match(input.content, /Latest tool summary in context: node-todo\/package\.json:1-4/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/app.js",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield { delta: "我已经恢复执行，并继续读了 node-todo/app.js。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ResumeWholeProjectEntryStageProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const completionPromise = waitForAssistantTaskCompletion(bus, session.sessionId);
+  const stageSummaryPromise = waitForAssistantDeltaContaining(
+    bus,
+    session.sessionId,
+    /还需要继续读到真正承载应用结构的核心实现文件/
+  );
+
+  bus.emit(createUserMessageSubmittedEvent({
+    sessionId: session.sessionId,
+    content: originalPrompt
+  }));
+
+  await stageSummaryPromise;
+  bus.emit(createRuntimeInterruptRequestedEvent({
+    sessionId: session.sessionId,
+    reason: "cancel"
+  }));
+
+  const cancelledTask = await completionPromise;
+  assert.equal(cancelledTask.payload.state, "cancelled");
+
+  const interruptedEvents = await transcriptStore.readEventsBySession(session.sessionId);
+  assert.ok(
+    interruptedEvents.some((event) =>
+      event.type === "tool.execution.completed" && event.payload.summary.startsWith("node-todo/package.json:1-4")
+    ),
+    "whole-project entry-stage resume chain should preserve the package entry read before stop"
+  );
+  assert.equal(
+    interruptedEvents.some((event) =>
+      event.type === "tool.execution.completed" && event.payload.summary.startsWith("node-todo/app.js:1-2")
+    ),
+    false,
+    "whole-project entry-stage resume chain should stop before reading the pending implementation file"
+  );
+
+  const resumedResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "还能继续吗"
+  });
+
+  assert.match(resumedResult.assistantText, /node-todo\/app\.js|恢复执行/);
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/package.json:1-")),
+    false,
+    "whole-project entry-stage resume should not restart from package.json"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-2")),
+    "whole-project entry-stage resume should continue directly into the pending implementation file"
   );
 }
 

@@ -953,11 +953,13 @@ export class AgentRuntime {
       const stageCommit = await this.commitAssistantStage({
         sessionId: input.sessionId,
         taskId: input.taskId,
+        originalRequest: input.originalRequest,
         messageText: input.assistantPass.messageText,
         messageWasEmitted: input.assistantPass.messageWasEmitted,
         lastDeferredAssistantStageSignature: input.lastDeferredAssistantStageSignature,
         forceDeferredEmission: true,
-        alreadyCommitted: false
+        alreadyCommitted: false,
+        latestToolResult: input.lastToolResult
       });
 
       return {
@@ -986,11 +988,13 @@ export class AgentRuntime {
       const stageCommit = await this.commitAssistantStage({
         sessionId: input.sessionId,
         taskId: input.taskId,
+        originalRequest: input.originalRequest,
         messageText: input.assistantPass.messageText,
         messageWasEmitted: input.assistantPass.messageWasEmitted,
         lastDeferredAssistantStageSignature: input.lastDeferredAssistantStageSignature,
         forceDeferredEmission: false,
-        alreadyCommitted: false
+        alreadyCommitted: false,
+        latestToolResult: input.lastToolResult
       });
 
       return {
@@ -1006,11 +1010,13 @@ export class AgentRuntime {
     const stageCommit = await this.commitAssistantStage({
       sessionId: input.sessionId,
       taskId: input.taskId,
+      originalRequest: input.originalRequest,
       messageText: input.assistantPass.messageText,
       messageWasEmitted: input.assistantPass.messageWasEmitted,
       lastDeferredAssistantStageSignature: input.lastDeferredAssistantStageSignature,
       forceDeferredEmission: true,
-      alreadyCommitted: false
+      alreadyCommitted: false,
+      latestToolResult: input.lastToolResult
     });
 
     return {
@@ -1023,11 +1029,13 @@ export class AgentRuntime {
   private async commitAssistantStage(input: {
     sessionId: string;
     taskId: string;
+    originalRequest?: string;
     messageText: string;
     messageWasEmitted: boolean;
     lastDeferredAssistantStageSignature?: string;
     forceDeferredEmission: boolean;
     alreadyCommitted: boolean;
+    latestToolResult?: RuntimeToolResult;
   }) {
     if (input.alreadyCommitted) {
       return {
@@ -1055,7 +1063,17 @@ export class AgentRuntime {
 
     if (isDeferredStage) {
       const signature = createAssistantStageSignature(input.messageText);
-      const pendingCheckpoint = extractPendingAssistantCheckpoint(input.messageText);
+      const pendingCheckpoint = extractPendingAssistantCheckpoint(
+        input.messageText,
+        input.originalRequest,
+        input.latestToolResult
+          ? {
+            toolName: input.latestToolResult.toolName,
+            toolSummary: input.latestToolResult.summary,
+            toolRawOutput: input.latestToolResult.rawOutput
+          }
+          : undefined
+      );
 
       if (signature && signature === input.lastDeferredAssistantStageSignature) {
         return {
@@ -3918,8 +3936,20 @@ function shouldPreserveDeferredAssistantStage(content: string) {
     && Boolean(extractLikelyNextTargetPathFromAssistantMessage(content));
 }
 
-function extractPendingAssistantCheckpoint(content: string) {
-  const targetPath = extractLikelyNextTargetPathFromAssistantMessage(content);
+function extractPendingAssistantCheckpoint(
+  content: string,
+  originalRequest?: string,
+  latestTool?: {
+    toolName?: string;
+    toolSummary?: string;
+    toolRawOutput?: string;
+  }
+) {
+  const targetPath = resolvePendingNextStepTargetFromAssistantStage({
+    assistantMessage: content,
+    originalRequest,
+    latestTool
+  });
 
   if (!targetPath || !looksLikeStageSummaryWithPendingWork(content)) {
     return undefined;
@@ -4435,6 +4465,7 @@ function extractRecentPendingNextTarget(
 ) {
   const timeline = projectSessionTimeline(historyEvents);
   const previousActionableUserIndex = findPreviousActionableUserTimelineIndex(timeline);
+  const originalRequest = extractPreviousActionableUserRequest(historyEvents);
   let skippedLatestUser = false;
 
   for (let index = timeline.length - 1; index >= 0; index -= 1) {
@@ -4456,10 +4487,34 @@ function extractRecentPendingNextTarget(
       continue;
     }
 
-    const nextTarget = extractLikelyNextTargetPathFromAssistantMessage(entry.text);
+    const nextTarget = resolvePendingNextStepTargetFromAssistantStage({
+      assistantMessage: entry.text,
+      originalRequest,
+      latestTool: findNearestToolTimelineEntryBeforeIndex(
+        timeline,
+        index,
+        previousActionableUserIndex
+      )
+    });
 
     if (nextTarget) {
       return nextTarget;
+    }
+  }
+
+  return undefined;
+}
+
+function findNearestToolTimelineEntryBeforeIndex(
+  timeline: ReturnType<typeof projectSessionTimeline>,
+  index: number,
+  lowerBoundExclusive = -1
+) {
+  for (let cursor = index - 1; cursor > lowerBoundExclusive; cursor -= 1) {
+    const entry = timeline[cursor];
+
+    if (entry?.kind === "tool" && entry.toolName && entry.toolSummary) {
+      return entry;
     }
   }
 
@@ -6502,6 +6557,69 @@ function extractLikelyNextTargetPathFromAssistantMessage(content: string) {
   }
 
   return targets.at(-1);
+}
+
+function resolvePendingNextStepTargetFromAssistantStage(input: {
+  assistantMessage: string;
+  originalRequest?: string;
+  latestTool?: {
+    toolName?: string;
+    toolSummary?: string;
+    toolRawOutput?: string;
+  };
+}) {
+  const explicitTarget = extractLikelyNextTargetPathFromAssistantMessage(input.assistantMessage);
+
+  if (!explicitTarget) {
+    return undefined;
+  }
+
+  const inferredTarget = inferPendingNextStepTargetFromRecentToolContext({
+    explicitTarget,
+    originalRequest: input.originalRequest,
+    latestTool: input.latestTool
+  });
+
+  return inferredTarget ?? explicitTarget;
+}
+
+function inferPendingNextStepTargetFromRecentToolContext(input: {
+  explicitTarget: string;
+  originalRequest?: string;
+  latestTool?: {
+    toolName?: string;
+    toolSummary?: string;
+    toolRawOutput?: string;
+  };
+}) {
+  if (!input.originalRequest || input.latestTool?.toolName !== "files" || !input.latestTool.toolSummary) {
+    return undefined;
+  }
+
+  const latestPath = extractPathFromToolSummary(input.latestTool.toolSummary);
+
+  if (!latestPath || !pathsReferToSameTarget(input.explicitTarget, latestPath)) {
+    return undefined;
+  }
+
+  let inferredTarget: string | undefined;
+
+  if (looksLikeWholeProjectInspectionRequest(input.originalRequest)) {
+    inferredTarget = deriveLikelyWholeProjectInspectionPath(latestPath, input.latestTool.toolRawOutput);
+  } else if (
+    looksLikeBroadProjectImprovementRequest(input.originalRequest)
+    || looksLikeExecutableProjectRewriteRequest(input.originalRequest)
+  ) {
+    inferredTarget = deriveLikelyProjectImplementationPath(latestPath, input.latestTool.toolRawOutput);
+  } else if (looksLikeProjectInspectionRequest(input.originalRequest)) {
+    inferredTarget = deriveLikelyProjectWorkfileFromEntryPath(latestPath, input.latestTool.toolRawOutput);
+  }
+
+  if (!inferredTarget || pathsReferToSameTarget(inferredTarget, input.explicitTarget)) {
+    return undefined;
+  }
+
+  return inferredTarget;
 }
 
 function looksLikePathScopedCompletionForMultiTargetRequest(
