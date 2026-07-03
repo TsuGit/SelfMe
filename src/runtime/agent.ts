@@ -1122,7 +1122,7 @@ export class AgentRuntime {
 
     if (
       input.previousToolResult
-      && shouldForceTerminalCompletionInsteadOfExtraTool(input.originalRequest, input.previousToolResult)
+      && shouldTightenTerminalCompletionInsteadOfExtraTool(input.originalRequest, input.previousToolResult)
     ) {
       return {
         kind: "continue",
@@ -5169,27 +5169,25 @@ function resolveSuccessfulToolResultContinuation(input: {
     ? input.previousRepeatedToolResultCount + 1
     : 0;
 
-  if (
-    input.result.toolName === "shell"
-    && looksLikeVerificationRequest(input.originalRequest)
-    && isLatestToolResultTaskTerminal(input.originalRequest, input.result)
-  ) {
+  if (shouldDirectlyFinalizeTerminalResult(input.originalRequest, input.result)) {
+    const directAnswer = buildDirectTerminalCompletionAnswer(
+      input.originalRequest,
+      input.result,
+      input.preferredLanguage
+    );
+
+    if (directAnswer) {
+      return {
+        repeatedToolResultCount,
+        directAnswer
+      };
+    }
+
     return {
       repeatedToolResultCount,
       nextPrompt: buildToolContinuationPrompt(
         input.originalRequest,
         withWorkingFileAnchor(input.result, input.workingFileAnchor),
-        input.preferredLanguage
-      )
-    };
-  }
-
-  if (shouldForceTerminalCompletionInsteadOfExtraTool(input.originalRequest, input.result)) {
-    return {
-      repeatedToolResultCount,
-      directAnswer: buildDirectTerminalCompletionAnswer(
-        input.originalRequest,
-        input.result,
         input.preferredLanguage
       )
     };
@@ -5547,6 +5545,13 @@ function shouldForceCompletionTightening(originalRequest: string, assistantMessa
     return false;
   }
 
+  const isVerificationTerminalTool = latestToolResult.toolName === "shell" || latestToolResult.toolName === "files";
+
+  if (!isVerificationTerminalTool) {
+    return looksLikeBlockingQuestion(assistantMessage)
+      || looksLikeThinCompletionReply(originalRequest, assistantMessage, latestToolResult);
+  }
+
   return !looksLikeCompletionReply(assistantMessage)
     || looksLikeThinCompletionReply(originalRequest, assistantMessage, latestToolResult)
     || looksLikeMissingExactOutputAnchorCompletionReply(originalRequest, assistantMessage, latestToolResult)
@@ -5703,7 +5708,7 @@ function extractRequestedMutationAnchor(originalRequest: string) {
     ?? taskContent.match(/\bmaxlength(?:\s*=|\s+)\d+\b/i)?.[0]?.replace(/\s*=\s*/g, "=");
 }
 
-function shouldForceTerminalCompletionInsteadOfExtraTool(originalRequest: string, latestToolResult: {
+function shouldTightenTerminalCompletionInsteadOfExtraTool(originalRequest: string, latestToolResult: {
   toolName: string;
   summary: string;
   rawOutput?: string;
@@ -5738,6 +5743,24 @@ function shouldForceTerminalCompletionInsteadOfExtraTool(originalRequest: string
   }
 
   return isLatestToolResultTaskTerminal(originalRequest, latestToolResult);
+}
+
+function shouldDirectlyFinalizeTerminalResult(originalRequest: string, latestToolResult: {
+  toolName: string;
+  summary: string;
+  rawOutput?: string;
+  errorMessage?: string;
+}) {
+  if (
+    latestToolResult.toolName !== "shell"
+    || isDirectShellExecutionRequest(originalRequest)
+    || !looksLikeExactOutputRequest(originalRequest)
+    || hasMutationIntent(originalRequest)
+  ) {
+    return false;
+  }
+
+  return shouldTightenTerminalCompletionInsteadOfExtraTool(originalRequest, latestToolResult);
 }
 
 function shouldForceFollowUpReplyTightening(originalRequest: string, assistantMessage: string, latestToolResult: {

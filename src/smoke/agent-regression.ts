@@ -3939,6 +3939,7 @@ async function main() {
   await verifyAssistantStageSummaryPromotesExplicitNextTarget();
   await verifyDeferredStageCheckpointDoesNotEmitAssistantCompletion();
   await verifyBusyPhaseReturnsToAssistantDuringSameTaskContinuation();
+  await verifyTerminalShellSuccessDoesNotRequireExtraAssistantPass();
   await verifyLongCompletionToneWithPendingWorkStillContinues();
   await verifyPathScopedCompletionDoesNotEndDualFileExecution();
   await verifyImplicitRemainingChainDoesNotEndAtHelperCompletion();
@@ -21729,6 +21730,82 @@ async function verifyBusyPhaseReturnsToAssistantDuringSameTaskContinuation() {
     .map((entry) => entry.phase);
 
   assert.deepEqual(relevantPhases, ["assistant", "assistant", "tool", "assistant", "tool", "assistant"]);
+}
+
+async function verifyTerminalShellSuccessDoesNotRequireExtraAssistantPass() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-terminal-shell-direct-finalize-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "app.config.json"), '{\n  "name": "SelfMe",\n  "port": 3000\n}\n', "utf8");
+  await writeFile(
+    join(workspace, "direct-finalize-report.mjs"),
+    'import config from "./app.config.json" with { type: "json" };\nconsole.log(`${config.name}:${config.port}`);\n',
+    "utf8"
+  );
+
+  class TerminalShellDirectFinalizeProvider implements ProviderClient {
+    readonly name = "terminal-shell-direct-finalize-provider";
+    continuationPromptCount = 0;
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "Read app.config.json and verify existing direct-finalize-report.mjs so running `node direct-finalize-report.mjs` prints exactly `SelfMe:3000`. Keep working until the output is exact.";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "node direct-finalize-report.mjs"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        this.continuationPromptCount += 1;
+        yield {
+          delta: "This extra assistant pass should not happen after a terminal exact-output shell success."
+        };
+        return;
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const provider = new TerminalShellDirectFinalizeProvider();
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider,
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Read app.config.json and verify existing direct-finalize-report.mjs so running `node direct-finalize-report.mjs` prints exactly `SelfMe:3000`. Keep working until the output is exact."
+  });
+
+  assert.equal(provider.continuationPromptCount, 0);
+  assert.equal(result.assistantText, "Completed and reran the verification command; the final output was `SelfMe:3000`.");
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node direct-finalize-report.mjs · completed")),
+    "expected direct shell verification success before the runtime finalized the task"
+  );
 }
 
 async function verifyLongCompletionToneWithPendingWorkStillContinues() {
