@@ -4502,7 +4502,16 @@ function extractRecentPendingNextTarget(
     }
   }
 
-  return undefined;
+  const latestTool = findNearestToolTimelineEntryBeforeIndex(
+    timeline,
+    timeline.length,
+    previousActionableUserIndex
+  );
+
+  return derivePendingNextTargetFromLatestToolContext({
+    originalRequest,
+    latestTool
+  });
 }
 
 function findNearestToolTimelineEntryBeforeIndex(
@@ -6616,6 +6625,44 @@ function inferPendingNextStepTargetFromRecentToolContext(input: {
   }
 
   if (!inferredTarget || pathsReferToSameTarget(inferredTarget, input.explicitTarget)) {
+    return undefined;
+  }
+
+  return inferredTarget;
+}
+
+function derivePendingNextTargetFromLatestToolContext(input: {
+  originalRequest?: string;
+  latestTool?: {
+    toolName?: string;
+    toolSummary?: string;
+    toolRawOutput?: string;
+  };
+}) {
+  if (!input.originalRequest || input.latestTool?.toolName !== "files" || !input.latestTool.toolSummary) {
+    return undefined;
+  }
+
+  const latestPath = extractPathFromToolSummary(input.latestTool.toolSummary);
+
+  if (!latestPath) {
+    return undefined;
+  }
+
+  let inferredTarget: string | undefined;
+
+  if (looksLikeWholeProjectInspectionRequest(input.originalRequest)) {
+    inferredTarget = deriveLikelyWholeProjectInspectionPath(latestPath, input.latestTool.toolRawOutput);
+  } else if (
+    looksLikeBroadProjectImprovementRequest(input.originalRequest)
+    || looksLikeExecutableProjectRewriteRequest(input.originalRequest)
+  ) {
+    inferredTarget = deriveLikelyProjectImplementationPath(latestPath, input.latestTool.toolRawOutput);
+  } else if (looksLikeProjectInspectionRequest(input.originalRequest)) {
+    inferredTarget = deriveLikelyProjectWorkfileFromEntryPath(latestPath, input.latestTool.toolRawOutput);
+  }
+
+  if (!inferredTarget || pathsReferToSameTarget(inferredTarget, latestPath)) {
     return undefined;
   }
 
