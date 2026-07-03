@@ -4097,6 +4097,7 @@ async function main() {
   await verifyResumeFollowUpDoesNotLeakStaleToolAnchor();
   await verifyResumeFollowUpDoesNotLeakStaleInterruptedApproval();
   await verifyApproveFollowUpDoesNotLeakOldProposalIntoInterruptedTask();
+  await verifyApproveFollowUpDoesNotLeakOldDeniedApprovalIntoNewInspectProposal();
   await verifyResumeFollowUpAfterApprovalWaitInProjectChain();
   await verifyBareAffirmativeAfterApprovalWaitInProjectChain();
   await verifyVagueOptimizationAfterApprovalWaitInProjectChain();
@@ -5238,6 +5239,162 @@ async function verifyOldDeniedApprovalDoesNotLeakIntoNewProjectFollowUp() {
 
 async function verifyOldDeniedApprovalDoesNotLeakIntoNewProjectRewriteFollowUp() {
   await verifyOldDeniedApprovalDoesNotLeakIntoNewProjectMutationFollowUp("帮我重写项目");
+}
+
+async function verifyApproveFollowUpDoesNotLeakOldDeniedApprovalIntoNewInspectProposal() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-no-stale-denied-approve-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "package.json"),
+    '{\n  "name": "node-todo",\n  "version": "1.0.0"\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const PORT = 3000;\nconsole.log(PORT);\n',
+    "utf8"
+  );
+
+  class NoStaleDeniedApproveInspectProvider implements ProviderClient {
+    readonly name = "no-stale-denied-approve-inspect-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const deniedPrompt = "Create blocked-old.txt with the content hidden.";
+      const inspectPrompt = "帮我看看项目";
+      const executeInspectProposalPrompt = 'The user replied "可以" and wants you to execute the immediately previous inspect proposal now.';
+
+      if (input.content === deniedPrompt) {
+        yield {
+          delta: toolCall("write", {
+            path: "blocked-old.txt",
+            content: "hidden\n"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${deniedPrompt}`)) {
+        assert.match(input.content, /denied by the user/i);
+        yield { delta: "I couldn't create blocked-old.txt because the write action was denied." };
+        return;
+      }
+
+      if (input.content === inspectPrompt) {
+        yield {
+          delta: "我先看了工作区列表，当前最像完整项目的是 node-todo。如果你愿意，我下一步可以继续读取 node-todo/package.json 和 node-todo/app.js。"
+        };
+        return;
+      }
+
+      if (input.content.startsWith(executeInspectProposalPrompt)) {
+        assert.doesNotMatch(input.content, /Latest denied approval:/);
+        assert.match(input.content, /Approved proposal: .*node-todo\/package\.json.*node-todo\/app\.js/u);
+        assert.doesNotMatch(input.content, /blocked-old\.txt/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/package.json",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${executeInspectProposalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield { delta: "I inspected node-todo/package.json and node-todo/app.js." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new NoStaleDeniedApproveInspectProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  let approvalCount = 0;
+  bus.on("approval.requested", (event) => {
+    approvalCount += 1;
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/deny ${event.payload.approvalId}`
+    }));
+  });
+
+  const deniedResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Create blocked-old.txt with the content hidden."
+  });
+  assert.match(deniedResult.assistantText, /(denied|not approved)/i);
+
+  const proposalResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "帮我看看项目"
+  });
+  assert.match(proposalResult.assistantText, /node-todo\/package\.json/);
+
+  const approveResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "可以"
+  });
+
+  assert.equal(
+    approveResult.toolSummaries.some((summary) => summary.startsWith("blocked-old.txt")),
+    false,
+    "approve follow-up should not reuse the older denied write target"
+  );
+  assert.ok(
+    approveResult.toolSummaries.some((summary) => summary.startsWith("node-todo/package.json:1-3")),
+    "approve follow-up should execute the new inspect proposal from the project entry"
+  );
+  assert.ok(
+    approveResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-2")),
+    "approve follow-up should continue the new inspect proposal into the implementation file"
+  );
+  assert.equal(approvalCount, 1, "expected only the original denied write approval");
 }
 
 async function verifyOldDeniedApprovalDoesNotLeakIntoNewProjectMutationFollowUp(
