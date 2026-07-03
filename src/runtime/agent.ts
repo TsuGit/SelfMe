@@ -837,6 +837,13 @@ export class AgentRuntime {
         nextPrompt = toolStep.nextPrompt;
       }
 
+      await this.recordAssistantPassLimitPendingCheckpoint({
+        sessionId,
+        taskId: responseTaskId,
+        originalRequest,
+        nextPrompt,
+        previousToolResult: lastToolResult
+      });
       throw new Error(`Agent stopped after ${maxAssistantPasses} assistant passes`);
     } catch (error) {
       if (isAbortError(error)) {
@@ -908,6 +915,35 @@ export class AgentRuntime {
     previousToolResult?: RuntimeToolResult;
   }) {
     const targetPath = extractPendingTargetPathFromToolRequest(input.toolName, input.toolInput);
+
+    if (!targetPath) {
+      return;
+    }
+
+    const checkpointContent = buildStepLimitPendingCheckpointContent({
+      originalRequest: input.originalRequest,
+      targetPath,
+      previousToolResult: input.previousToolResult
+    });
+    const checkpointEvent = createAssistantCheckpointRecordedEvent({
+      sessionId: input.sessionId,
+      taskId: input.taskId,
+      kind: "pending_next_step",
+      content: checkpointContent,
+      targetPath
+    });
+    this.input.bus.emit(checkpointEvent);
+    await this.input.transcriptStore.appendEvent(checkpointEvent);
+  }
+
+  private async recordAssistantPassLimitPendingCheckpoint(input: {
+    sessionId: string;
+    taskId: string;
+    originalRequest: string;
+    nextPrompt: string;
+    previousToolResult?: RuntimeToolResult;
+  }) {
+    const targetPath = extractPendingTargetPathFromContinuationPrompt(input.nextPrompt);
 
     if (!targetPath) {
       return;
@@ -6794,6 +6830,25 @@ function extractPendingTargetPathFromToolRequest(toolName: string, toolInput: un
     : undefined;
 
   return candidatePath || undefined;
+}
+
+function extractPendingTargetPathFromContinuationPrompt(content: string) {
+  const patterns = [
+    /\bPending next step target:\s*([A-Za-z0-9_./-]+\.(?:tsx|json|mjs|cjs|ejs|html|css|js|ts|txt|md|csv))/i,
+    /\bLikely target file:\s*([A-Za-z0-9_./-]+\.(?:tsx|json|mjs|cjs|ejs|html|css|js|ts|txt|md|csv))/i,
+    /\bRecent editable working file:\s*([A-Za-z0-9_./-]+\.(?:tsx|json|mjs|cjs|ejs|html|css|js|ts|txt|md|csv))/i
+  ];
+
+  for (const pattern of patterns) {
+    const match = content.match(pattern);
+    const targetPath = match?.[1]?.trim();
+
+    if (targetPath) {
+      return normalizePromptPath(targetPath);
+    }
+  }
+
+  return undefined;
 }
 
 function buildStepLimitPendingCheckpointContent(input: {

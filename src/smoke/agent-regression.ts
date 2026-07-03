@@ -3801,6 +3801,7 @@ async function main() {
   );
 
   await verifyResumeAfterToolStepLimitFailure();
+  await verifyResumeAfterAssistantPassLimitFailure();
 
   assert.ok(approvals.length >= 2, "expected at least two approvals to be auto-approved");
 
@@ -4247,6 +4248,186 @@ async function verifyResumeAfterToolStepLimitFailure() {
     resumedResult.toolSummaries.filter((summary) => summary.startsWith("alpha-9.txt:1-1")).length,
     1,
     "step-limit resume should execute only the pending ninth read"
+  );
+}
+
+async function verifyResumeAfterAssistantPassLimitFailure() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-assistant-pass-limit-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  const originalPrompt = "Read app.config.json and fix assistant-pass-limit-report.mjs so running `node assistant-pass-limit-report.mjs` prints exactly `SelfMe:3000` on one line. Keep working until the output is exact.";
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "app.config.json"), '{\n  "name": "SelfMe",\n  "port": 3000\n}\n', "utf8");
+  await writeFile(
+    join(workspace, "assistant-pass-limit-report.mjs"),
+    'import config from "./app.conf.json" with { type: "json" };\nconsole.log(`${config.name}:${config.port}`);\n',
+    "utf8"
+  );
+
+  class AssistantPassLimitResumeProvider implements ProviderClient {
+    readonly name = "assistant-pass-limit-resume-provider";
+    private loopReplyCount = 0;
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "app.config.json",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /app\.config\.json/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node assistant-pass-limit-report.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /failed \(1\)/.test(summary)) {
+          assert.match(input.content, /Likely target file: assistant-pass-limit-report\.mjs/);
+          this.loopReplyCount += 1;
+          yield {
+            delta: `Regression loop marker ${this.loopReplyCount} stays focused on assistant-pass-limit-report.mjs and the unresolved import path app.conf.json, the source location is already narrow, this intentionally verbose sentence avoids short progress classification, and no user input ambiguity exists in this branch.`
+          };
+          return;
+        }
+      }
+
+      if (
+        !input.content.startsWith("Original user request:")
+        && input.content.includes('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
+      ) {
+        assert.match(input.content, /Original task: Read app\.config\.json and fix assistant-pass-limit-report\.mjs/);
+        assert.match(input.content, /Pending next step target: assistant-pass-limit-report\.mjs/);
+        assert.match(input.content, /Latest tool in context: shell/);
+        assert.match(input.content, /Latest tool summary in context: node assistant-pass-limit-report\.mjs · failed \(1\)/);
+        yield {
+          delta: toolCall("files", {
+            path: "assistant-pass-limit-report.mjs",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (
+        input.content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
+      ) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /assistant-pass-limit-report\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "assistant-pass-limit-report.mjs",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'import config from "./app.config.json" with { type: "json" };'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /assistant-pass-limit-report\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node assistant-pass-limit-report.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /completed/.test(summary)) {
+          yield { delta: "Repaired assistant-pass-limit-report.mjs and verified the final output is SelfMe:3000." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new AssistantPassLimitResumeProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  bus.on("approval.requested", (event) => {
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const failedResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: originalPrompt,
+    expectedState: "failed"
+  });
+
+  assert.ok(
+    failedResult.toolSummaries.some((summary) => summary.startsWith("node assistant-pass-limit-report.mjs · failed (1)")),
+    "expected the assistant-pass-limit scenario to reach a real failed verification first"
+  );
+  assert.ok(
+    failedResult.runtimeErrors.some((message) => message.includes("Agent stopped after 96 assistant passes")),
+    "expected a deterministic assistant-pass ceiling before resume"
+  );
+
+  const resumedResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "还能继续吗"
+  });
+
+  const resumedContent = await readFile(join(workspace, "assistant-pass-limit-report.mjs"), "utf8");
+  assert.match(resumedContent, /app\.config\.json/);
+  assert.match(resumedResult.assistantText, /SelfMe:3000|assistant-pass-limit-report\.mjs/i);
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("app.config.json:1-4")),
+    false,
+    "assistant-pass-limit resume should not reread the earlier config source"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("assistant-pass-limit-report.mjs:1-2")),
+    "assistant-pass-limit resume should continue directly into the pending file read"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("assistant-pass-limit-report.mjs:1-1 · updated")),
+    "assistant-pass-limit resume should repair the pending file after reading it"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node assistant-pass-limit-report.mjs · completed")),
+    "assistant-pass-limit resume should finish the pending verification after the repair"
   );
 }
 
