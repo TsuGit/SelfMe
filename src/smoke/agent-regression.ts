@@ -3733,6 +3733,7 @@ async function main() {
   await verifyVagueRewriteResumesInterruptedProposalExecution("帮我重写项目");
   await verifyAlternateVagueRewriteResumesInterruptedProposalExecution();
   await verifyVagueOptimizationExecutesPreviousProposal();
+  await verifyVagueOptimizationProposalContinuesAfterLongExplanation();
   await verifyEnglishPlanningStyleOptimizationProposalExecutesPreviousProposal();
   await verifyChineseOptimizationProposalExecutesPreviousProposal();
   await verifyDirectEditFollowUpExecutesPreviousProposal();
@@ -5393,6 +5394,183 @@ async function verifyVagueOptimizationExecutesPreviousProposal() {
   assert.ok(
     followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1 · updated")),
     "expected vague optimization follow-up to finish the view edit from the previous optimize proposal"
+  );
+}
+
+async function verifyVagueOptimizationProposalContinuesAfterLongExplanation() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-vague-optimize-proposal-long-explanation-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const PORT = 3000;\nconsole.log(PORT);\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<input name="title" />\n',
+    "utf8"
+  );
+
+  class VagueOptimizeProposalLongExplanationProvider implements ProviderClient {
+    readonly name = "vague-optimize-proposal-long-explanation-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const proposalPrompt = "看看项目，但先别改，告诉我如果优化 node-todo 你会怎么做。";
+      const executeProposalPrompt = 'The user replied "帮我优化下" and wants you to execute the immediately previous optimize proposal now.';
+
+      if (input.content === proposalPrompt) {
+        yield {
+          delta: [
+            "If you want, I can optimize node-todo by updating node-todo/app.js and node-todo/views/index.ejs.",
+            "I would first switch node-todo/app.js to process.env.PORT, then add maxlength 100 in node-todo/views/index.ejs."
+          ].join(" ")
+        };
+        return;
+      }
+
+      if (input.content.startsWith(executeProposalPrompt)) {
+        assert.match(input.content, /Approved proposal:/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/app.js",
+            startLine: 1,
+            endLine: 2
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${executeProposalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          if (/You are already inside the execution phase of a concrete task\./.test(input.content)) {
+            yield {
+              delta: "node-todo/app.js 当前把端口写死在常量里，这说明应用入口还停留在很基础的单环境写法；如果目标是把这个项目按刚才的优化方案真正落到可部署的方向，那么这里确实是第一步该改的位置，但仅仅说明这一点还不够，因为这条已批准的执行链还需要继续把 app.js 真正改成读取 process.env.PORT，然后再推进到 views/index.ejs 去补 maxlength 100。"
+            };
+            return;
+          }
+
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (
+          toolName === "files"
+          && /node-todo\/app\.js/.test(summary)
+          && /You are already inside the execution phase of a concrete task\./.test(input.content)
+        ) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1,
+              replacement: '<input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield { delta: "Optimized node-todo by updating app.js and views/index.ejs from the previous proposal." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new VagueOptimizeProposalLongExplanationProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const proposalResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "看看项目，但先别改，告诉我如果优化 node-todo 你会怎么做。"
+  });
+  assert.match(proposalResult.assistantText, /node-todo\/app\.js/i);
+  assert.match(proposalResult.assistantText, /node-todo\/views\/index\.ejs/i);
+
+  const followUpResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "帮我优化下"
+  });
+
+  const optimizedAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const optimizedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(optimizedAppContent, /process\.env\.PORT/);
+  assert.match(optimizedViewContent, /maxlength="100"/);
+  assert.match(followUpResult.assistantText, /node-todo/i);
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-2")),
+    "expected vague optimization proposal long-explanation flow to start from app.js"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-1 · updated")),
+    "expected vague optimization proposal long-explanation flow to still edit app.js after the long explanation"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1")),
+    "expected vague optimization proposal long-explanation flow to continue into views/index.ejs"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1 · updated")),
+    "expected vague optimization proposal long-explanation flow to finish the view edit"
   );
 }
 
