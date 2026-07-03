@@ -119,6 +119,7 @@ async function main() {
   await writeFile(join(workspace, "unrelated-anchor-report.mjs"), 'import config from "./app.config.json" with { type: "json" };\nconsole.log(`${config.name}-${config.port}`);\n', "utf8");
   await writeFile(join(workspace, "over-verify-report.mjs"), 'import config from "./app.config.json" with { type: "json" };\nconsole.log(`${config.name}-${config.port}`);\n', "utf8");
   await writeFile(join(workspace, "invalid-tool-resume-report.mjs"), 'import config from "./app.conf.json" with { type: "json" };\nconsole.log(`${config.name}:${config.port}`);\n', "utf8");
+  await writeFile(join(workspace, "no-tool-invalid-resume-report.mjs"), 'console.log("pending");\n', "utf8");
   await writeFile(join(workspace, "option-start-report.mjs"), 'console.log("pending");\n', "utf8");
   await writeFile(join(workspace, "question-start-report.mjs"), 'console.log("pending");\n', "utf8");
   await writeFile(
@@ -3508,6 +3509,43 @@ async function main() {
   assert.ok(
     invalidToolInputResumeResult.toolSummaries.some((summary) => summary.startsWith("node invalid-tool-resume-report.mjs · completed")),
     "expected invalid-tool-input resume to finish verification after the repair"
+  );
+
+  console.log("task: resume after invalid tool input before the first real tool runs");
+  const noToolInvalidResumeFailedResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Fix no-tool-invalid-resume-report.mjs so running `node no-tool-invalid-resume-report.mjs` prints exactly `ready`. Verify it before finishing, even if your first edit tool input is invalid.",
+    expectedState: "failed"
+  });
+
+  assert.ok(
+    noToolInvalidResumeFailedResult.runtimeErrors.length > 0,
+    "expected repeated invalid first-tool input to fail before resume"
+  );
+
+  const noToolInvalidResumeResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "还能继续吗"
+  });
+
+  const noToolInvalidResumeContent = await readFile(join(workspace, "no-tool-invalid-resume-report.mjs"), "utf8");
+  assert.match(noToolInvalidResumeContent, /ready/);
+  assert.match(noToolInvalidResumeResult.assistantText, /ready|no-tool-invalid-resume-report\.mjs/i);
+  assert.ok(
+    noToolInvalidResumeResult.toolSummaries.some((summary) => summary.startsWith("no-tool-invalid-resume-report.mjs:1-1")),
+    "expected first-tool invalid-input resume to inspect the original target file"
+  );
+  assert.ok(
+    noToolInvalidResumeResult.toolSummaries.some((summary) => summary.startsWith("no-tool-invalid-resume-report.mjs:1-1 · updated")),
+    "expected first-tool invalid-input resume to repair the original target file"
+  );
+  assert.ok(
+    noToolInvalidResumeResult.toolSummaries.some((summary) => summary.startsWith("node no-tool-invalid-resume-report.mjs · completed")),
+    "expected first-tool invalid-input resume to finish verification after the repair"
   );
 
   console.log("task: accept shell cmd alias payload");
@@ -25338,6 +25376,12 @@ function resolveProviderResponse(content: string) {
     });
   }
 
+  if (content.startsWith("Fix no-tool-invalid-resume-report.mjs so running `node no-tool-invalid-resume-report.mjs` prints exactly `ready`. Verify it before finishing, even if your first edit tool input is invalid.")) {
+    return toolCall("edit", {
+      path: "no-tool-invalid-resume-report.mjs"
+    });
+  }
+
   if (content.startsWith("Tell me the current working directory again using a shell cmd alias payload.")) {
     return [
       "<tool_call>",
@@ -29702,6 +29746,36 @@ function resolveProviderResponse(content: string) {
     }
   }
 
+  if (content.startsWith("Original user request: Fix no-tool-invalid-resume-report.mjs so running `node no-tool-invalid-resume-report.mjs` prints exactly `ready`. Verify it before finishing, even if your first edit tool input is invalid.")) {
+    const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
+    const summary = extractLine(content, "Summary:") ?? extractLine(content, "Latest summary:") ?? "";
+
+    if (/Validation error:/i.test(content)) {
+      return toolCall("edit", {
+        path: "no-tool-invalid-resume-report.mjs"
+      });
+    }
+
+    if (toolName === "files" && /no-tool-invalid-resume-report\.mjs/.test(summary)) {
+      return toolCall("edit", {
+        path: "no-tool-invalid-resume-report.mjs",
+        startLine: 1,
+        endLine: 1,
+        replacement: 'console.log("ready");'
+      });
+    }
+
+    if (toolName === "edit" && /no-tool-invalid-resume-report\.mjs/.test(summary)) {
+      return toolCall("shell", {
+        command: "node no-tool-invalid-resume-report.mjs"
+      });
+    }
+
+    if (toolName === "shell" && /completed/.test(summary)) {
+      return "Repaired no-tool-invalid-resume-report.mjs and verified the final output is ready.";
+    }
+  }
+
   if (content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
     && /Original task: Read app\.config\.json and fix invalid-tool-resume-report\.mjs/.test(content)
   ) {
@@ -29738,6 +29812,43 @@ function resolveProviderResponse(content: string) {
 
     if (toolName === "shell" && /completed/.test(summary)) {
       return "Repaired invalid-tool-resume-report.mjs and verified the final output is SelfMe:3000.";
+    }
+  }
+
+  if (content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
+    && /Original task: Fix no-tool-invalid-resume-report\.mjs so running `node no-tool-invalid-resume-report\.mjs` prints exactly `ready`\./.test(content)
+  ) {
+    assert.match(content, /Pending next step target: no-tool-invalid-resume-report\.mjs/);
+    return toolCall("files", {
+      path: "no-tool-invalid-resume-report.mjs",
+      startLine: 1,
+      endLine: 20
+    });
+  }
+
+  if (content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
+    && /Original task: Fix no-tool-invalid-resume-report\.mjs so running `node no-tool-invalid-resume-report\.mjs` prints exactly `ready`\./.test(content)
+  ) {
+    const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
+    const summary = extractLine(content, "Summary:") ?? extractLine(content, "Latest summary:") ?? "";
+
+    if (toolName === "files" && /no-tool-invalid-resume-report\.mjs/.test(summary)) {
+      return toolCall("edit", {
+        path: "no-tool-invalid-resume-report.mjs",
+        startLine: 1,
+        endLine: 1,
+        replacement: 'console.log("ready");'
+      });
+    }
+
+    if (toolName === "edit" && /no-tool-invalid-resume-report\.mjs/.test(summary)) {
+      return toolCall("shell", {
+        command: "node no-tool-invalid-resume-report.mjs"
+      });
+    }
+
+    if (toolName === "shell" && /completed/.test(summary)) {
+      return "Repaired no-tool-invalid-resume-report.mjs and verified the final output is ready.";
     }
   }
 

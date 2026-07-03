@@ -260,7 +260,7 @@
           <li>普通工具执行失败（例如缺文件、edit range 越界）现在也会进入统一的 failed tool result 历史，而不是掉进零散的 runtime error 分支，后续 continuation / repair 能直接复用这条失败锚点。</li>
           <li>项目入口、第一个核心实现文件，或第一处已落到的工作文件后的长解释句，现在也会继续被拉回到下一个真正动作，而不是停在“我已经看出问题了”的说明态。</li>
           <li>即便 stop 发生在项目入口刚读完、assistant 还没来得及吐出“下一步我会继续看 app.js / server.js”这类阶段总结之前，resume 现在也会优先根据最近 tool 上下文推断下一步，而不是重新从 listing、package 或 README 起跑。</li>
-          <li>如果任务不是被用户手动 stop，而是刚好撞到 tool-step 上限，runtime 现在也会先把那条尚未执行的 <code>files</code> / <code>edit</code> / <code>write</code> 目标记录成 pending next step；如果撞到的是 assistant-pass 上限，或者 repeated assistant stall / repeated tool stall 这类已经收窄到具体文件的循环失败，continuation prompt 里明确的目标文件也会被记下来；即便卡住点不是 shell / files 重复，而是连续 malformed tool call、unknown tool 或 invalid tool input 这种模型工具调用循环，只要前面已经有明确工作目标，后续一句 <code>继续</code> 也会优先接回那个文件，而不是回到更宽的目录勘查重新起跑。</li>
+          <li>如果任务不是被用户手动 stop，而是刚好撞到 tool-step 上限，runtime 现在也会先把那条尚未执行的 <code>files</code> / <code>edit</code> / <code>write</code> 目标记录成 pending next step；如果撞到的是 assistant-pass 上限，或者 repeated assistant stall / repeated tool stall 这类已经收窄到具体文件的循环失败，continuation prompt 里明确的目标文件也会被记下来；即便卡住点不是 shell / files 重复，而是连续 malformed tool call、unknown tool 或 invalid tool input 这种模型工具调用循环，只要前面已经有明确工作目标，甚至目标还只是来自 original request、还没跑出第一条真实 tool result，后续一句 <code>继续</code> 也会优先接回那个文件，而不是回到更宽的目录勘查重新起跑。</li>
           <li>下次继续时，优先看真实交互里是否仍然存在“一次工具、一句收尾、提前停住”的体感问题，而不是先回头补更多 smoke 文案分支。</li>
           <li>如果需要快速判断当前是不是跑偏，先跑 <code>pnpm smoke:agent</code> 守住基线，再去复现真实会话里的 continuation / resume / long-task 行为。</li>
         </ul>
