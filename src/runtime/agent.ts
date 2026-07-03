@@ -36,6 +36,7 @@ const VERIFICATION_AGENT_TOOL_STEPS = 24;
 const PROJECT_AGENT_TOOL_STEPS = 32;
 const ASSISTANT_PASS_MULTIPLIER = 4;
 const MAX_AUTO_STEP_LIMIT_CONTINUATIONS = 2;
+const MAX_AUTO_ASSISTANT_PASS_LIMIT_CONTINUATIONS = 1;
 const MAX_REPEATED_IDENTICAL_TOOL_RESULTS = 2;
 const MAX_REPEATED_IDENTICAL_ASSISTANT_MESSAGES = 2;
 const MAX_MALFORMED_TOOL_CALL_RETRIES = 1;
@@ -625,6 +626,7 @@ export class AgentRuntime {
     let unknownToolRetryCount = 0;
     let invalidToolInputRetryCount = 0;
     let autoStepLimitContinuationCount = 0;
+    let autoAssistantPassContinuationCount = 0;
     const activeRun = this.startActiveRun(sessionId, responseTaskId);
     this.taskOriginalRequests.set(responseTaskId, originalRequest);
     this.taskKnownPaths.set(responseTaskId, new Set(extractWritableTaskPaths(originalRequest)));
@@ -642,7 +644,43 @@ export class AgentRuntime {
       let assistantPassCount = 0;
       let toolStepCount = 0;
 
-      while (assistantPassCount < maxAssistantPasses) {
+      while (true) {
+        if (assistantPassCount === maxAssistantPasses) {
+          const pendingTargetPath = extractPendingTargetPathFromContinuationPrompt(nextPrompt)
+            ?? derivePendingTargetPathFromContinuationContext({
+              originalRequest,
+              previousToolResult: lastToolResult
+            });
+
+          await this.recordContinuationPendingCheckpoint({
+            sessionId,
+            taskId: responseTaskId,
+            originalRequest,
+            nextPrompt,
+            previousToolResult: lastToolResult
+          });
+
+          if (
+            pendingTargetPath
+            && autoAssistantPassContinuationCount < MAX_AUTO_ASSISTANT_PASS_LIMIT_CONTINUATIONS
+            && shouldAutoContinueAfterStepLimit(originalRequest, pendingTargetPath)
+          ) {
+            autoAssistantPassContinuationCount += 1;
+            nextPrompt = buildAssistantPassLimitAutoContinuationPrompt({
+              originalRequest,
+              targetPath: pendingTargetPath,
+              previousToolResult: lastToolResult
+            });
+            assistantPassCount = 0;
+            malformedToolCallRetryCount = 0;
+            unknownToolRetryCount = 0;
+            invalidToolInputRetryCount = 0;
+            continue;
+          }
+
+          throw new Error(`Agent stopped after ${maxAssistantPasses} assistant passes`);
+        }
+
         assistantPassCount += 1;
         const workingFileAnchor = this.taskLatestEditablePaths.get(responseTaskId);
         const assistantPass = await this.runAssistantPass({
@@ -899,14 +937,6 @@ export class AgentRuntime {
         nextPrompt = toolStep.nextPrompt;
       }
 
-      await this.recordContinuationPendingCheckpoint({
-        sessionId,
-        taskId: responseTaskId,
-        originalRequest,
-        nextPrompt,
-        previousToolResult: lastToolResult
-      });
-      throw new Error(`Agent stopped after ${maxAssistantPasses} assistant passes`);
     } catch (error) {
       if (isAbortError(error)) {
         await this.finishRuntimeTask({
@@ -7102,6 +7132,25 @@ function buildStepLimitAutoContinuationPrompt(input: {
     "The current task hit the per-slice tool budget but still has unfinished work.",
     "Continue the same task now instead of stopping or restarting from earlier completed steps.",
     "Do not ask the user to continue; keep working from the pending next step target until the original request is actually complete or truly blocked.",
+    `Pending next step target: ${input.targetPath}`,
+    input.previousToolResult ? `Latest tool in context: ${input.previousToolResult.toolName}` : "",
+    input.previousToolResult ? `Latest tool summary in context: ${input.previousToolResult.summary}` : "",
+    `Original task: ${input.originalRequest}`
+  ].filter(Boolean).join("\n");
+}
+
+function buildAssistantPassLimitAutoContinuationPrompt(input: {
+  originalRequest: string;
+  targetPath: string;
+  previousToolResult?: {
+    toolName: string;
+    summary: string;
+  };
+}) {
+  return [
+    "The current task used up its assistant pass budget but still has unfinished work.",
+    "Continue the same task now instead of stopping or repeating the same broad explanation loop.",
+    "Do not ask the user to continue; move directly onto the pending next step target and keep working until the original request is actually complete or truly blocked.",
     `Pending next step target: ${input.targetPath}`,
     input.previousToolResult ? `Latest tool in context: ${input.previousToolResult.toolName}` : "",
     input.previousToolResult ? `Latest tool summary in context: ${input.previousToolResult.summary}` : "",

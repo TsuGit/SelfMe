@@ -3959,7 +3959,7 @@ async function main() {
 
   await verifyResumeAfterToolStepLimitFailure();
   await verifyAutomaticContinuationAfterToolStepLimitBeforeEdit();
-  await verifyResumeAfterAssistantPassLimitFailure();
+  await verifyAutomaticContinuationAfterAssistantPassLimitFailure();
   await verifyDeniedLaterApprovalDoesNotRetrySameAction();
   await verifyResumeAfterDeniedLaterApprovalStaysBlocked();
   await verifyAffirmativeAfterDeniedLaterApprovalStaysBlocked();
@@ -4924,7 +4924,7 @@ async function verifyAutomaticContinuationAfterToolStepLimitBeforeEdit() {
   );
 }
 
-async function verifyResumeAfterAssistantPassLimitFailure() {
+async function verifyAutomaticContinuationAfterAssistantPassLimitFailure() {
   const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-assistant-pass-limit-"));
   const workspace = join(root, "workspace");
   const transcriptPath = join(root, "transcript.jsonl");
@@ -4938,8 +4938,8 @@ async function verifyResumeAfterAssistantPassLimitFailure() {
     "utf8"
   );
 
-  class AssistantPassLimitResumeProvider implements ProviderClient {
-    readonly name = "assistant-pass-limit-resume-provider";
+  class AssistantPassLimitAutoContinueProvider implements ProviderClient {
+    readonly name = "assistant-pass-limit-auto-continue-provider";
     private loopReplyCount = 0;
 
     async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
@@ -4979,7 +4979,7 @@ async function verifyResumeAfterAssistantPassLimitFailure() {
 
       if (
         !input.content.startsWith("Original user request:")
-        && input.content.includes('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
+        && input.content.includes("The current task used up its assistant pass budget but still has unfinished work.")
       ) {
         assert.match(input.content, /Original task: Read app\.config\.json and fix assistant-pass-limit-report\.mjs/);
         assert.match(input.content, /Pending next step target: assistant-pass-limit-report\.mjs/);
@@ -4996,7 +4996,7 @@ async function verifyResumeAfterAssistantPassLimitFailure() {
       }
 
       if (
-        input.content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
+        input.content.startsWith("Original user request: The current task used up its assistant pass budget but still has unfinished work.")
       ) {
         const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
         const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
@@ -5043,7 +5043,7 @@ async function verifyResumeAfterAssistantPassLimitFailure() {
 
   const runtime = new AgentRuntime({
     bus,
-    provider: new AssistantPassLimitResumeProvider(),
+    provider: new AssistantPassLimitAutoContinueProvider(),
     tools: new InMemoryToolRegistry(),
     session,
     transcriptStore,
@@ -5058,49 +5058,41 @@ async function verifyResumeAfterAssistantPassLimitFailure() {
     }));
   });
 
-  const failedResult = await runAgentTask({
+  const result = await runAgentTask({
     bus,
     transcriptStore,
     sessionId: session.sessionId,
-    prompt: originalPrompt,
-    expectedState: "failed"
-  });
-
-  assert.ok(
-    failedResult.toolSummaries.some((summary) => summary.startsWith("node assistant-pass-limit-report.mjs · failed (1)")),
-    "expected the assistant-pass-limit scenario to reach a real failed verification first"
-  );
-  assert.ok(
-    failedResult.runtimeErrors.some((message) => message.includes("Agent stopped after 96 assistant passes")),
-    "expected a deterministic assistant-pass ceiling before resume"
-  );
-
-  const resumedResult = await runAgentTask({
-    bus,
-    transcriptStore,
-    sessionId: session.sessionId,
-    prompt: "还能继续吗"
+    prompt: originalPrompt
   });
 
   const resumedContent = await readFile(join(workspace, "assistant-pass-limit-report.mjs"), "utf8");
   assert.match(resumedContent, /app\.config\.json/);
-  assert.match(resumedResult.assistantText, /SelfMe:3000|assistant-pass-limit-report\.mjs/i);
+  assert.match(result.assistantText, /SelfMe:3000|assistant-pass-limit-report\.mjs/i);
   assert.equal(
-    resumedResult.toolSummaries.some((summary) => summary.startsWith("app.config.json:1-4")),
+    result.toolSummaries.some((summary) => summary.startsWith("app.config.json:1-4")),
     false,
-    "assistant-pass-limit resume should not reread the earlier config source"
+    "automatic assistant-pass continuation should not reread the earlier config source"
   );
   assert.ok(
-    resumedResult.toolSummaries.some((summary) => summary.startsWith("assistant-pass-limit-report.mjs:1-2")),
-    "assistant-pass-limit resume should continue directly into the pending file read"
+    result.toolSummaries.some((summary) => summary.startsWith("assistant-pass-limit-report.mjs:1-2")),
+    "automatic assistant-pass continuation should continue directly into the pending file read"
   );
   assert.ok(
-    resumedResult.toolSummaries.some((summary) => summary.startsWith("assistant-pass-limit-report.mjs:1-1 · updated")),
-    "assistant-pass-limit resume should repair the pending file after reading it"
+    result.toolSummaries.some((summary) => summary.startsWith("assistant-pass-limit-report.mjs:1-1 · updated")),
+    "automatic assistant-pass continuation should repair the pending file after reading it"
   );
   assert.ok(
-    resumedResult.toolSummaries.some((summary) => summary.startsWith("node assistant-pass-limit-report.mjs · completed")),
-    "assistant-pass-limit resume should finish the pending verification after the repair"
+    result.toolSummaries.some((summary) => summary.startsWith("node assistant-pass-limit-report.mjs · failed (1)")),
+    "automatic assistant-pass continuation should still preserve the original failed verification context"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node assistant-pass-limit-report.mjs · completed")),
+    "automatic assistant-pass continuation should finish the pending verification after the repair"
+  );
+  assert.equal(
+    result.runtimeErrors.some((message) => message.includes("Agent stopped after 96 assistant passes")),
+    false,
+    "automatic assistant-pass continuation should finish without surfacing the old assistant-pass hard stop"
   );
 }
 
