@@ -3955,6 +3955,7 @@ async function main() {
   verifyContextCompactionPreservesPendingNextStep();
   verifyContextCompactionPreservesHiddenPendingNextStepCheckpoint();
   verifyContextCompactionDropsOlderPendingNextStepAfterNewRequest();
+  verifyContextCompactionCarriesUnderlyingTaskThroughResumeFollowUp();
   verifyContextCompactionPreservesAssistantStageBoundaries();
   verifyContextCompactionKeepsWholeTurns();
   verifyToolSummaryFormatting();
@@ -23192,6 +23193,53 @@ function verifyContextCompactionDropsOlderPendingNextStepAfterNewRequest() {
   assert.doesNotMatch(recentTaskStateMessage, /Pending next step:/);
   assert.doesNotMatch(recentTaskStateMessage, /node-todo\/app\.js/);
   assert.doesNotMatch(recentTaskStateMessage, /node-todo\/views\/index\.ejs/);
+}
+
+function verifyContextCompactionCarriesUnderlyingTaskThroughResumeFollowUp() {
+  const sessionId = "compaction-resume-underlying-task-session";
+  const events: RuntimeEvent[] = [];
+
+  events.push(createUserMessageSubmittedEvent({
+    sessionId,
+    content: "Read app.config.json and fix report.mjs so running `node report.mjs` prints exactly `SelfMe:3000`. Verify it and keep working until the output is exact."
+  }));
+  events.push(createToolExecutionCompletedEvent({
+    sessionId,
+    taskId: "resume-underlying-tool-1",
+    toolName: "files",
+    summary: "app.config.json:1-4",
+    rawOutput: '{\n  "name": "SelfMe",\n  "port": 3000\n}'
+  }));
+  events.push(createToolExecutionCompletedEvent({
+    sessionId,
+    taskId: "resume-underlying-tool-2",
+    toolName: "edit",
+    summary: "report.mjs:1-2 · updated (2 -> 2 lines)"
+  }));
+  events.push(createToolExecutionCompletedEvent({
+    sessionId,
+    taskId: "resume-underlying-tool-3",
+    toolName: "shell",
+    summary: "node report.mjs · failed (1)",
+    rawOutput: "ReferenceError: config is not defined"
+  }));
+  events.push(createUserMessageSubmittedEvent({
+    sessionId,
+    content: "继续"
+  }));
+
+  const messages = buildContextMessages(events);
+  const recentTaskStateMessage = messages.find((message) => message.role === "system" && message.content.includes("Recent task state:"))?.content ?? "";
+
+  assert.match(recentTaskStateMessage, /Current request: 继续/);
+  assert.match(
+    recentTaskStateMessage,
+    /Underlying task: Read app\.config\.json and fix report\.mjs so running `node report\.mjs` prints exactly `SelfMe:3000`\. Verify it and keep working until the output is exact\./
+  );
+  assert.match(recentTaskStateMessage, /Target output: SelfMe:3000/);
+  assert.match(recentTaskStateMessage, /Target verification: node report\.mjs/);
+  assert.match(recentTaskStateMessage, /Working files: report\.mjs, app\.config\.json|Working files: app\.config\.json, report\.mjs/);
+  assert.match(recentTaskStateMessage, /Last failure: node report\.mjs · failed \(1\)/);
 }
 
 function verifyContextCompactionPreservesAssistantStageBoundaries() {

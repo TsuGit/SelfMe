@@ -156,10 +156,13 @@ export function buildContextMessages(events: Awaited<ReturnType<TranscriptStore[
     .map((entry) => `- ${entry.kind}: ${createInlinePreview(entry.text, MAX_TOOL_NOTE_CHARS)}`);
   const recentCodingNotes = buildRecentCodingNotes(recentEntries);
   const latestUserRequest = [...recentEntries].reverse().find((entry) => entry.kind === "user")?.text;
-  const requestedVerificationCommand = latestUserRequest ? extractVerificationCommandFromRequest(latestUserRequest) : undefined;
-  const requestedPaths = latestUserRequest ? extractTaskRelevantPaths(latestUserRequest, requestedVerificationCommand) : [];
+  const taskAnchorRequest = latestUserRequest
+    ? resolveTaskAnchorRequest(latestUserRequest, timeline)
+    : undefined;
+  const requestedVerificationCommand = taskAnchorRequest ? extractVerificationCommandFromRequest(taskAnchorRequest) : undefined;
+  const requestedPaths = taskAnchorRequest ? extractTaskRelevantPaths(taskAnchorRequest, requestedVerificationCommand) : [];
   const recentRepairSummary = buildRecentRepairSummary(recentEntries, requestedPaths, requestedVerificationCommand);
-  const recentTaskState = buildRecentTaskState(recentEntries, events);
+  const recentTaskState = buildRecentTaskState(recentEntries, events, timeline);
 
   if (summary) {
     messages.push({
@@ -459,14 +462,18 @@ function extractObservedToolOutput(rawOutput?: string) {
 
 function buildRecentTaskState(
   entries: SessionTimelineEntry[],
-  rawEvents: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>
+  rawEvents: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>,
+  allEntries: SessionTimelineEntry[] = entries
 ) {
   const latestUserIndex = findLatestUserEntryIndex(entries);
   const currentTaskEntries = latestUserIndex >= 0 ? entries.slice(latestUserIndex) : entries;
   const latestUserRequest = currentTaskEntries.find((entry) => entry.kind === "user")?.text;
-  const expectedOutput = latestUserRequest ? extractExpectedOutputFromRequest(latestUserRequest) : undefined;
-  const requestedVerificationCommand = latestUserRequest ? extractVerificationCommandFromRequest(latestUserRequest) : undefined;
-  const requestedPaths = latestUserRequest ? extractTaskRelevantPaths(latestUserRequest, requestedVerificationCommand) : [];
+  const taskAnchorRequest = latestUserRequest
+    ? resolveTaskAnchorRequest(latestUserRequest, allEntries)
+    : undefined;
+  const expectedOutput = taskAnchorRequest ? extractExpectedOutputFromRequest(taskAnchorRequest) : undefined;
+  const requestedVerificationCommand = taskAnchorRequest ? extractVerificationCommandFromRequest(taskAnchorRequest) : undefined;
+  const requestedPaths = taskAnchorRequest ? extractTaskRelevantPaths(taskAnchorRequest, requestedVerificationCommand) : [];
   const pendingApproval = extractPendingApprovalState(rawEvents);
   const workingFiles = dedupeNotes(filterTaskRelevantWorkingFiles(
     extractRecentWorkingFiles(currentTaskEntries),
@@ -481,9 +488,13 @@ function buildRecentTaskState(
   const prioritizedRepairState = lastRepairSummary.filter((line) =>
     /^(Last failure|Failure reason|Last verification|Last observed output):/.test(line)
   );
+  const underlyingTask = taskAnchorRequest && latestUserRequest && normalizePreviewText(taskAnchorRequest) !== normalizePreviewText(latestUserRequest)
+    ? taskAnchorRequest
+    : undefined;
 
   const notes = [
     latestUserRequest ? `Current request: ${createInlinePreview(latestUserRequest, 140)}` : "",
+    underlyingTask ? `Underlying task: ${createInlinePreview(underlyingTask, 140)}` : "",
     expectedOutput ? `Target output: ${expectedOutput}` : "",
     requestedVerificationCommand ? `Target verification: ${requestedVerificationCommand}` : "",
     pendingApproval ? `Pending approval: ${pendingApproval}` : "",
@@ -636,6 +647,60 @@ function extractExpectedOutputFromRequest(request: string) {
   return extractExpectedOutputFromTaskRequest(request);
 }
 
+function resolveTaskAnchorRequest(latestUserRequest: string, entries: SessionTimelineEntry[]) {
+  const embeddedAnchor = extractEmbeddedTaskAnchorFromRequest(latestUserRequest);
+
+  if (embeddedAnchor) {
+    return embeddedAnchor;
+  }
+
+  if (!isContextRunnableFollowUp(latestUserRequest)) {
+    return latestUserRequest;
+  }
+
+  return findPreviousActionableUserRequest(entries) ?? latestUserRequest;
+}
+
+function extractEmbeddedTaskAnchorFromRequest(request: string) {
+  const approvedProposalMatch = request.match(/\bApproved proposal:\s*([\s\S]+)$/i);
+
+  if (approvedProposalMatch?.[1]?.trim()) {
+    return approvedProposalMatch[1].trim();
+  }
+
+  const originalTaskMatch = request.match(/\bOriginal task:\s*([\s\S]+)$/i);
+
+  if (originalTaskMatch?.[1]?.trim()) {
+    return originalTaskMatch[1].trim();
+  }
+
+  const previousContextMatch = request.match(/\bPrevious context request:\s*([\s\S]+)$/i);
+
+  if (previousContextMatch?.[1]?.trim()) {
+    return previousContextMatch[1].trim();
+  }
+
+  return undefined;
+}
+
+function findPreviousActionableUserRequest(entries: SessionTimelineEntry[]) {
+  const latestUserIndex = findLatestUserEntryIndex(entries);
+
+  for (let index = latestUserIndex - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+
+    if (entry?.kind !== "user") {
+      continue;
+    }
+
+    if (!isContextRunnableFollowUp(entry.text) && looksLikeContextActionableTaskRequest(entry.text)) {
+      return entry.text;
+    }
+  }
+
+  return undefined;
+}
+
 function extractVerificationCommandFromRequest(request: string) {
   const backtickValues = [...request.matchAll(/`([^`]+)`/g)]
     .map((match) => match[1]?.trim())
@@ -687,6 +752,109 @@ function extractTaskRelevantPaths(request: string, primaryVerificationCommand?: 
     ...directBacktickPaths,
     ...plainTextPaths
   ]);
+}
+
+function isContextRunnableFollowUp(content: string) {
+  return isContextResumeFollowUp(content)
+    || isContextAffirmativeFollowUp(content)
+    || isContextVagueOptimizationFollowUp(content)
+    || isContextVagueRewriteFollowUp(content)
+    || isContextVagueInspectionFollowUp(content);
+}
+
+function isContextResumeFollowUp(content: string) {
+  const normalized = content.trim();
+
+  if (!normalized || normalized.startsWith("/")) {
+    return false;
+  }
+
+  if (normalized.length > 24) {
+    return false;
+  }
+
+  return /^(还能继续吗|能继续吗|继续吗|还能接着做吗|能接着做吗|接着来|接着做|继续做|继续搞|继续弄|继续干)$/iu.test(normalized);
+}
+
+function isContextAffirmativeFollowUp(content: string) {
+  const normalized = content.trim();
+
+  if (!normalized || normalized.startsWith("/")) {
+    return false;
+  }
+
+  if (normalized.length > 24) {
+    return false;
+  }
+
+  return /^(可以|行|好|好的|好啊|继续|开始吧|来吧|弄吧|搞吧|干吧|没问题|行吧|可以了|继续吧|yes|ok|okay|sure|go ahead|please do)$/iu.test(normalized)
+    || /^(?:按你说的|照你说的)(?:改|做|来)吧?$|^(?:按这个|照这个)(?:改|做|来)吧?$|^(?:就按这个|那就按这个)(?:改|做|来)吧?$/iu.test(normalized)
+    || /^(?:继续|继续吧|干|干吧|搞|搞吧|弄|弄吧|来吧|开始吧)(?:[\s,，。!！?？/]+(?:继续|继续吧|干|干吧|搞|搞吧|弄|弄吧|来吧|开始吧))+$/iu.test(normalized);
+}
+
+function isContextVagueOptimizationFollowUp(content: string) {
+  const normalized = content.trim();
+
+  if (!normalized || normalized.startsWith("/")) {
+    return false;
+  }
+
+  if (normalized.length > 32) {
+    return false;
+  }
+
+  return /^(?:帮我)?(?:优化|改进|重构)(?:一下|下)?$/iu.test(normalized)
+    || /^(?:帮我)(?:优化|改进|重构)(?:(?:这个)?(?:项目|仓库|代码))(?:一下|下)?$/iu.test(normalized)
+    || /^(?:optimize|improve|refactor)(?: it| this)?$/iu.test(normalized);
+}
+
+function isContextVagueRewriteFollowUp(content: string) {
+  const normalized = content.trim();
+
+  if (!normalized || normalized.startsWith("/")) {
+    return false;
+  }
+
+  if (normalized.length > 40) {
+    return false;
+  }
+
+  return /^(?:你能)?(?:帮我)?(?:重新写|重写)(?:(?:这个|整个)?(?:项目|仓库|代码)|这个|整个|个项目|一个项目)?(?:一下|下|吗)?$/iu.test(normalized)
+    || /^(?:rewrite|rebuild)(?: it| this| the project)?$/iu.test(normalized);
+}
+
+function isContextVagueInspectionFollowUp(content: string) {
+  const normalized = content.trim();
+
+  if (!normalized || normalized.startsWith("/")) {
+    return false;
+  }
+
+  if (normalized.length > 72) {
+    return false;
+  }
+
+  return /^(?:帮我)?(?:看看|看下|检查下|瞅瞅)(?:这个|一下|下)?$/iu.test(normalized)
+    || /^(?:帮我)(?:看看|看下|检查下|瞅瞅)(?:(?:这个)?(?:项目|仓库|代码))$/iu.test(normalized)
+    || /^(?:你能)?(?:不能)?(?:一次性)?(?:都)?(?:帮我)?(?:(?:看完|看看|检查|检查下|看下|审一下)).*(?:整个|完整|全部).*(?:项目|仓库|代码)(?:吗)?$/iu.test(normalized)
+    || /^(?:你能)?(?:帮我)?(?:把)?(?:整个|完整|全部).*(?:项目|仓库|代码).*(?:看完|看看|检查|检查下|看下|审一下)(?:吗)?$/iu.test(normalized)
+    || /^(?:inspect|review|look at)(?: it| this)?$/iu.test(normalized)
+    || /^(?:inspect|review|look at).*(?:whole|entire|full).*(?:project|repo|repository|codebase)$/iu.test(normalized);
+}
+
+function looksLikeContextActionableTaskRequest(content: string) {
+  if (looksLikeContextDiscussionRequest(content)) {
+    return false;
+  }
+
+  return /\b(read|write|edit|fix|repair|create|inspect|run|running|verify|check|list|update|change|modify|improve|optimize|refactor|rewrite|rebuild)\b/i.test(content)
+    || /\bby running\b/i.test(content)
+    || /(读取|写入|编辑|修复|创建|检查|运行|验证|列出|修改|更新|优化|改进|重构|重写|重做|改成|改为|改下|改一下|换成)/u.test(content);
+}
+
+function looksLikeContextDiscussionRequest(content: string) {
+  return /\b(discuss|brainstorm|explain|why|architecture|tradeoff|plan|strategy|how would you|what would you do|tell me what you(?:'d| would) do)\b/i.test(content)
+    || /(讨论|聊聊|为什么|架构|取舍|方案|计划|策略|先讨论|告诉我.*怎么做|会怎么做|你会怎么做)/u.test(content);
 }
 
 function looksLikePendingAssistantStep(content: string) {
