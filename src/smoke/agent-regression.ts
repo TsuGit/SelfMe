@@ -120,6 +120,7 @@ async function main() {
   await writeFile(join(workspace, "over-verify-report.mjs"), 'import config from "./app.config.json" with { type: "json" };\nconsole.log(`${config.name}-${config.port}`);\n', "utf8");
   await writeFile(join(workspace, "invalid-tool-resume-report.mjs"), 'import config from "./app.conf.json" with { type: "json" };\nconsole.log(`${config.name}:${config.port}`);\n', "utf8");
   await writeFile(join(workspace, "no-tool-invalid-resume-report.mjs"), 'console.log("pending");\n', "utf8");
+  await writeFile(join(workspace, "no-tool-unknown-resume-report.mjs"), 'console.log("pending");\n', "utf8");
   await writeFile(join(workspace, "option-start-report.mjs"), 'console.log("pending");\n', "utf8");
   await writeFile(join(workspace, "question-start-report.mjs"), 'console.log("pending");\n', "utf8");
   await writeFile(
@@ -3546,6 +3547,43 @@ async function main() {
   assert.ok(
     noToolInvalidResumeResult.toolSummaries.some((summary) => summary.startsWith("node no-tool-invalid-resume-report.mjs · completed")),
     "expected first-tool invalid-input resume to finish verification after the repair"
+  );
+
+  console.log("task: resume after unknown tool before the first real tool runs");
+  const noToolUnknownResumeFailedResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Fix no-tool-unknown-resume-report.mjs so running `node no-tool-unknown-resume-report.mjs` prints exactly `ready`. Verify it before finishing, even if your first edit tool name is wrong.",
+    expectedState: "failed"
+  });
+
+  assert.ok(
+    noToolUnknownResumeFailedResult.runtimeErrors.length > 0,
+    "expected repeated unknown first-tool request to fail before resume"
+  );
+
+  const noToolUnknownResumeResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "还能继续吗"
+  });
+
+  const noToolUnknownResumeContent = await readFile(join(workspace, "no-tool-unknown-resume-report.mjs"), "utf8");
+  assert.match(noToolUnknownResumeContent, /ready/);
+  assert.match(noToolUnknownResumeResult.assistantText, /ready|no-tool-unknown-resume-report\.mjs/i);
+  assert.ok(
+    noToolUnknownResumeResult.toolSummaries.some((summary) => summary.startsWith("no-tool-unknown-resume-report.mjs:1-1")),
+    "expected first-tool unknown-tool resume to inspect the original target file"
+  );
+  assert.ok(
+    noToolUnknownResumeResult.toolSummaries.some((summary) => summary.startsWith("no-tool-unknown-resume-report.mjs:1-1 · updated")),
+    "expected first-tool unknown-tool resume to repair the original target file"
+  );
+  assert.ok(
+    noToolUnknownResumeResult.toolSummaries.some((summary) => summary.startsWith("node no-tool-unknown-resume-report.mjs · completed")),
+    "expected first-tool unknown-tool resume to finish verification after the repair"
   );
 
   console.log("task: accept shell cmd alias payload");
@@ -25536,6 +25574,15 @@ function resolveProviderResponse(content: string) {
     });
   }
 
+  if (content.startsWith("Fix no-tool-unknown-resume-report.mjs so running `node no-tool-unknown-resume-report.mjs` prints exactly `ready`. Verify it before finishing, even if your first edit tool name is wrong.")) {
+    return toolCall("edits", {
+      path: "no-tool-unknown-resume-report.mjs",
+      startLine: 1,
+      endLine: 1,
+      replacement: 'console.log("ready");'
+    });
+  }
+
   if (content.startsWith("Tell me the current working directory again using a shell cmd alias payload.")) {
     return [
       "<tool_call>",
@@ -29930,6 +29977,39 @@ function resolveProviderResponse(content: string) {
     }
   }
 
+  if (content.startsWith("Original user request: Fix no-tool-unknown-resume-report.mjs so running `node no-tool-unknown-resume-report.mjs` prints exactly `ready`. Verify it before finishing, even if your first edit tool name is wrong.")) {
+    const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
+    const summary = extractLine(content, "Summary:") ?? extractLine(content, "Latest summary:") ?? "";
+
+    if (/unknown tool/i.test(content) || /available tools are:/i.test(content)) {
+      return toolCall("edits", {
+        path: "no-tool-unknown-resume-report.mjs",
+        startLine: 1,
+        endLine: 1,
+        replacement: 'console.log("ready");'
+      });
+    }
+
+    if (toolName === "files" && /no-tool-unknown-resume-report\.mjs/.test(summary)) {
+      return toolCall("edit", {
+        path: "no-tool-unknown-resume-report.mjs",
+        startLine: 1,
+        endLine: 1,
+        replacement: 'console.log("ready");'
+      });
+    }
+
+    if (toolName === "edit" && /no-tool-unknown-resume-report\.mjs/.test(summary)) {
+      return toolCall("shell", {
+        command: "node no-tool-unknown-resume-report.mjs"
+      });
+    }
+
+    if (toolName === "shell" && /completed/.test(summary)) {
+      return "Repaired no-tool-unknown-resume-report.mjs and verified the final output is ready.";
+    }
+  }
+
   if (content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
     && /Original task: Read app\.config\.json and fix invalid-tool-resume-report\.mjs/.test(content)
   ) {
@@ -30003,6 +30083,43 @@ function resolveProviderResponse(content: string) {
 
     if (toolName === "shell" && /completed/.test(summary)) {
       return "Repaired no-tool-invalid-resume-report.mjs and verified the final output is ready.";
+    }
+  }
+
+  if (content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
+    && /Original task: Fix no-tool-unknown-resume-report\.mjs so running `node no-tool-unknown-resume-report\.mjs` prints exactly `ready`\./.test(content)
+  ) {
+    assert.match(content, /Pending next step target: no-tool-unknown-resume-report\.mjs/);
+    return toolCall("files", {
+      path: "no-tool-unknown-resume-report.mjs",
+      startLine: 1,
+      endLine: 20
+    });
+  }
+
+  if (content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
+    && /Original task: Fix no-tool-unknown-resume-report\.mjs so running `node no-tool-unknown-resume-report\.mjs` prints exactly `ready`\./.test(content)
+  ) {
+    const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
+    const summary = extractLine(content, "Summary:") ?? extractLine(content, "Latest summary:") ?? "";
+
+    if (toolName === "files" && /no-tool-unknown-resume-report\.mjs/.test(summary)) {
+      return toolCall("edit", {
+        path: "no-tool-unknown-resume-report.mjs",
+        startLine: 1,
+        endLine: 1,
+        replacement: 'console.log("ready");'
+      });
+    }
+
+    if (toolName === "edit" && /no-tool-unknown-resume-report\.mjs/.test(summary)) {
+      return toolCall("shell", {
+        command: "node no-tool-unknown-resume-report.mjs"
+      });
+    }
+
+    if (toolName === "shell" && /completed/.test(summary)) {
+      return "Repaired no-tool-unknown-resume-report.mjs and verified the final output is ready.";
     }
   }
 
