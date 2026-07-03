@@ -5099,7 +5099,12 @@ function resolveDeniedApprovalResumeFollowUp(input: {
   historyEvents: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>;
   followUp: RunnableFollowUp;
 }) {
-  if (input.followUp.kind !== "resume" && input.followUp.kind !== "approve") {
+  if (
+    input.followUp.kind !== "resume"
+    && input.followUp.kind !== "approve"
+    && input.followUp.kind !== "optimize"
+    && input.followUp.kind !== "rewrite"
+  ) {
     return undefined;
   }
 
