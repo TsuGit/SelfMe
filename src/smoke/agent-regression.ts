@@ -3956,6 +3956,9 @@ async function main() {
   verifyContextCompactionPreservesHiddenPendingNextStepCheckpoint();
   verifyContextCompactionDropsOlderPendingNextStepAfterNewRequest();
   verifyContextCompactionCarriesUnderlyingTaskThroughResumeFollowUp();
+  verifyContextCompactionCarriesPendingApprovalThroughResumeFollowUp();
+  verifyContextCompactionCarriesPendingNextStepThroughResumeFollowUp();
+  verifyContextCompactionCarriesHiddenPendingNextStepCheckpointThroughResumeFollowUp();
   verifyContextCompactionPreservesAssistantStageBoundaries();
   verifyContextCompactionKeepsWholeTurns();
   verifyToolSummaryFormatting();
@@ -23241,6 +23244,120 @@ function verifyContextCompactionCarriesUnderlyingTaskThroughResumeFollowUp() {
   assert.match(recentTaskStateMessage, /Working files: report\.mjs, app\.config\.json|Working files: app\.config\.json, report\.mjs/);
   assert.match(recentTaskStateMessage, /Last failure: node report\.mjs · failed \(1\)/);
   assert.match(recentTaskStateMessage, /Failure reason: ReferenceError: config is not defined/);
+}
+
+function verifyContextCompactionCarriesPendingApprovalThroughResumeFollowUp() {
+  const sessionId = "compaction-resume-pending-approval-session";
+  const events: RuntimeEvent[] = [];
+
+  events.push(createUserMessageSubmittedEvent({
+    sessionId,
+    content: "Rewrite node-todo and keep working until it is ready."
+  }));
+  events.push(createToolExecutionCompletedEvent({
+    sessionId,
+    taskId: "resume-pending-approval-tool-1",
+    toolName: "edit",
+    summary: "node-todo/app.js:1-3 · updated (3 -> 3 lines)"
+  }));
+  events.push(createApprovalRequestedEvent({
+    sessionId,
+    taskId: "resume-pending-approval-task",
+    toolName: "edit",
+    input: {
+      path: "node-todo/views/index.ejs",
+      startLine: 3,
+      endLine: 3,
+      replacement: '<input name="title" maxlength="100" />'
+    },
+    reason: "Edit node-todo/views/index.ejs",
+    risk: "high"
+  }));
+  events.push(createUserMessageSubmittedEvent({
+    sessionId,
+    content: "继续"
+  }));
+
+  const messages = buildContextMessages(events);
+  const recentTaskStateMessage = messages.find((message) => message.role === "system" && message.content.includes("Recent task state:"))?.content ?? "";
+
+  assert.match(recentTaskStateMessage, /Current request: 继续/);
+  assert.match(recentTaskStateMessage, /Underlying task: Rewrite node-todo and keep working until it is ready\./);
+  assert.match(recentTaskStateMessage, /Working files: node-todo\/app\.js/);
+  assert.match(recentTaskStateMessage, /Pending approval: edit · node-todo\/views\/index\.ejs:3-3/);
+}
+
+function verifyContextCompactionCarriesPendingNextStepThroughResumeFollowUp() {
+  const sessionId = "compaction-resume-pending-next-step-session";
+  const events: RuntimeEvent[] = [];
+
+  events.push(createUserMessageSubmittedEvent({
+    sessionId,
+    content: "Rewrite node-todo and keep working until it is ready."
+  }));
+  events.push(createToolExecutionCompletedEvent({
+    sessionId,
+    taskId: "resume-pending-next-tool-1",
+    toolName: "edit",
+    summary: "node-todo/app.js:1-3 · updated (3 -> 3 lines)"
+  }));
+  events.push(createAssistantDeltaEvent({
+    sessionId,
+    taskId: "resume-pending-next-turn",
+    delta: "I updated node-todo/app.js and will continue with node-todo/views/index.ejs next."
+  }));
+  events.push(createAssistantCompletedEvent({
+    sessionId,
+    taskId: "resume-pending-next-turn",
+    model: "regression-stub"
+  }));
+  events.push(createUserMessageSubmittedEvent({
+    sessionId,
+    content: "可以"
+  }));
+
+  const messages = buildContextMessages(events);
+  const recentTaskStateMessage = messages.find((message) => message.role === "system" && message.content.includes("Recent task state:"))?.content ?? "";
+
+  assert.match(recentTaskStateMessage, /Current request: 可以/);
+  assert.match(recentTaskStateMessage, /Underlying task: Rewrite node-todo and keep working until it is ready\./);
+  assert.match(recentTaskStateMessage, /Working files: node-todo\/app\.js/);
+  assert.match(recentTaskStateMessage, /Pending next step: I updated node-todo\/app\.js and will continue with node-todo\/views\/index\.ejs next\./);
+}
+
+function verifyContextCompactionCarriesHiddenPendingNextStepCheckpointThroughResumeFollowUp() {
+  const sessionId = "compaction-resume-hidden-pending-next-step-session";
+  const events: RuntimeEvent[] = [];
+
+  events.push(createUserMessageSubmittedEvent({
+    sessionId,
+    content: "Rewrite node-todo and keep working until it is ready."
+  }));
+  events.push(createToolExecutionCompletedEvent({
+    sessionId,
+    taskId: "resume-hidden-pending-next-tool-1",
+    toolName: "edit",
+    summary: "node-todo/app.js:1-3 · updated (3 -> 3 lines)"
+  }));
+  events.push(createAssistantCheckpointRecordedEvent({
+    sessionId,
+    taskId: "resume-hidden-pending-next-turn",
+    kind: "pending_next_step",
+    content: "I updated node-todo/app.js and will continue with node-todo/views/index.ejs next.",
+    targetPath: "node-todo/views/index.ejs"
+  }));
+  events.push(createUserMessageSubmittedEvent({
+    sessionId,
+    content: "帮我优化下"
+  }));
+
+  const messages = buildContextMessages(events);
+  const recentTaskStateMessage = messages.find((message) => message.role === "system" && message.content.includes("Recent task state:"))?.content ?? "";
+
+  assert.match(recentTaskStateMessage, /Current request: 帮我优化下/);
+  assert.match(recentTaskStateMessage, /Underlying task: Rewrite node-todo and keep working until it is ready\./);
+  assert.match(recentTaskStateMessage, /Working files: node-todo\/app\.js/);
+  assert.match(recentTaskStateMessage, /Pending next step: I updated node-todo\/app\.js and will continue with node-todo\/views\/index\.ejs next\./);
 }
 
 function verifyContextCompactionPreservesAssistantStageBoundaries() {
