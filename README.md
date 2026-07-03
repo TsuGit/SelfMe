@@ -267,7 +267,7 @@ The current development checkpoint is:
 - terminal UX baseline is established enough to keep runtime work moving
 - `pnpm smoke:agent` is green on the current continuation / resume / multi-step baseline
 - ordinary tool execution failures now stay on the unified failed-tool event path, so missing-file / edit-range failures keep usable task history instead of falling into ad hoc runtime-error-only branches
-- when a task hits either the tool-step ceiling before the next `files` / `edit` / `write` action executes, the assistant-pass ceiling while a concrete next file is already implied by the continuation prompt, or a repeated assistant/tool stall after the task has already narrowed to a concrete next file, runtime now records that pending target so a later `继续` can resume from the blocked step instead of restarting broad exploration
+- when a task hits either the tool-step ceiling before the next `files` / `edit` / `write` action executes, the assistant-pass ceiling while a concrete next file is already implied by the continuation prompt, a repeated assistant/tool stall after the task has already narrowed to a concrete next file, or a repeated malformed/unknown/invalid tool-call loop after the task already has a concrete working target, runtime now records that pending target so a later `继续` can resume from the blocked step instead of restarting broad exploration
 - the active work is still runtime hardening, not feature expansion
 
 The next runtime questions remain:

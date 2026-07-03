@@ -656,6 +656,13 @@ export class AgentRuntime {
           malformedToolCallRetryCount += 1;
 
           if (malformedToolCallRetryCount > MAX_MALFORMED_TOOL_CALL_RETRIES) {
+            await this.recordContinuationPendingCheckpoint({
+              sessionId,
+              taskId: responseTaskId,
+              originalRequest,
+              nextPrompt,
+              previousToolResult: lastToolResult
+            });
             throw new Error(`Model emitted a malformed tool call: ${createMalformedToolCallPreview(assistantPass.rawBuffer)}`);
           }
 
@@ -756,6 +763,13 @@ export class AgentRuntime {
           unknownToolRetryCount += 1;
 
           if (unknownToolRetryCount > MAX_UNKNOWN_TOOL_RETRIES) {
+            await this.recordContinuationPendingCheckpoint({
+              sessionId,
+              taskId: responseTaskId,
+              originalRequest,
+              nextPrompt,
+              previousToolResult: lastToolResult
+            });
             throw new Error(`Unknown tool requested by model: ${assistantPass.toolCall.tool}`);
           }
 
@@ -778,6 +792,13 @@ export class AgentRuntime {
           invalidToolInputRetryCount += 1;
 
           if (invalidToolInputRetryCount > MAX_INVALID_TOOL_INPUT_RETRIES) {
+            await this.recordContinuationPendingCheckpoint({
+              sessionId,
+              taskId: responseTaskId,
+              originalRequest,
+              nextPrompt,
+              previousToolResult: lastToolResult
+            });
             throw error;
           }
 
@@ -957,7 +978,11 @@ export class AgentRuntime {
     nextPrompt: string;
     previousToolResult?: RuntimeToolResult;
   }) {
-    const targetPath = extractPendingTargetPathFromContinuationPrompt(input.nextPrompt);
+    const targetPath = extractPendingTargetPathFromContinuationPrompt(input.nextPrompt)
+      ?? derivePendingTargetPathFromContinuationContext({
+        originalRequest: input.originalRequest,
+        previousToolResult: input.previousToolResult
+      });
 
     if (!targetPath) {
       return;
@@ -6863,6 +6888,51 @@ function extractPendingTargetPathFromContinuationPrompt(content: string) {
   }
 
   return undefined;
+}
+
+function derivePendingTargetPathFromContinuationContext(input: {
+  originalRequest: string;
+  previousToolResult?: {
+    toolName: string;
+    summary: string;
+    rawOutput?: string;
+    errorMessage?: string;
+  };
+}) {
+  const explicitMutationTargets = extractExplicitRequestedMutationTargets(input.originalRequest);
+  const preferredExplicitTarget = [...explicitMutationTargets]
+    .reverse()
+    .find((path) => looksLikeEditableSourcePath(path))
+    ?? explicitMutationTargets.at(-1);
+
+  if (preferredExplicitTarget) {
+    return normalizePromptPath(preferredExplicitTarget);
+  }
+
+  const explicitTargets = extractExplicitFileTargets(input.originalRequest);
+  const preferredExplicitFile = [...explicitTargets]
+    .reverse()
+    .find((path) => looksLikeEditableSourcePath(path))
+    ?? explicitTargets.at(-1);
+
+  if (preferredExplicitFile) {
+    return normalizePromptPath(preferredExplicitFile);
+  }
+
+  if (!input.previousToolResult) {
+    return undefined;
+  }
+
+  if (input.previousToolResult.toolName === "shell") {
+    const shellText = [
+      input.previousToolResult.summary,
+      input.previousToolResult.errorMessage,
+      input.previousToolResult.rawOutput
+    ].filter(Boolean).join("\n");
+    return deriveLikelyTargetFileForShellFailure(input.previousToolResult.summary, shellText);
+  }
+
+  return extractPathFromToolSummary(input.previousToolResult.summary);
 }
 
 function buildStepLimitPendingCheckpointContent(input: {

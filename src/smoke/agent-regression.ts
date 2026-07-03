@@ -118,6 +118,7 @@ async function main() {
   await writeFile(join(workspace, "failure-recap-report.mjs"), 'import config from "./app.config.json" with { type: "json" };\nconsole.log(`${config.name}-${config.port}`);\n', "utf8");
   await writeFile(join(workspace, "unrelated-anchor-report.mjs"), 'import config from "./app.config.json" with { type: "json" };\nconsole.log(`${config.name}-${config.port}`);\n', "utf8");
   await writeFile(join(workspace, "over-verify-report.mjs"), 'import config from "./app.config.json" with { type: "json" };\nconsole.log(`${config.name}-${config.port}`);\n', "utf8");
+  await writeFile(join(workspace, "invalid-tool-resume-report.mjs"), 'import config from "./app.conf.json" with { type: "json" };\nconsole.log(`${config.name}:${config.port}`);\n', "utf8");
   await writeFile(join(workspace, "option-start-report.mjs"), 'console.log("pending");\n', "utf8");
   await writeFile(join(workspace, "question-start-report.mjs"), 'console.log("pending");\n', "utf8");
   await writeFile(
@@ -3465,6 +3466,48 @@ async function main() {
     invalidToolInputRecoveryResult.runtimeErrors.some((message) => /Invalid \/?shell input/i.test(message)),
     false,
     "expected invalid tool input recovery not to fail the task"
+  );
+
+  console.log("task: resume after repeated invalid tool input failure");
+  const invalidToolInputFailedResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "Read app.config.json and fix invalid-tool-resume-report.mjs so running `node invalid-tool-resume-report.mjs` prints exactly `SelfMe:3000` on one line. Keep working until the output is exact, even if a shell tool input becomes invalid.",
+    expectedState: "failed"
+  });
+
+  assert.ok(
+    invalidToolInputFailedResult.runtimeErrors.length > 0,
+    "expected repeated invalid tool input to fail before resume"
+  );
+
+  const invalidToolInputResumeResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "还能继续吗"
+  });
+
+  const invalidToolResumeContent = await readFile(join(workspace, "invalid-tool-resume-report.mjs"), "utf8");
+  assert.match(invalidToolResumeContent, /app\.config\.json/);
+  assert.match(invalidToolInputResumeResult.assistantText, /SelfMe:3000|invalid-tool-resume-report\.mjs/i);
+  assert.equal(
+    invalidToolInputResumeResult.toolSummaries.some((summary) => summary.startsWith("app.config.json:1-4")),
+    false,
+    "expected invalid-tool-input resume to skip rereading the config source after continue"
+  );
+  assert.ok(
+    invalidToolInputResumeResult.toolSummaries.some((summary) => summary.startsWith("invalid-tool-resume-report.mjs:1-2")),
+    "expected invalid-tool-input resume to continue directly into the pending file read"
+  );
+  assert.ok(
+    invalidToolInputResumeResult.toolSummaries.some((summary) => summary.startsWith("invalid-tool-resume-report.mjs:1-1 · updated")),
+    "expected invalid-tool-input resume to repair the pending file after reading it"
+  );
+  assert.ok(
+    invalidToolInputResumeResult.toolSummaries.some((summary) => summary.startsWith("node invalid-tool-resume-report.mjs · completed")),
+    "expected invalid-tool-input resume to finish verification after the repair"
   );
 
   console.log("task: accept shell cmd alias payload");
@@ -25287,6 +25330,14 @@ function resolveProviderResponse(content: string) {
     return toolCall("shell", {});
   }
 
+  if (content.startsWith("Read app.config.json and fix invalid-tool-resume-report.mjs so running `node invalid-tool-resume-report.mjs` prints exactly `SelfMe:3000` on one line. Keep working until the output is exact, even if a shell tool input becomes invalid.")) {
+    return toolCall("files", {
+      path: "app.config.json",
+      startLine: 1,
+      endLine: 20
+    });
+  }
+
   if (content.startsWith("Tell me the current working directory again using a shell cmd alias payload.")) {
     return [
       "<tool_call>",
@@ -29615,6 +29666,79 @@ function resolveProviderResponse(content: string) {
     assert.match(content, /Tool: shell/);
     assert.match(content, /pwd/);
     return "The working directory is the current workspace root.";
+  }
+
+  if (content.startsWith("Original user request: Read app.config.json and fix invalid-tool-resume-report.mjs so running `node invalid-tool-resume-report.mjs` prints exactly `SelfMe:3000` on one line. Keep working until the output is exact, even if a shell tool input becomes invalid.")) {
+    const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
+    const summary = extractLine(content, "Summary:") ?? extractLine(content, "Latest summary:") ?? "";
+
+    if (toolName === "files" && /app\.config\.json/.test(summary)) {
+      return toolCall("shell", {
+        command: "node invalid-tool-resume-report.mjs"
+      });
+    }
+
+    if ((toolName === "shell" && /failed \(1\)/.test(summary)) || /Validation error:/i.test(content)) {
+      return toolCall("shell", {});
+    }
+
+    if (toolName === "files" && /invalid-tool-resume-report\.mjs/.test(summary)) {
+      return toolCall("edit", {
+        path: "invalid-tool-resume-report.mjs",
+        startLine: 1,
+        endLine: 1,
+        replacement: 'import config from "./app.config.json" with { type: "json" };'
+      });
+    }
+
+    if (toolName === "edit" && /invalid-tool-resume-report\.mjs/.test(summary)) {
+      return toolCall("shell", {
+        command: "node invalid-tool-resume-report.mjs"
+      });
+    }
+
+    if (toolName === "shell" && /completed/.test(summary)) {
+      return "Repaired invalid-tool-resume-report.mjs and verified the final output is SelfMe:3000.";
+    }
+  }
+
+  if (content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
+    && /Original task: Read app\.config\.json and fix invalid-tool-resume-report\.mjs/.test(content)
+  ) {
+    assert.match(content, /Pending next step target: invalid-tool-resume-report\.mjs/);
+    assert.match(content, /Latest tool in context: shell/);
+    assert.match(content, /Latest tool summary in context: node invalid-tool-resume-report\.mjs · failed \(1\)/);
+    return toolCall("files", {
+      path: "invalid-tool-resume-report.mjs",
+      startLine: 1,
+      endLine: 20
+    });
+  }
+
+  if (content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
+    && /Original task: Read app\.config\.json and fix invalid-tool-resume-report\.mjs/.test(content)
+  ) {
+    const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
+    const summary = extractLine(content, "Summary:") ?? extractLine(content, "Latest summary:") ?? "";
+
+    if (toolName === "files" && /invalid-tool-resume-report\.mjs/.test(summary)) {
+      return toolCall("edit", {
+        path: "invalid-tool-resume-report.mjs",
+        startLine: 1,
+        endLine: 1,
+        replacement: 'import config from "./app.config.json" with { type: "json" };'
+      });
+    }
+
+    if (toolName === "edit" && /invalid-tool-resume-report\.mjs/.test(summary)) {
+      return toolCall("shell", {
+        command: "node invalid-tool-resume-report.mjs"
+      });
+    }
+
+    if (toolName === "shell" && /completed/.test(summary)) {
+      return "Repaired invalid-tool-resume-report.mjs and verified the final output is SelfMe:3000.";
+    }
   }
 
   if (content.startsWith("Original user request: Tell me the current working directory again using a shell cmd alias payload.")) {
