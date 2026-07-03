@@ -3962,6 +3962,7 @@ async function main() {
   await verifyResumeAfterAssistantPassLimitFailure();
   await verifyDeniedLaterApprovalDoesNotRetrySameAction();
   await verifyResumeAfterDeniedLaterApprovalStaysBlocked();
+  await verifyAffirmativeAfterDeniedLaterApprovalStaysBlocked();
 
   assert.ok(approvals.length >= 2, "expected at least two approvals to be auto-approved");
 
@@ -5212,6 +5213,14 @@ async function verifyDeniedLaterApprovalDoesNotRetrySameAction() {
 }
 
 async function verifyResumeAfterDeniedLaterApprovalStaysBlocked() {
+  await verifyDeniedLaterApprovalBlockedFollowUp("还能继续吗");
+}
+
+async function verifyAffirmativeAfterDeniedLaterApprovalStaysBlocked() {
+  await verifyDeniedLaterApprovalBlockedFollowUp("可以");
+}
+
+async function verifyDeniedLaterApprovalBlockedFollowUp(followUpPrompt: "还能继续吗" | "可以") {
   const root = await mkdtemp(join(tmpdir(), "selfme-agent-denied-resume-blocked-"));
   const workspace = join(root, "workspace");
   const transcriptPath = join(root, "transcript.jsonl");
@@ -5254,7 +5263,7 @@ async function verifyResumeAfterDeniedLaterApprovalStaysBlocked() {
         return;
       }
 
-      if (input.content.startsWith('The user replied "还能继续吗" after the most recent task reached a denied approval.')) {
+      if (input.content.startsWith(`The user replied "${followUpPrompt}" after the most recent task reached a denied approval.`)) {
         assert.match(input.content, /Do not retry the same denied action unless the user explicitly asks again or approves a new attempt\./);
         assert.match(input.content, /Latest denied approval: shell · rm approved-chain\.txt/);
         assert.match(input.content, /Original task: Create approved-chain\.txt with the content ok\./);
@@ -5309,7 +5318,7 @@ async function verifyResumeAfterDeniedLaterApprovalStaysBlocked() {
     bus,
     transcriptStore,
     sessionId: session.sessionId,
-    prompt: "还能继续吗"
+    prompt: followUpPrompt
   });
 
   const approvedChainContent = await readFile(join(workspace, "approved-chain.txt"), "utf8");
