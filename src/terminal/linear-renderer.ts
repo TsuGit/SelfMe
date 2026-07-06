@@ -141,6 +141,8 @@ export class LinearTerminalRenderer {
     });
 
     this.input.bus.on("assistant.stream.started", (event) => {
+      this.commitLiveAssistantToHistory(event.taskId);
+
       if (this.state.liveAssistant?.kind === "assistant-working" && this.state.liveAssistant.taskId === event.taskId) {
         this.state.workingTaskId = event.taskId;
         this.startWorkingAnimation();
@@ -197,6 +199,8 @@ export class LinearTerminalRenderer {
     });
 
     this.input.bus.on("tool.execution.requested", (event) => {
+      this.commitLiveAssistantToHistory(event.taskId);
+
       const stepIndex = this.nextToolStepIndex(event.taskId);
       this.state.liveTool = {
         kind: "tool",
@@ -402,6 +406,26 @@ export class LinearTerminalRenderer {
     if (renderBottom) {
       this.renderBottomArea();
     }
+  }
+
+  private commitLiveAssistantToHistory(taskId?: string) {
+    const liveAssistant = this.state.liveAssistant;
+
+    if (!liveAssistant || liveAssistant.kind !== "assistant") {
+      return;
+    }
+
+    if (taskId && liveAssistant.taskId !== taskId) {
+      return;
+    }
+
+    if (liveAssistant.body.trim().length === 0) {
+      this.state.liveAssistant = undefined;
+      return;
+    }
+
+    this.appendHistoryBlock(liveAssistant, false);
+    this.state.liveAssistant = undefined;
   }
 
   private nextToolStepIndex(taskId?: string) {
