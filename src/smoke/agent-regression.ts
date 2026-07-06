@@ -4102,6 +4102,7 @@ async function main() {
   await verifyVagueOptimizationInImplicitBroadProjectProposalChain();
   await verifyBroadProjectEditRangeFailureCarriesForward();
   await verifyBroadProjectStageSummaryDoesNotConsumeToolBudget();
+  await verifyColloquialBroadProjectStageSummaryDoesNotLosePendingTarget();
   await verifyResumeFollowUpInImplicitMultiTargetProposalChain();
   await verifyBareAffirmativeInImplicitMultiTargetProposalChain();
   await verifyVagueOptimizationInImplicitMultiTargetProposalChain();
@@ -20077,6 +20078,176 @@ async function verifyBroadProjectStageSummaryDoesNotConsumeToolBudget() {
     result.runtimeErrors.some((message) => message.includes("Agent stopped after 6 tool steps")),
     false,
     "stage-summary turns should not consume the six-tool budget"
+  );
+}
+
+async function verifyColloquialBroadProjectStageSummaryDoesNotLosePendingTarget() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-broad-project-stage-budget-colloquial-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "package.json"),
+    '{\n  "name": "node-todo",\n  "version": "1.0.0",\n  "scripts": {\n    "start": "node app.js"\n  }\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const express = require("express");\nconst app = express();\nconst PORT = 3000;\napp.listen(PORT, () => {\n  console.log(`Todo app is running at http://localhost:${PORT}`);\n});\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<!DOCTYPE html>\n<form action="/add" method="post">\n  <input name="title" />\n</form>\n',
+    "utf8"
+  );
+
+  class ColloquialBroadProjectStageBudgetProvider implements ProviderClient {
+    readonly name = "colloquial-broad-project-stage-budget-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "看看项目，然后把 node-todo/app.js 搞成 process.env.PORT，再把 node-todo/views/index.ejs 整一下，给 title input 加上 maxlength 100。你自己直接搞完。";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "pwd && ls -la && find . -maxdepth 2 -type f | sed 's#^./##' | sort | head -200"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell" && /You are in the middle of a concrete project inspection request\./.test(input.content)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/package.json",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 3,
+              endLine: 3,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          if (/Pending next step target: node-todo\/views\/index\.ejs/.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/views/index.ejs",
+                startLine: 1,
+                endLine: 4
+              })
+            };
+            return;
+          }
+
+          yield {
+            delta: "node-todo/app.js 这一处我先搞好了，接下来继续处理剩下的文件。"
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 3,
+              endLine: 3,
+              replacement: '  <input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield { delta: "已经把这两个文件都搞完了。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ColloquialBroadProjectStageBudgetProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  bus.on("approval.requested", (event) => {
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "看看项目，然后把 node-todo/app.js 搞成 process.env.PORT，再把 node-todo/views/index.ejs 整一下，给 title input 加上 maxlength 100。你自己直接搞完。"
+  });
+
+  const optimizedAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const optimizedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(optimizedAppContent, /process\.env\.PORT/);
+  assert.match(optimizedViewContent, /maxlength="100"/);
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-4")),
+    "expected colloquial broad project flow to continue into the pending view read"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:3-3 · updated")),
+    "expected colloquial broad project flow to finish the pending view edit"
+  );
+  assert.equal(
+    result.runtimeErrors.some((message) => message.includes("Agent stopped after 6 tool steps")),
+    false,
+    "colloquial broad project flow should not lose the pending target and fall back to the old step-limit stop"
   );
 }
 

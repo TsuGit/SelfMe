@@ -6963,15 +6963,15 @@ function extractExplicitRequestedMutationTargets(content: string) {
     const immediatePrefix = before.trimEnd().slice(-16);
     const immediateSuffix = after.trimStart().slice(0, 20);
     const hasMutationCue = /\b(fix|repair|edit|write|create|update|change|modify|rewrite|rebuild|optimize|improve|refactor|add|remove|rename|replace)\b/i.test(localContext)
-      || /(修复|编辑|写入|创建|更新|修改|改成|改为|改掉|重写|重做|优化|改进|重构|新增|删除|替换|补上|加上|移除|调整)/u.test(localContext);
+      || /(修复|编辑|写入|创建|更新|修改|改成|改为|改掉|重写|重做|优化|改进|重构|新增|删除|替换|补上|加上|移除|调整|处理下|处理一下|搞下|搞一下|弄下|弄一下|整下|整一下|搞成|弄成|整成)/u.test(localContext);
     const hasReadOnlyCue = /\b(read|inspect|review|check|look at|open|analyze)\b/i.test(localContext)
       || /(读取|读一下|读下|看看|看下|检查|查看|审一下|打开|分析)/u.test(localContext);
     const hasImmediateReadOnlyCue = /\b(read|inspect|review|check|look at|open|analyze)\s*$/i.test(immediatePrefix)
       || /(读取|读一下|读下|看看|看下|检查|查看|审一下|打开|分析)\s*$/u.test(immediatePrefix);
     const hasImmediateMutationCue = /\b(fix|repair|edit|write|create|update|change|modify|rewrite|rebuild|optimize|improve|refactor|add|remove|rename|replace)\s*$/i.test(immediatePrefix)
       || /^\s*(?:to\s+)?\b(fix|repair|edit|write|create|update|change|modify|rewrite|rebuild|optimize|improve|refactor|add|remove|rename|replace)\b/i.test(immediateSuffix)
-      || /(修复|编辑|写入|创建|更新|修改|改成|改为|改掉|重写|重做|优化|改进|重构|新增|删除|替换|补上|加上|移除|调整)\s*$/u.test(immediatePrefix)
-      || /^\s*(?:为|成|成了|一下|下)?\s*(修复|编辑|写入|创建|更新|修改|改成|改为|改掉|重写|重做|优化|改进|重构|新增|删除|替换|补上|加上|移除|调整)/u.test(immediateSuffix);
+      || /(修复|编辑|写入|创建|更新|修改|改成|改为|改掉|重写|重做|优化|改进|重构|新增|删除|替换|补上|加上|移除|调整|处理下|处理一下|搞下|搞一下|弄下|弄一下|整下|整一下|搞成|弄成|整成)\s*$/u.test(immediatePrefix)
+      || /^\s*(?:为|成|成了|一下|下)?\s*(修复|编辑|写入|创建|更新|修改|改成|改为|改掉|重写|重做|优化|改进|重构|新增|删除|替换|补上|加上|移除|调整|处理下|处理一下|搞下|搞一下|弄下|弄一下|整下|整一下|搞成|弄成|整成)/u.test(immediateSuffix);
 
     if (hasImmediateReadOnlyCue && !hasImmediateMutationCue) {
       continue;
