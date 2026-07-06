@@ -244,15 +244,6 @@ src/
   types/      task, event, session, approval, tool types
 ```
 
-## Project Documents
-
-- `docs/agent-cli-roadmap.html`
-  Product boundary, current baseline, current checkpoint, and roadmap
-- `docs/agent-eval-strategy.html`
-  Evaluation method, regression strategy, and failure taxonomy
-- `docs/brand-color-system.html`
-  Brand and color rules
-
 ## Current Checkpoint
 
 As of `2026-07-02`, the npm package name has been finalized as `selfme`, and the install path is:
@@ -275,5 +266,3 @@ The next runtime questions remain:
 - can it keep that continuation behavior in real interactive sessions, not just smoke fixtures?
 - can it finish long multi-step project tasks without falling back to one-tool-one-stop behavior?
 - can interrupted tasks resume cleanly from the latest real execution point after stop / approval edges?
-
-If you are resuming work later, start from `docs/agent-cli-roadmap.html` first. That file is the canonical checkpoint for current product scope and next priorities.
