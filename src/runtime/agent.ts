@@ -4471,6 +4471,10 @@ function isAffirmativeFollowUp(content: string) {
     return true;
   }
 
+  if (/^(?:那就|那你|你(?:就)?直接)(?:改|做|来|弄|搞|干|整)吧$/iu.test(normalized)) {
+    return true;
+  }
+
   if (isProposalAcceptanceFollowUp(normalized)) {
     return true;
   }
@@ -4485,7 +4489,7 @@ function isProposalAcceptanceFollowUp(content: string) {
     return false;
   }
 
-  return /^(?:按你说的|照你说的)(?:改|做|来)吧?$|^(?:按这个|照这个)(?:改|做|来)吧?$|^(?:就按这个|那就按这个)(?:改|做|来)吧?$/iu.test(normalized);
+  return /^(?:按你说的|照你说的)(?:改|做|来|弄|整|搞)吧?$|^(?:按这个|照这个)(?:改|做|来|弄|整|搞)吧?$|^(?:就按这个|那就按这个)(?:改|做|来|弄|整|搞)吧?$|^(?:就这么|那就这么)(?:改|做|来|弄|整|搞)吧?$/iu.test(normalized);
 }
 
 function isVagueOptimizationFollowUp(content: string) {
