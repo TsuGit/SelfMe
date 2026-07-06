@@ -4278,6 +4278,14 @@ function deriveInferredProjectDirectoryRoot(path: string, preferredRoots: Set<st
     return normalized;
   }
 
+  const nestedPreferredMatches = [...preferredRoots]
+    .filter((root) => root.startsWith(`${normalizedLower}/`) || normalizedLower.startsWith(`${root}/`))
+    .sort((left, right) => right.length - left.length);
+
+  if (nestedPreferredMatches.length > 0) {
+    return nestedPreferredMatches[0];
+  }
+
   if (!normalized.includes("/") && looksLikeProjectDirectoryRoot(normalized)) {
     return normalized;
   }
@@ -7247,8 +7255,7 @@ function extractMentionedProjectRoots(content: string) {
   const roots = new Set<string>();
 
   for (const target of extractExplicitFileTargets(taskContent)) {
-    const normalizedTarget = normalizePromptPath(target);
-    const root = normalizedTarget.includes("/") ? normalizedTarget.split("/")[0] : undefined;
+    const root = deriveMentionedProjectRootFromExplicitTarget(target);
 
     if (root && !root.startsWith(".") && !/\.[A-Za-z0-9]+$/.test(root)) {
       roots.add(root.toLowerCase());
@@ -7273,6 +7280,71 @@ function extractMentionedProjectRoots(content: string) {
   }
 
   return roots;
+}
+
+function deriveMentionedProjectRootFromExplicitTarget(target: string) {
+  const normalizedTarget = normalizePromptPath(target);
+
+  if (!normalizedTarget.includes("/")) {
+    return undefined;
+  }
+
+  const basename = pathPosix.basename(normalizedTarget).toLowerCase();
+  const directorySegments = pathPosix.dirname(normalizedTarget).split("/").filter(Boolean);
+
+  if (directorySegments.length === 0) {
+    return undefined;
+  }
+
+  const trimIfImplementationDirectory = () => {
+    while (directorySegments.length > 1) {
+      const tail = directorySegments[directorySegments.length - 1]?.toLowerCase();
+
+      if (!tail || ![
+        "src",
+        "app",
+        "apps",
+        "routes",
+        "route",
+        "views",
+        "view",
+        "services",
+        "service",
+        "server",
+        "lib",
+        "libs",
+        "public",
+        "assets",
+        "config",
+        "configs",
+        "scripts",
+        "dist",
+        "build",
+        "tests",
+        "test",
+        "docs"
+      ].includes(tail)) {
+        break;
+      }
+
+      directorySegments.pop();
+    }
+  };
+
+  if (
+    basename === "package.json"
+    || basename === "readme.md"
+    || /^(?:app|main|server)\.(?:mjs|cjs|js|ts|tsx)$/i.test(basename)
+    || /^index\.(?:mjs|cjs|js|ts|tsx)$/i.test(basename)
+  ) {
+    trimIfImplementationDirectory();
+    return directorySegments.join("/");
+  }
+
+  trimIfImplementationDirectory();
+  const derivedRoot = directorySegments.join("/");
+
+  return looksLikeProjectDirectoryRoot(derivedRoot) ? derivedRoot : undefined;
 }
 
 function extractExplicitRequestedMutationTargets(content: string) {

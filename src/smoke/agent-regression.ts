@@ -4083,6 +4083,7 @@ async function main() {
   await verifyRepeatedProjectListingStallAutoContinuesIntoProjectEntry();
   await verifyResumeAfterRepeatedToolStall();
   await verifyExplicitProjectInspectionContinuesFromDirectoryOnlyListing();
+  await verifyNestedProjectInspectionContinuesFromSparseRootOnlyListing();
   await verifyBareCompletionReplyStillTriggersVerification();
   await verifyRepeatedIdenticalAssistantRepliesAbortAsStalled();
   await verifyResumeAfterRepeatedAssistantStall();
@@ -4942,6 +4943,140 @@ async function verifyExplicitProjectInspectionContinuesFromDirectoryOnlyListing(
   assert.ok(
     result.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-3")),
     "expected explicit project inspection to continue from the inferred entry into the implementation file"
+  );
+}
+
+async function verifyNestedProjectInspectionContinuesFromSparseRootOnlyListing() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-sparse-root-only-nested-project-inspection-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  const originalPrompt = "看看 packages/demo-core 项目";
+  await mkdir(join(workspace, "packages", "demo-core"), { recursive: true });
+  await mkdir(join(workspace, "packages", "aaa-workbench"), { recursive: true });
+  await mkdir(join(workspace, "docs"), { recursive: true });
+
+  await writeFile(join(workspace, "docs", "plan.md"), "# plan\n", "utf8");
+  await writeFile(
+    join(workspace, "packages", "demo-core", "package.json"),
+    '{\n  "name": "demo-core",\n  "version": "1.0.0",\n  "main": "app.js"\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "packages", "demo-core", "app.js"),
+    'const core = "demo-core";\nconsole.log(core);\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "packages", "aaa-workbench", "package.json"),
+    '{\n  "name": "aaa-workbench",\n  "version": "1.0.0",\n  "main": "server.js"\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "packages", "aaa-workbench", "server.js"),
+    'console.log("decoy");\n',
+    "utf8"
+  );
+
+  class SparseRootOnlyNestedProjectInspectionProvider implements ProviderClient {
+    readonly name = "sparse-root-only-nested-project-inspection-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "pwd && ls -la"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell" && /pwd && ls -la/.test(summary)) {
+          if (/You are in the middle of a concrete project inspection request\./.test(input.content)) {
+            assert.match(input.content, /Likely project entry: packages\/demo-core\/package\.json/);
+            assert.doesNotMatch(input.content, /Likely project entry: packages\/aaa-workbench\/package\.json/);
+            yield {
+              delta: toolCall("files", {
+                path: "packages/demo-core/package.json",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+
+          yield { delta: "当前目录里有 docs 和 packages。" };
+          return;
+        }
+
+        if (toolName === "files" && /packages\/demo-core\/package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "packages/demo-core/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /packages\/demo-core\/app\.js/.test(summary)) {
+          yield { delta: "我已经继续读了 packages/demo-core/package.json 和 packages/demo-core/app.js。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new SparseRootOnlyNestedProjectInspectionProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: originalPrompt
+  });
+
+  assert.match(result.assistantText, /packages\/demo-core/i);
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("pwd && ls -la · completed")),
+    "expected nested explicit project inspection to start from a sparse root-only listing"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("packages/demo-core/package.json:1-4")),
+    "expected nested explicit project inspection to infer the named nested project from the sparse root-only listing"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("packages/demo-core/app.js:1-2")),
+    "expected nested explicit project inspection to continue into the nested project's implementation file"
+  );
+  assert.equal(
+    result.toolSummaries.some((summary) => summary.startsWith("packages/aaa-workbench/package.json:1-4")),
+    false,
+    "expected nested explicit project inspection to avoid drifting into the sibling decoy project"
   );
 }
 
