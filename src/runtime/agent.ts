@@ -3487,7 +3487,7 @@ function buildToolContinuationClueLines(originalRequest: string, input: {
   }
 
   if (looksLikeProjectInspectionRequest(originalRequest) && looksLikeProjectListingOutput(input.summary, input.rawOutput)) {
-    const projectEntry = extractLikelyProjectEntryFromListing(input.rawOutput);
+    const projectEntry = extractLikelyProjectEntryFromListing(input.rawOutput, originalRequest);
 
     if (projectEntry) {
       clues.push(`Likely project entry: ${projectEntry}`);
@@ -4016,7 +4016,7 @@ function looksLikeProjectListingOutput(summary: string, rawOutput?: string) {
   return /(?:^|\n)(?:package\.json|README\.md|src\/|app\.js|index\.(?:js|ts)|node_modules|docs\/)/m.test(output);
 }
 
-function extractLikelyProjectEntryFromListing(rawOutput?: string) {
+function extractLikelyProjectEntryFromListing(rawOutput?: string, originalRequest?: string) {
   if (!rawOutput) {
     return undefined;
   }
@@ -4025,6 +4025,7 @@ function extractLikelyProjectEntryFromListing(rawOutput?: string) {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
+  const preferredRoots = originalRequest ? extractMentionedProjectRoots(originalRequest) : new Set<string>();
   const candidates = new Map<string, {
     packagePath?: string;
     readmePath?: string;
@@ -4094,7 +4095,8 @@ function extractLikelyProjectEntryFromListing(rawOutput?: string) {
       root,
       candidate,
       score:
-        (candidate.packagePath ? 120 : 0)
+        (preferredRoots.has(root.toLowerCase()) ? 240 : 0)
+        + (candidate.packagePath ? 120 : 0)
         + (candidate.readmePath ? 40 : 0)
         + (candidate.entryPath ? 80 : 0)
         + Math.min(candidate.sourceCount, 8) * 10
@@ -7066,6 +7068,39 @@ function extractExplicitFileTargets(content: string) {
   const taskContent = extractEmbeddedTaskContent(content);
   const pathMatches = taskContent.match(/[A-Za-z0-9_./-]+\.(?:tsx|json|mjs|cjs|ejs|html|css|js|ts|txt|md|csv)/g) ?? [];
   return Array.from(new Set(pathMatches.map((path) => stripLineLocationSuffix(normalizePromptPath(path.trim())))));
+}
+
+function extractMentionedProjectRoots(content: string) {
+  const taskContent = extractEmbeddedTaskContent(content);
+  const roots = new Set<string>();
+
+  for (const target of extractExplicitFileTargets(taskContent)) {
+    const normalizedTarget = normalizePromptPath(target);
+    const root = normalizedTarget.includes("/") ? normalizedTarget.split("/")[0] : undefined;
+
+    if (root && !root.startsWith(".") && !/\.[A-Za-z0-9]+$/.test(root)) {
+      roots.add(root.toLowerCase());
+    }
+  }
+
+  const patterns = [
+    /\b(?:inspect|check|review|optimize|improve|rewrite|refactor|explore|analyze|look at)\s+([A-Za-z0-9][A-Za-z0-9_-]*)\b/gi,
+    /\b([A-Za-z0-9][A-Za-z0-9_-]*)\s+(?:project|repo|repository|codebase)\b/gi,
+    /(?:检查|看看|看下|优化|改进|重写|重构|分析)\s*([A-Za-z0-9][A-Za-z0-9_-]*)/gu,
+    /([A-Za-z0-9][A-Za-z0-9_-]*)\s*(?:项目|仓库|代码)/gu
+  ];
+
+  for (const pattern of patterns) {
+    for (const match of taskContent.matchAll(pattern)) {
+      const root = match[1]?.trim().toLowerCase();
+
+      if (root) {
+        roots.add(root);
+      }
+    }
+  }
+
+  return roots;
 }
 
 function extractExplicitRequestedMutationTargets(content: string) {

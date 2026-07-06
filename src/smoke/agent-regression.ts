@@ -4062,6 +4062,7 @@ async function main() {
   await verifyAutomaticContinuationAfterToolStepLimitBeforeShell();
   await verifyAutomaticContinuationAfterToolStepLimitBeforeWrappedShell();
   await verifyAutomaticContinuationAfterToolStepLimitDuringWholeProjectInspection();
+  await verifyExplicitProjectMentionWinsOverRicherWorkspaceDecoy();
   await verifyAutomaticContinuationAfterAssistantPassLimitFailure();
   await verifyDeniedLaterApprovalDoesNotRetrySameAction();
   await verifyResumeAfterDeniedLaterApprovalStaysBlocked();
@@ -5650,6 +5651,111 @@ async function verifyAutomaticContinuationAfterToolStepLimitDuringWholeProjectIn
     result.runtimeErrors.some((message) => message.includes("Agent stopped after 16 tool steps")),
     false,
     "whole-project auto-continuation should finish without surfacing the old step-limit hard stop"
+  );
+}
+
+async function verifyExplicitProjectMentionWinsOverRicherWorkspaceDecoy() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-project-name-listing-priority-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  const originalPrompt = "看看项目，但先别改，告诉我你会怎么检查 node-todo。";
+  await mkdir(join(workspace, "aaa-workbench"), { recursive: true });
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+
+  await writeFile(join(workspace, "aaa-workbench", "package.json"), '{\n  "name": "aaa-workbench"\n}\n', "utf8");
+  await writeFile(join(workspace, "aaa-workbench", "README.md"), '# aaa-workbench\n', "utf8");
+  await writeFile(join(workspace, "aaa-workbench", "app.js"), 'console.log("decoy");\n', "utf8");
+  await writeFile(join(workspace, "aaa-workbench", "server.js"), 'console.log("server");\n', "utf8");
+  await writeFile(join(workspace, "node-todo", "package.json"), '{\n  "name": "node-todo"\n}\n', "utf8");
+  await writeFile(join(workspace, "node-todo", "app.js"), 'console.log("todo");\n', "utf8");
+
+  class ProjectNamePriorityProvider implements ProviderClient {
+    readonly name = "project-name-priority-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "pwd && ls -la && find . -maxdepth 2 -type f | sed 's#^./##' | sort | head -200"
+          })
+        };
+        return;
+      }
+
+      if (/^Original user request: 看看项目，但先别改，告诉我你会怎么检查 node-todo。(?:\n|$)/.test(input.content)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell") {
+          assert.match(input.content, /Likely project entry: node-todo\/package\.json/);
+          assert.doesNotMatch(input.content, /Likely project entry: aaa-workbench\/package\.json/);
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/package.json",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield { delta: "我会从 node-todo/package.json 和 node-todo/app.js 开始检查这个项目。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ProjectNamePriorityProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: originalPrompt
+  });
+
+  assert.match(result.assistantText, /node-todo\/package\.json|node-todo\/app\.js/);
+  assert.ok(
+    result.toolSummaries.some((summary) => /^node-todo\/package\.json:1-\d+$/.test(summary)),
+    "explicit project mention should anchor inspection on node-todo/package.json even when a richer decoy project exists"
+  );
+  assert.equal(
+    result.toolSummaries.some((summary) => /^aaa-workbench\/package\.json:1-\d+$/.test(summary)),
+    false,
+    "explicit project mention should not drift into the richer decoy project"
   );
 }
 
