@@ -4083,14 +4083,26 @@ function extractLikelyProjectEntryFromListing(rawOutput?: string, originalReques
     packagePath?: string;
     readmePath?: string;
     entryPath?: string;
+    inferredDirectory?: boolean;
     sourceCount: number;
     implementationCount: number;
   }>();
 
   for (const line of lines) {
-    const normalizedLine = normalizePromptPath(line.replace(/^[./]+/, ""));
+    const normalizedLine = extractListingPathCandidate(line);
 
     if (!normalizedLine || normalizedLine.startsWith(".") || normalizedLine.startsWith("node_modules/")) {
+      continue;
+    }
+
+    if (!normalizedLine.includes("/") && !/\.[A-Za-z0-9]+$/.test(normalizedLine) && looksLikeProjectDirectoryRoot(normalizedLine)) {
+      const inferredRoot = normalizedLine;
+      const candidate = candidates.get(inferredRoot) ?? {
+        sourceCount: 0,
+        implementationCount: 0
+      };
+      candidate.inferredDirectory = true;
+      candidates.set(inferredRoot, candidate);
       continue;
     }
 
@@ -4152,6 +4164,7 @@ function extractLikelyProjectEntryFromListing(rawOutput?: string, originalReques
         + (candidate.packagePath ? 120 : 0)
         + (candidate.readmePath ? 40 : 0)
         + (candidate.entryPath ? 80 : 0)
+        + (candidate.inferredDirectory ? (preferredRoots.has(root.toLowerCase()) ? 90 : 12) : 0)
         + Math.min(candidate.sourceCount, 8) * 10
         + Math.min(candidate.implementationCount, 8) * 8
         + (root === "." && candidate.packagePath ? 12 : 0)
@@ -4160,6 +4173,7 @@ function extractLikelyProjectEntryFromListing(rawOutput?: string, originalReques
       candidate.packagePath
       || candidate.readmePath
       || candidate.entryPath
+      || candidate.inferredDirectory
       || candidate.sourceCount > 0
     ))
     .sort((left, right) =>
@@ -4176,7 +4190,78 @@ function extractLikelyProjectEntryFromListing(rawOutput?: string, originalReques
   return bestCandidate?.packagePath
     ?? bestCandidate?.readmePath
     ?? bestCandidate?.entryPath
+    ?? (
+      rankedCandidates[0]?.root
+      && rankedCandidates[0]?.candidate.inferredDirectory
+      && rankedCandidates[0]?.root !== "."
+        ? `${rankedCandidates[0].root}/package.json`
+        : undefined
+    )
     ?? undefined;
+}
+
+function extractListingPathCandidate(line: string) {
+  const trimmed = line.trim();
+
+  if (!trimmed) {
+    return undefined;
+  }
+
+  const direct = normalizePromptPath(trimmed.replace(/^[./]+/, ""));
+
+  if (looksLikeListingPathCandidate(direct)) {
+    return direct;
+  }
+
+  const trailingMatch = trimmed.match(/([A-Za-z0-9][A-Za-z0-9._/-]*)\/?$/);
+  const trailingCandidate = trailingMatch?.[1]
+    ? normalizePromptPath(trailingMatch[1].replace(/^[./]+/, ""))
+    : undefined;
+
+  return trailingCandidate && looksLikeListingPathCandidate(trailingCandidate)
+    ? trailingCandidate
+    : undefined;
+}
+
+function looksLikeListingPathCandidate(path: string) {
+  if (!path || path === "." || path === "..") {
+    return false;
+  }
+
+  return !/[<>:"|?*]/.test(path);
+}
+
+function looksLikeProjectDirectoryRoot(root: string) {
+  const normalized = root.toLowerCase();
+
+  if (!normalized || normalized === "." || normalized === "..") {
+    return false;
+  }
+
+  if ([
+    "src",
+    "app",
+    "apps",
+    "config",
+    "configs",
+    "dist",
+    "build",
+    "public",
+    "scripts",
+    "docs",
+    "lib",
+    "libs",
+    "views",
+    "assets",
+    "node_modules",
+    "coverage",
+    "tests",
+    "test"
+  ].includes(normalized)) {
+    return false;
+  }
+
+  return !/\.[a-z0-9]+$/i.test(normalized);
 }
 
 function extractMissingPath(content: string) {

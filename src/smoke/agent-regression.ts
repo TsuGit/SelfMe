@@ -4080,6 +4080,7 @@ async function main() {
   await verifyResumeAfterRepeatedFilesStall();
   await verifyRepeatedProjectListingStallAutoContinuesIntoProjectEntry();
   await verifyResumeAfterRepeatedToolStall();
+  await verifyExplicitProjectInspectionContinuesFromDirectoryOnlyListing();
   await verifyBareCompletionReplyStillTriggersVerification();
   await verifyRepeatedIdenticalAssistantRepliesAbortAsStalled();
   await verifyResumeAfterRepeatedAssistantStall();
@@ -4822,6 +4823,123 @@ async function verifyResumeAfterRepeatedToolStall() {
   assert.ok(
     result.toolSummaries.some((summary) => summary.startsWith("node tool-stall-resume-report.mjs · completed")),
     "repeated-tool-stall auto-continuation should finish the pending verification after the repair"
+  );
+}
+
+async function verifyExplicitProjectInspectionContinuesFromDirectoryOnlyListing() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-directory-only-project-inspection-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  const originalPrompt = "看看 node-todo 项目";
+  await mkdir(join(workspace, "docs"), { recursive: true });
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+
+  await writeFile(join(workspace, "docs", "plan.md"), "# plan\n", "utf8");
+  await writeFile(
+    join(workspace, "node-todo", "package.json"),
+    '{\n  "name": "node-todo",\n  "version": "1.0.0",\n  "main": "app.js"\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const express = require("express");\nconst app = express();\napp.listen(3000);\n',
+    "utf8"
+  );
+
+  class DirectoryOnlyProjectInspectionProvider implements ProviderClient {
+    readonly name = "directory-only-project-inspection-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "pwd && ls -la"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell" && /pwd && ls -la/.test(summary)) {
+          if (/You are in the middle of a concrete project inspection request\./.test(input.content)) {
+            assert.match(input.content, /Likely project entry: node-todo\/package\.json/);
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/package.json",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+
+          yield { delta: "当前目录里有 docs 和 node-todo。" };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield { delta: "我已经继续读了 node-todo/package.json 和 node-todo/app.js，这个项目当前的主入口在 app.js。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new DirectoryOnlyProjectInspectionProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: originalPrompt
+  });
+
+  assert.match(result.assistantText, /node-todo/i);
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("pwd && ls -la · completed")),
+    "expected explicit project inspection to start from a directory-only listing"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/package.json:1-4")),
+    "expected explicit project inspection to infer the named project's package entry from the directory-only listing"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-3")),
+    "expected explicit project inspection to continue from the inferred entry into the implementation file"
   );
 }
 
