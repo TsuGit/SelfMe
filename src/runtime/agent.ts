@@ -4095,18 +4095,19 @@ function extractLikelyProjectEntryFromListing(rawOutput?: string, originalReques
       continue;
     }
 
-    if (!normalizedLine.includes("/") && !/\.[A-Za-z0-9]+$/.test(normalizedLine) && looksLikeProjectDirectoryRoot(normalizedLine)) {
-      const inferredRoot = normalizedLine;
-      const candidate = candidates.get(inferredRoot) ?? {
+    const inferredDirectoryRoot = deriveInferredProjectDirectoryRoot(normalizedLine, preferredRoots);
+
+    if (inferredDirectoryRoot) {
+      const candidate = candidates.get(inferredDirectoryRoot) ?? {
         sourceCount: 0,
         implementationCount: 0
       };
       candidate.inferredDirectory = true;
-      candidates.set(inferredRoot, candidate);
+      candidates.set(inferredDirectoryRoot, candidate);
       continue;
     }
 
-    const root = normalizedLine.includes("/") ? normalizedLine.split("/")[0] ?? normalizedLine : ".";
+    const root = resolveListingProjectRoot(normalizedLine, preferredRoots);
 
     if (!root || root.startsWith(".")) {
       continue;
@@ -4262,6 +4263,39 @@ function looksLikeProjectDirectoryRoot(root: string) {
   }
 
   return !/\.[a-z0-9]+$/i.test(normalized);
+}
+
+function deriveInferredProjectDirectoryRoot(path: string, preferredRoots: Set<string>) {
+  const normalized = normalizePromptPath(path);
+
+  if (!normalized || /\.[A-Za-z0-9]+$/.test(normalized)) {
+    return undefined;
+  }
+
+  const normalizedLower = normalized.toLowerCase();
+
+  if (preferredRoots.has(normalizedLower)) {
+    return normalized;
+  }
+
+  if (!normalized.includes("/") && looksLikeProjectDirectoryRoot(normalized)) {
+    return normalized;
+  }
+
+  return undefined;
+}
+
+function resolveListingProjectRoot(path: string, preferredRoots: Set<string>) {
+  const normalized = normalizePromptPath(path);
+  const preferredMatches = [...preferredRoots]
+    .filter((root) => normalized === root || normalized.startsWith(`${root}/`))
+    .sort((left, right) => right.length - left.length);
+
+  if (preferredMatches.length > 0) {
+    return preferredMatches[0];
+  }
+
+  return normalized.includes("/") ? normalized.split("/")[0] ?? normalized : ".";
 }
 
 function extractMissingPath(content: string) {
@@ -7222,10 +7256,10 @@ function extractMentionedProjectRoots(content: string) {
   }
 
   const patterns = [
-    /\b(?:inspect|check|review|optimize|improve|rewrite|refactor|explore|analyze|look at)\s+([A-Za-z0-9][A-Za-z0-9_-]*)\b/gi,
-    /\b([A-Za-z0-9][A-Za-z0-9_-]*)\s+(?:project|repo|repository|codebase)\b/gi,
-    /(?:检查|看看|看下|优化|改进|重写|重构|分析)\s*([A-Za-z0-9][A-Za-z0-9_-]*)/gu,
-    /([A-Za-z0-9][A-Za-z0-9_-]*)\s*(?:项目|仓库|代码)/gu
+    /\b(?:inspect|check|review|optimize|improve|rewrite|refactor|explore|analyze|look at)\s+([A-Za-z0-9][A-Za-z0-9_/-]*)\b/gi,
+    /\b([A-Za-z0-9][A-Za-z0-9_/-]*)\s+(?:project|repo|repository|codebase)\b/gi,
+    /(?:检查|看看|看下|优化|改进|重写|重构|分析)\s*([A-Za-z0-9][A-Za-z0-9_/-]*)/gu,
+    /([A-Za-z0-9][A-Za-z0-9_/-]*)\s*(?:项目|仓库|代码)/gu
   ];
 
   for (const pattern of patterns) {

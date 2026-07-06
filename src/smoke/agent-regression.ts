@@ -4065,6 +4065,8 @@ async function main() {
   await verifyExplicitProjectMentionWinsOverRicherWorkspaceDecoy();
   await verifyExplicitProjectMentionWinsOverRicherWorkspaceDecoyDuringProjectImprovement();
   await verifyExplicitProjectMentionWinsOverRicherWorkspaceDecoyDuringProjectRewrite();
+  await verifyNestedProjectMentionWinsOverRicherWorkspaceDecoy();
+  await verifyNestedProjectMentionWinsOverRicherWorkspaceDecoyDuringProjectRewrite();
   await verifyAutomaticContinuationAfterAssistantPassLimitFailure();
   await verifyDeniedLaterApprovalDoesNotRetrySameAction();
   await verifyResumeAfterDeniedLaterApprovalStaysBlocked();
@@ -6257,6 +6259,229 @@ async function verifyExplicitProjectMentionWinsOverRicherWorkspaceDecoyDuringPro
     result.toolSummaries.some((summary) => /^aaa-workbench\/package\.json:1-\d+$/.test(summary)),
     false,
     "explicit project mention should not drift into the richer decoy project during project rewrite"
+  );
+}
+
+async function verifyNestedProjectMentionWinsOverRicherWorkspaceDecoy() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-nested-project-name-listing-priority-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  const originalPrompt = "看看项目，但先别改，告诉我你会怎么检查 packages/demo-core。";
+  await mkdir(join(workspace, "packages", "aaa-workbench"), { recursive: true });
+  await mkdir(join(workspace, "packages", "demo-core"), { recursive: true });
+
+  await writeFile(join(workspace, "packages", "aaa-workbench", "package.json"), '{\n  "name": "aaa-workbench"\n}\n', "utf8");
+  await writeFile(join(workspace, "packages", "aaa-workbench", "README.md"), '# aaa-workbench\n', "utf8");
+  await writeFile(join(workspace, "packages", "aaa-workbench", "app.js"), 'console.log("decoy");\n', "utf8");
+  await writeFile(join(workspace, "packages", "aaa-workbench", "server.js"), 'console.log("server");\n', "utf8");
+  await writeFile(join(workspace, "packages", "demo-core", "package.json"), '{\n  "name": "demo-core"\n}\n', "utf8");
+  await writeFile(join(workspace, "packages", "demo-core", "app.js"), 'console.log("core");\n', "utf8");
+
+  class NestedProjectNamePriorityProvider implements ProviderClient {
+    readonly name = "nested-project-name-priority-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "pwd && ls -la && find . -maxdepth 3 -type f | sed 's#^./##' | sort | head -200"
+          })
+        };
+        return;
+      }
+
+      if (/^Original user request: 看看项目，但先别改，告诉我你会怎么检查 packages\/demo-core。(?:\n|$)/.test(input.content)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell") {
+          assert.match(input.content, /Likely project entry: packages\/demo-core\/package\.json/);
+          assert.doesNotMatch(input.content, /Likely project entry: packages\/aaa-workbench\/package\.json/);
+          yield {
+            delta: toolCall("files", {
+              path: "packages/demo-core/package.json",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /packages\/demo-core\/package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "packages/demo-core/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /packages\/demo-core\/app\.js/.test(summary)) {
+          yield { delta: "我会从 packages/demo-core/package.json 和 packages/demo-core/app.js 开始检查这个项目。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new NestedProjectNamePriorityProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: originalPrompt
+  });
+
+  assert.match(result.assistantText, /packages\/demo-core\/package\.json|packages\/demo-core\/app\.js/);
+  assert.ok(
+    result.toolSummaries.some((summary) => /^packages\/demo-core\/package\.json:1-\d+$/.test(summary)),
+    "nested project mention should anchor inspection on packages/demo-core/package.json even when a richer decoy project exists"
+  );
+  assert.equal(
+    result.toolSummaries.some((summary) => /^packages\/aaa-workbench\/package\.json:1-\d+$/.test(summary)),
+    false,
+    "nested project mention should not drift into the richer nested decoy project"
+  );
+}
+
+async function verifyNestedProjectMentionWinsOverRicherWorkspaceDecoyDuringProjectRewrite() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-nested-project-name-rewrite-priority-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  const originalPrompt = "看看项目，然后重写 packages/demo-core。你自己直接搞完。";
+  await mkdir(join(workspace, "packages", "aaa-workbench"), { recursive: true });
+  await mkdir(join(workspace, "packages", "demo-core"), { recursive: true });
+
+  await writeFile(join(workspace, "packages", "aaa-workbench", "package.json"), '{\n  "name": "aaa-workbench"\n}\n', "utf8");
+  await writeFile(join(workspace, "packages", "aaa-workbench", "README.md"), '# aaa-workbench\n', "utf8");
+  await writeFile(join(workspace, "packages", "aaa-workbench", "app.js"), 'console.log("decoy");\n', "utf8");
+  await writeFile(join(workspace, "packages", "aaa-workbench", "server.js"), 'console.log("server");\n', "utf8");
+  await writeFile(join(workspace, "packages", "demo-core", "package.json"), '{\n  "name": "demo-core"\n}\n', "utf8");
+  await writeFile(join(workspace, "packages", "demo-core", "app.js"), 'const PORT = 3000;\nconsole.log(PORT);\n', "utf8");
+
+  class NestedProjectNameRewritePriorityProvider implements ProviderClient {
+    readonly name = "nested-project-name-rewrite-priority-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "pwd && ls -la && find . -maxdepth 3 -type f | sed 's#^./##' | sort | head -200"
+          })
+        };
+        return;
+      }
+
+      if (/^Original user request: 看看项目，然后重写 packages\/demo-core。你自己直接搞完。(?:\n|$)/.test(input.content)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell") {
+          assert.match(input.content, /Likely project entry: packages\/demo-core\/package\.json/);
+          assert.doesNotMatch(input.content, /Likely project entry: packages\/aaa-workbench\/package\.json/);
+          yield {
+            delta: toolCall("files", {
+              path: "packages/demo-core/package.json",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /packages\/demo-core\/package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "packages/demo-core/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /packages\/demo-core\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "packages/demo-core/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'const PORT = Number(process.env.PORT || 3000);\nconsole.log(PORT);\n'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /packages\/demo-core\/app\.js/.test(summary)) {
+          yield { delta: "我已经把这轮重写稳定落在 packages/demo-core/app.js，而不是被其他 nested project 带偏。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new NestedProjectNameRewritePriorityProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: originalPrompt
+  });
+
+  const appContent = await readFile(join(workspace, "packages", "demo-core", "app.js"), "utf8");
+  assert.match(appContent, /process\.env\.PORT/);
+  assert.ok(
+    result.toolSummaries.some((summary) => /^packages\/demo-core\/package\.json:1-\d+$/.test(summary)),
+    "nested project mention should anchor project rewrite on packages/demo-core/package.json even when a richer decoy project exists"
+  );
+  assert.equal(
+    result.toolSummaries.some((summary) => /^packages\/aaa-workbench\/package\.json:1-\d+$/.test(summary)),
+    false,
+    "nested project mention should not drift into the richer nested decoy project during project rewrite"
   );
 }
 
