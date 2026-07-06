@@ -3874,15 +3874,18 @@ function extractLikelyRelativeImplementationImportPath(fromFile: string, rawOutp
     .filter((value): value is string => Boolean(value))
     .filter((value) => !/\.(?:json|css|scss|sass|less|png|jpg|jpeg|gif|svg)$/i.test(value));
 
-  for (const relativePath of matches) {
-    const resolved = resolveRelativeInspectionImportPath(fromFile, relativePath);
+  const rankedCandidates = matches
+    .map((relativePath, index) => ({
+      path: resolveRelativeInspectionImportPath(fromFile, relativePath),
+      index
+    }))
+    .filter((candidate): candidate is { path: string; index: number } => Boolean(candidate.path))
+    .sort((left, right) => {
+      const scoreDelta = scoreLikelyImplementationImportPath(right.path) - scoreLikelyImplementationImportPath(left.path);
+      return scoreDelta !== 0 ? scoreDelta : left.index - right.index;
+    });
 
-    if (resolved) {
-      return resolved;
-    }
-  }
-
-  return undefined;
+  return rankedCandidates[0]?.path;
 }
 
 function resolveRelativeInspectionImportPath(fromFile: string, target: string) {
@@ -3916,6 +3919,42 @@ function resolveRelativeInspectionImportPath(fromFile: string, target: string) {
   ];
 
   return candidates[0];
+}
+
+function scoreLikelyImplementationImportPath(path: string) {
+  const normalized = normalizePromptPath(path).toLowerCase();
+  const basename = pathPosix.basename(normalized).replace(/\.[a-z0-9]+$/i, "");
+  let score = 0;
+
+  if (normalized.includes("/src/")) {
+    score += 20;
+  }
+
+  if (/(?:^|\/)(?:routes?|controllers?|services?|handlers?|workers?|stores?|reducers?|models?|server|app|main|api)(?:\/|$)/.test(normalized)) {
+    score += 70;
+  }
+
+  if (/(?:^|\/)(?:config|configs?|settings?|constants?|types?|interfaces?|schemas?|theme|themes|styles?)(?:\/|$)/.test(normalized)) {
+    score -= 90;
+  }
+
+  if (/(?:^|\/)(?:utils?|helpers?)(?:\/|$)/.test(normalized)) {
+    score -= 25;
+  }
+
+  if (basename === "server" || basename === "app" || basename === "main") {
+    score += 20;
+  }
+
+  if (basename === "index") {
+    score -= 5;
+  }
+
+  if (/^(?:config|runtime|settings?|constants?|types?|interfaces?)$/.test(basename)) {
+    score -= 25;
+  }
+
+  return score;
 }
 
 function deriveLikelySiblingInspectionPath(path: string) {

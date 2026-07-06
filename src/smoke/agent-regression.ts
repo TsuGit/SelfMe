@@ -4134,6 +4134,7 @@ async function main() {
   await verifyResumeAfterThinEntryImplementationStageSummary();
   await verifyVagueFollowUpResumeAfterThinEntryImplementationStageSummary("帮我优化下");
   await verifyVagueFollowUpResumeAfterThinEntryImplementationStageSummary("帮我看看");
+  await verifyProjectRewritePrefersBusinessImportOverConfigImport();
   await verifyProjectRewriteFollowsThinEntryImplementationImport();
   await verifyProjectRewriteContinuesAfterThinEntryStageSummary();
   await verifyProjectRewriteContinuesAfterThinEntryLongExplanation();
@@ -15100,6 +15101,185 @@ async function verifyProjectRewriteFollowsThinEntryImplementationImport() {
   assert.ok(
     result.toolSummaries.some((summary) => summary.startsWith("demo-rewrite-thin/src/server.js:2-2 · updated")),
     "expected thin-entry rewrite flow to edit the imported implementation file"
+  );
+}
+
+async function verifyProjectRewritePrefersBusinessImportOverConfigImport() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-project-rewrite-ranked-import-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "demo-rewrite-ranked", "config"), { recursive: true });
+  await mkdir(join(workspace, "demo-rewrite-ranked", "src"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "demo-rewrite-ranked", "package.json"),
+    '{\n  "name": "demo-rewrite-ranked",\n  "version": "1.0.0",\n  "main": "app.js"\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "demo-rewrite-ranked", "app.js"),
+    [
+      'const { runtimeLabel } = require("./config/runtime");',
+      'const { createServer } = require("./src/server");',
+      'module.exports = { runtimeLabel, server: createServer() };'
+    ].join("\n") + "\n",
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "demo-rewrite-ranked", "config", "runtime.js"),
+    'const runtimeLabel = "dev";\n\nmodule.exports = { runtimeLabel };\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "demo-rewrite-ranked", "src", "server.js"),
+    'function createServer() {\n  return { port: 3000 };\n}\n\nmodule.exports = { createServer };\n',
+    "utf8"
+  );
+
+  class ProjectRewriteRankedImportProvider implements ProviderClient {
+    readonly name = "project-rewrite-ranked-import-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "看看项目，然后帮我重新写一下 demo-rewrite-ranked，让端口来自 process.env.PORT。";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "pwd && ls -la && find . -maxdepth 4 -type f | sed 's#^./##' | sort | head -200"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell") {
+          if (/You are in the middle of a concrete project inspection request\./.test(input.content)) {
+            assert.match(input.content, /Likely project entry: demo-rewrite-ranked\/package\.json/);
+            yield {
+              delta: toolCall("files", {
+                path: "demo-rewrite-ranked/package.json",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+
+          yield { delta: "我先看了工作区列表，demo-rewrite-ranked 看起来是最像要继续改造的项目。" };
+          return;
+        }
+
+        if (toolName === "files" && /demo-rewrite-ranked\/package\.json/.test(summary)) {
+          if (/You are in the middle of a project improvement task\./.test(input.content)) {
+            assert.match(input.content, /Likely working file: demo-rewrite-ranked\/app\.js/);
+            yield {
+              delta: toolCall("files", {
+                path: "demo-rewrite-ranked/app.js",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+
+          yield { delta: "入口已经定位到 app.js，我先继续跟进实现。" };
+          return;
+        }
+
+        if (toolName === "files" && /demo-rewrite-ranked\/app\.js/.test(summary)) {
+          if (/You are in the middle of a project improvement task\./.test(input.content)) {
+            assert.match(input.content, /Likely working file: demo-rewrite-ranked\/src\/server\.js/);
+            assert.doesNotMatch(input.content, /Likely working file: demo-rewrite-ranked\/config\/runtime\.js/);
+            yield {
+              delta: toolCall("files", {
+                path: "demo-rewrite-ranked/src/server.js",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+
+          yield { delta: "app.js 里虽然也引了 config，但真正承载端口逻辑的是 server 实现。" };
+          return;
+        }
+
+        if (toolName === "files" && /demo-rewrite-ranked\/src\/server\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "demo-rewrite-ranked/src/server.js",
+              startLine: 2,
+              endLine: 2,
+              replacement: '  return { port: Number(process.env.PORT ?? 3000) };\n'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /demo-rewrite-ranked\/src\/server\.js/.test(summary)) {
+          yield { delta: "我已经把 demo-rewrite-ranked/src/server.js 改成优先读取 process.env.PORT。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ProjectRewriteRankedImportProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "看看项目，然后帮我重新写一下 demo-rewrite-ranked，让端口来自 process.env.PORT。"
+  });
+
+  const sourceContent = await readFile(join(workspace, "demo-rewrite-ranked", "src", "server.js"), "utf8");
+  const configContent = await readFile(join(workspace, "demo-rewrite-ranked", "config", "runtime.js"), "utf8");
+  assert.match(sourceContent, /process\.env\.PORT/);
+  assert.doesNotMatch(configContent, /process\.env\.PORT/);
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("demo-rewrite-ranked/package.json:1-4")),
+    "expected ranked thin-entry rewrite flow to inspect package.json first"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("demo-rewrite-ranked/app.js:1-3")),
+    "expected ranked thin-entry rewrite flow to inspect app.js before choosing the deeper implementation"
+  );
+  assert.equal(
+    result.toolSummaries.some((summary) => summary.startsWith("demo-rewrite-ranked/config/runtime.js:1-")),
+    false,
+    "expected ranked thin-entry rewrite flow to avoid detouring into config when the business implementation is already visible"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("demo-rewrite-ranked/src/server.js:1-5")),
+    "expected ranked thin-entry rewrite flow to continue into the business implementation import"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("demo-rewrite-ranked/src/server.js:2-2 · updated")),
+    "expected ranked thin-entry rewrite flow to edit the business implementation import"
   );
 }
 
