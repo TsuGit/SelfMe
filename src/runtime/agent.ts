@@ -6889,11 +6889,7 @@ function looksLikeMultiTargetInspectionTask(content: string) {
     return false;
   }
 
-  return extractExplicitFileTargets(taskContent).length >= 3
-    && (
-      /\b(read|inspect|check|review|look at|show)\b/i.test(taskContent)
-      || /(读取|检查|查看|看看|审查|展示)/u.test(taskContent)
-    );
+  return extractExplicitFileTargets(taskContent).length >= 3;
 }
 
 function looksLikeExplicitFileContentQuestion(content: string) {

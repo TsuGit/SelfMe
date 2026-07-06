@@ -3925,6 +3925,26 @@ async function main() {
     "automatic step-limit continuation should no longer surface the old ninth-step hard stop"
   );
 
+  console.log("task: auto-continue broad multi-file inspection phrased without explicit read keywords");
+  const broadInspectionContinuationResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "app.config.json、greet.mjs、report.mjs、serve.mjs、dashboard.mjs、status.mjs、smoke-a.mjs、node-todo/app.js、node-todo/views/index.ejs 这些文件都过一遍，最后直接回答 SHOULD-NOT-HAPPEN-ALT。"
+  });
+
+  assert.equal(broadInspectionContinuationResult.assistantText, "SHOULD-NOT-HAPPEN-ALT");
+  assert.equal(
+    broadInspectionContinuationResult.toolSummaries.filter((summary) => summary.startsWith("node-todo/views/index.ejs:")).length,
+    1,
+    "broad multi-file inspection continuation should still reach the pending ninth file exactly once"
+  );
+  assert.equal(
+    broadInspectionContinuationResult.runtimeErrors.some((message) => message.includes("Agent stopped after 8 tool steps")),
+    false,
+    "broad multi-file inspection continuation should not surface the old step-limit hard stop"
+  );
+
   await verifyResumeAfterToolStepLimitFailure();
   await verifyAutomaticContinuationAfterToolStepLimitBeforeEdit();
   await verifyAutomaticContinuationAfterToolStepLimitDuringWholeProjectInspection();
@@ -31749,6 +31769,111 @@ function resolveProviderResponse(content: string) {
 
     if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
       return "SHOULD-NOT-HAPPEN";
+    }
+  }
+
+  if (content.startsWith("app.config.json、greet.mjs、report.mjs、serve.mjs、dashboard.mjs、status.mjs、smoke-a.mjs、node-todo/app.js、node-todo/views/index.ejs 这些文件都过一遍，最后直接回答 SHOULD-NOT-HAPPEN-ALT。")) {
+    return toolCall("files", {
+      path: "app.config.json",
+      startLine: 1,
+      endLine: 20
+    });
+  }
+
+  if (content.startsWith("Original user request: app.config.json、greet.mjs、report.mjs、serve.mjs、dashboard.mjs、status.mjs、smoke-a.mjs、node-todo/app.js、node-todo/views/index.ejs 这些文件都过一遍，最后直接回答 SHOULD-NOT-HAPPEN-ALT。")) {
+    const toolName = extractLine(content, "Tool:");
+    const summary = extractLine(content, "Summary:") ?? "";
+
+    if (toolName === "files" && /app\.config\.json/.test(summary)) {
+      return toolCall("files", {
+        path: "greet.mjs",
+        startLine: 1,
+        endLine: 20
+      });
+    }
+
+    if (toolName === "files" && /greet\.mjs/.test(summary)) {
+      return toolCall("files", {
+        path: "report.mjs",
+        startLine: 1,
+        endLine: 20
+      });
+    }
+
+    if (toolName === "files" && /report\.mjs/.test(summary)) {
+      return toolCall("files", {
+        path: "serve.mjs",
+        startLine: 1,
+        endLine: 20
+      });
+    }
+
+    if (toolName === "files" && /serve\.mjs/.test(summary)) {
+      return toolCall("files", {
+        path: "dashboard.mjs",
+        startLine: 1,
+        endLine: 20
+      });
+    }
+
+    if (toolName === "files" && /dashboard\.mjs/.test(summary)) {
+      return toolCall("files", {
+        path: "status.mjs",
+        startLine: 1,
+        endLine: 20
+      });
+    }
+
+    if (toolName === "files" && /status\.mjs/.test(summary)) {
+      return toolCall("files", {
+        path: "smoke-a.mjs",
+        startLine: 1,
+        endLine: 20
+      });
+    }
+
+    if (toolName === "files" && /smoke-a\.mjs/.test(summary)) {
+      return toolCall("files", {
+        path: "node-todo/app.js",
+        startLine: 1,
+        endLine: 20
+      });
+    }
+
+    if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+      return toolCall("files", {
+        path: "node-todo/views/index.ejs",
+        startLine: 1,
+        endLine: 20
+      });
+    }
+
+    if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+      return "SHOULD-NOT-HAPPEN-ALT";
+    }
+  }
+
+  if (
+    !content.startsWith("Original user request:")
+    && content.includes("The current task hit the per-slice tool budget but still has unfinished work.")
+    && content.includes("Original task: app.config.json、greet.mjs、report.mjs、serve.mjs、dashboard.mjs、status.mjs、smoke-a.mjs、node-todo/app.js、node-todo/views/index.ejs 这些文件都过一遍，最后直接回答 SHOULD-NOT-HAPPEN-ALT。")
+  ) {
+    return toolCall("files", {
+      path: "node-todo/views/index.ejs",
+      startLine: 1,
+      endLine: 20
+    });
+  }
+
+  if (
+    content.startsWith("Original user request: The current task hit the per-slice tool budget but still has unfinished work.")
+    && content.includes("Original task: app.config.json、greet.mjs、report.mjs、serve.mjs、dashboard.mjs、status.mjs、smoke-a.mjs、node-todo/app.js、node-todo/views/index.ejs 这些文件都过一遍，最后直接回答 SHOULD-NOT-HAPPEN-ALT。")
+  ) {
+    const toolName = extractLine(content, "Tool:");
+    const summary = extractLine(content, "Summary:") ?? "";
+
+    if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+      return "SHOULD-NOT-HAPPEN-ALT";
     }
   }
 
