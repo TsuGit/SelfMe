@@ -4259,6 +4259,8 @@ async function main() {
   verifyContextCompactionCarriesPendingApprovalThroughResumeFollowUp();
   verifyContextCompactionCarriesPendingNextStepThroughResumeFollowUp();
   verifyContextCompactionCarriesHiddenPendingNextStepCheckpointThroughResumeFollowUp();
+  verifyContextCompactionPreservesNestedProjectPendingNextStep();
+  verifyContextCompactionCarriesNestedProjectResumeAnchorThroughFollowUp();
   verifyContextCompactionPreservesAssistantStageBoundaries();
   verifyContextCompactionKeepsWholeTurns();
   verifyToolSummaryFormatting();
@@ -29705,6 +29707,81 @@ function verifyContextCompactionCarriesHiddenPendingNextStepCheckpointThroughRes
   assert.match(recentTaskStateMessage, /Underlying task: Rewrite node-todo and keep working until it is ready\./);
   assert.match(recentTaskStateMessage, /Working files: node-todo\/app\.js/);
   assert.match(recentTaskStateMessage, /Pending next step: I updated node-todo\/app\.js and will continue with node-todo\/views\/index\.ejs next\./);
+}
+
+function verifyContextCompactionPreservesNestedProjectPendingNextStep() {
+  const sessionId = "compaction-nested-pending-next-step-session";
+  const events: RuntimeEvent[] = [];
+
+  events.push(createUserMessageSubmittedEvent({
+    sessionId,
+    content: "Rewrite packages/demo-core and keep working until it is ready."
+  }));
+  events.push(createToolExecutionCompletedEvent({
+    sessionId,
+    taskId: "nested-pending-next-tool-1",
+    toolName: "edit",
+    summary: "packages/demo-core/app.js:1-2 · updated (2 -> 2 lines)"
+  }));
+  events.push(createAssistantCheckpointRecordedEvent({
+    sessionId,
+    taskId: "nested-pending-next-turn",
+    kind: "pending_next_step",
+    content: "I updated packages/demo-core/app.js and will continue with packages/demo-core/views/index.ejs next.",
+    targetPath: "packages/demo-core/views/index.ejs"
+  }));
+
+  const messages = buildContextMessages(events);
+  const recentTaskStateMessage = messages.find((message) => message.role === "system" && message.content.includes("Recent task state:"))?.content ?? "";
+
+  assert.match(recentTaskStateMessage, /Current request: Rewrite packages\/demo-core and keep working until it is ready\./);
+  assert.match(recentTaskStateMessage, /Working files: packages\/demo-core\/app\.js/);
+  assert.match(
+    recentTaskStateMessage,
+    /Pending next step: I updated packages\/demo-core\/app\.js and will continue with packages\/demo-core\/views\/index\.ejs next\./
+  );
+  assert.doesNotMatch(recentTaskStateMessage, /Working files: packages(?:,|$)/);
+  assert.doesNotMatch(recentTaskStateMessage, /Pending next step: .*packages\/views\/index\.ejs/);
+}
+
+function verifyContextCompactionCarriesNestedProjectResumeAnchorThroughFollowUp() {
+  const sessionId = "compaction-nested-resume-anchor-session";
+  const events: RuntimeEvent[] = [];
+
+  events.push(createUserMessageSubmittedEvent({
+    sessionId,
+    content: "Rewrite packages/demo-core and keep working until it is ready."
+  }));
+  events.push(createToolExecutionCompletedEvent({
+    sessionId,
+    taskId: "nested-resume-tool-1",
+    toolName: "edit",
+    summary: "packages/demo-core/app.js:1-2 · updated (2 -> 2 lines)"
+  }));
+  events.push(createAssistantCheckpointRecordedEvent({
+    sessionId,
+    taskId: "nested-resume-turn",
+    kind: "pending_next_step",
+    content: "I updated packages/demo-core/app.js and will continue with packages/demo-core/views/index.ejs next.",
+    targetPath: "packages/demo-core/views/index.ejs"
+  }));
+  events.push(createUserMessageSubmittedEvent({
+    sessionId,
+    content: "帮我优化下"
+  }));
+
+  const messages = buildContextMessages(events);
+  const recentTaskStateMessage = messages.find((message) => message.role === "system" && message.content.includes("Recent task state:"))?.content ?? "";
+
+  assert.match(recentTaskStateMessage, /Current request: 帮我优化下/);
+  assert.match(recentTaskStateMessage, /Underlying task: Rewrite packages\/demo-core and keep working until it is ready\./);
+  assert.match(recentTaskStateMessage, /Working files: packages\/demo-core\/app\.js/);
+  assert.match(
+    recentTaskStateMessage,
+    /Pending next step: I updated packages\/demo-core\/app\.js and will continue with packages\/demo-core\/views\/index\.ejs next\./
+  );
+  assert.doesNotMatch(recentTaskStateMessage, /Working files: packages(?:,|$)/);
+  assert.doesNotMatch(recentTaskStateMessage, /Underlying task: Rewrite packages and keep working until it is ready\./);
 }
 
 function verifyContextCompactionPreservesAssistantStageBoundaries() {
