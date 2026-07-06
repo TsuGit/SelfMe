@@ -4092,6 +4092,7 @@ async function main() {
   await verifyNestedProjectVagueOptimizationExecutesPreviousProposalAfterSparseInspection();
   await verifyNestedProjectLongHistoryFollowUpStillAnchorsAfterCompaction();
   await verifyNestedProjectLongHistoryRewriteFollowUpStillAnchorsAfterCompaction();
+  await verifyNestedProjectLongHistoryProposalApprovalStillAnchorsAfterCompaction();
   await verifyBareCompletionReplyStillTriggersVerification();
   await verifyRepeatedIdenticalAssistantRepliesAbortAsStalled();
   await verifyResumeAfterRepeatedAssistantStall();
@@ -6699,6 +6700,244 @@ async function verifyNestedProjectLongHistoryRewriteFollowUpStillAnchorsAfterCom
     result.toolSummaries.some((summary) => /^packages\/aaa-workbench\/(?:package\.json|server\.js):1-\d+/.test(summary)),
     false,
     "expected long-history nested rewrite follow-up to avoid drifting into the sibling decoy project after compaction"
+  );
+}
+
+async function verifyNestedProjectLongHistoryProposalApprovalStillAnchorsAfterCompaction() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-nested-project-long-history-proposal-approval-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  const proposalPrompt = "看看 packages/demo-core 项目，但先别改，告诉我如果优化它你会怎么做。";
+  await mkdir(join(workspace, "packages", "demo-core", "views"), { recursive: true });
+  await mkdir(join(workspace, "packages", "aaa-workbench"), { recursive: true });
+  await mkdir(join(workspace, "docs"), { recursive: true });
+
+  await writeFile(join(workspace, "docs", "plan.md"), "# plan\n", "utf8");
+  await writeFile(
+    join(workspace, "packages", "demo-core", "package.json"),
+    '{\n  "name": "demo-core",\n  "version": "1.0.0",\n  "main": "app.js"\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "packages", "demo-core", "app.js"),
+    'const PORT = 3000;\nconsole.log(PORT);\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "packages", "demo-core", "views", "index.ejs"),
+    '<input name="title" />\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "packages", "aaa-workbench", "package.json"),
+    '{\n  "name": "aaa-workbench",\n  "version": "1.0.0",\n  "main": "server.js"\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "packages", "aaa-workbench", "server.js"),
+    'console.log("decoy");\n',
+    "utf8"
+  );
+
+  class NestedProjectLongHistoryProposalApprovalProvider implements ProviderClient {
+    readonly name = "nested-project-long-history-proposal-approval-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const executeProposalPrompt = 'The user replied "可以" to approve the immediately previous proposal.';
+
+      if (input.content === proposalPrompt) {
+        yield { delta: "可以" };
+        return;
+      }
+
+      if (input.content.startsWith(executeProposalPrompt) && !input.content.startsWith(`Original user request: ${executeProposalPrompt}`)) {
+        assert.match(input.content, /Approved proposal:/);
+        assert.match(input.content, /packages\/demo-core\/app\.js/);
+        assert.match(input.content, /packages\/demo-core\/views\/index\.ejs/);
+        assert.match(input.content, /Recent editable working file: packages\/demo-core\/app\.js/);
+
+        const recentTaskState = input.contextMessages?.find((message) =>
+          message.role === "system" && message.content.includes("Recent task state:")
+        )?.content ?? "";
+        const earlierSummary = input.contextMessages?.find((message) =>
+          message.role === "system" && message.content.includes("Earlier session summary:")
+        )?.content ?? "";
+
+        assert.match(recentTaskState, /Current request: 可以/);
+        assert.match(recentTaskState, /Underlying task: 看看 packages\/demo-core 项目，但先别改，告诉我如果优化它你会怎么做。/);
+        assert.match(recentTaskState, /Working files: packages\/demo-core\/app\.js/);
+        assert.ok(earlierSummary.length > 0, "expected long history proposal approval to build an earlier session summary");
+
+        yield {
+          delta: toolCall("files", {
+            path: "packages/demo-core/app.js",
+            startLine: 1,
+            endLine: 2
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${executeProposalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /packages\/demo-core\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "packages/demo-core/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /packages\/demo-core\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "packages/demo-core/views/index.ejs",
+              startLine: 1,
+              endLine: 1
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /packages\/demo-core\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "packages/demo-core/views/index.ejs",
+              startLine: 1,
+              endLine: 1,
+              replacement: '<input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /packages\/demo-core\/views\/index\.ejs/.test(summary)) {
+          yield { delta: "我已经在长历史上下文里按 proposal 完成了 packages/demo-core 的优化。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  for (let index = 1; index <= 6; index += 1) {
+    const taskId = `older-history-proposal-${index}`;
+    await transcriptStore.appendEvent(createUserMessageSubmittedEvent({
+      sessionId: session.sessionId,
+      content: `Older request ${index}`
+    }));
+    await transcriptStore.appendEvent(createAssistantDeltaEvent({
+      sessionId: session.sessionId,
+      taskId,
+      delta: `Older answer ${index}`
+    }));
+    await transcriptStore.appendEvent(createAssistantCompletedEvent({
+      sessionId: session.sessionId,
+      taskId,
+      model: "regression-stub"
+    }));
+  }
+
+  await transcriptStore.appendEvent(createToolExecutionCompletedEvent({
+    sessionId: session.sessionId,
+    taskId: "older-history-proposal-tool",
+    toolName: "shell",
+    summary: "yes · timed out · truncated",
+    rawOutput: "Y".repeat(4000)
+  }));
+
+  await transcriptStore.appendEvent(createUserMessageSubmittedEvent({
+    sessionId: session.sessionId,
+    content: proposalPrompt
+  }));
+  await transcriptStore.appendEvent(createToolExecutionCompletedEvent({
+    sessionId: session.sessionId,
+    taskId: "nested-history-proposal-tool-1",
+    toolName: "shell",
+    summary: "pwd && ls -la · completed",
+    rawOutput: "/workspace\npackages\ndocs"
+  }));
+  await transcriptStore.appendEvent(createToolExecutionCompletedEvent({
+    sessionId: session.sessionId,
+    taskId: "nested-history-proposal-tool-2",
+    toolName: "files",
+    summary: "packages/demo-core/package.json:1-4",
+    rawOutput: '{\n  "name": "demo-core",\n  "version": "1.0.0",\n  "main": "app.js"\n}'
+  }));
+  await transcriptStore.appendEvent(createToolExecutionCompletedEvent({
+    sessionId: session.sessionId,
+    taskId: "nested-history-proposal-tool-3",
+    toolName: "files",
+    summary: "packages/demo-core/app.js:1-2",
+    rawOutput: '1 | const PORT = 3000;\n2 | console.log(PORT);'
+  }));
+  await transcriptStore.appendEvent(createAssistantDeltaEvent({
+    sessionId: session.sessionId,
+    taskId: "nested-history-proposal-turn",
+    delta: "如果你要我继续，我会优化 packages/demo-core，先把 packages/demo-core/app.js 改成读取 process.env.PORT，再给 packages/demo-core/views/index.ejs 的 title input 加上 maxlength 100。"
+  }));
+  await transcriptStore.appendEvent(createAssistantCompletedEvent({
+    sessionId: session.sessionId,
+    taskId: "nested-history-proposal-turn",
+    model: "regression-stub"
+  }));
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new NestedProjectLongHistoryProposalApprovalProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "可以"
+  });
+
+  const optimizedAppContent = await readFile(join(workspace, "packages", "demo-core", "app.js"), "utf8");
+  const optimizedViewContent = await readFile(join(workspace, "packages", "demo-core", "views", "index.ejs"), "utf8");
+  assert.match(optimizedAppContent, /process\.env\.PORT/);
+  assert.match(optimizedViewContent, /maxlength="100"/);
+  assert.match(result.assistantText, /packages\/demo-core/i);
+  assert.doesNotMatch(result.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("packages/demo-core/app.js:1-2")),
+    "expected long-history nested proposal approval to execute the approved proposal from packages/demo-core/app.js"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("packages/demo-core/views/index.ejs:1-1")),
+    "expected long-history nested proposal approval to continue the approved proposal into packages/demo-core/views/index.ejs"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("packages/demo-core/views/index.ejs:1-1 · updated")),
+    "expected long-history nested proposal approval to finish the nested view edit"
+  );
+  assert.equal(
+    result.toolSummaries.some((summary) => /^packages\/aaa-workbench\/(?:package\.json|server\.js):1-\d+/.test(summary)),
+    false,
+    "expected long-history nested proposal approval to avoid drifting into the sibling decoy project after compaction"
   );
 }
 
