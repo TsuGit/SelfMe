@@ -3305,7 +3305,14 @@ function buildToolContinuationActionHint(originalRequest: string, input: {
     return undefined;
   }
 
-  if (looksLikeProjectInspectionRequest(originalRequest) && looksLikeProjectListingOutput(input.summary, input.rawOutput)) {
+  if (
+    (
+      looksLikeProjectInspectionRequest(originalRequest)
+      || looksLikeBroadProjectImprovementRequest(originalRequest)
+      || looksLikeExecutableProjectRewriteRequest(originalRequest)
+    )
+    && looksLikeProjectListingOutput(input.summary, input.rawOutput)
+  ) {
     return "do not stop at a broad question after the listing; pick the most likely project entry from the listing and read that package.json, README, or main source file next";
   }
 
@@ -3486,7 +3493,14 @@ function buildToolContinuationClueLines(originalRequest: string, input: {
     clues.push(`Working file anchor: ${input.workingFileAnchor}`);
   }
 
-  if (looksLikeProjectInspectionRequest(originalRequest) && looksLikeProjectListingOutput(input.summary, input.rawOutput)) {
+  if (
+    (
+      looksLikeProjectInspectionRequest(originalRequest)
+      || looksLikeBroadProjectImprovementRequest(originalRequest)
+      || looksLikeExecutableProjectRewriteRequest(originalRequest)
+    )
+    && looksLikeProjectListingOutput(input.summary, input.rawOutput)
+  ) {
     const projectEntry = extractLikelyProjectEntryFromListing(input.rawOutput, originalRequest);
 
     if (projectEntry) {
