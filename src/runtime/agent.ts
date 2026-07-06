@@ -1557,17 +1557,30 @@ export class AgentRuntime {
       }
 
       if (mode === "message") {
+        const sanitizedPendingMessage = sanitizeAssistantMessageForRuntime(input.content, pendingPrefix);
+
+        if (
+          !input.suppressMessageEmission
+          && !deferVisibleEmission
+          && (
+            (looksLikeLowValueAcknowledgementPrefix(pendingPrefix) && sanitizedPendingMessage.trim().length === 0)
+            || looksLikePendingLowValueAcknowledgementPrefix(pendingPrefix)
+          )
+        ) {
+          continue;
+        }
+
         streamedVisible = true;
 
         if (!input.suppressMessageEmission && !deferVisibleEmission) {
           const nextEvent = createAssistantDeltaEvent({
             sessionId: input.sessionId,
             taskId: input.taskId,
-            delta: pendingPrefix
+            delta: sanitizedPendingMessage
           });
           this.input.bus.emit(nextEvent);
           await this.input.transcriptStore.appendEvent(nextEvent);
-          visibleMessageEmitted = true;
+          visibleMessageEmitted = sanitizedPendingMessage.trim().length > 0;
         }
 
         pendingPrefix = "";
@@ -7962,6 +7975,30 @@ function stripLowValueAcknowledgementPrefix(content: string) {
   const trimmedStart = content.slice(leadingWhitespace.length);
   const stripped = trimmedStart.replace(/^(?:(?:可以继续吗|可以继续|可以了|可以|已继续|继续了|好的|好|行|没问题|sure|okay|ok)\b[\s,，。!！:：-]*)+/iu, "");
   return stripped === trimmedStart ? content : `${leadingWhitespace}${stripped}`;
+}
+
+function looksLikePendingLowValueAcknowledgementPrefix(content: string) {
+  const normalized = content.trim().replace(/[\s,，。!！:：-]+$/u, "").toLowerCase();
+
+  if (!normalized) {
+    return false;
+  }
+
+  return [
+    "可以继续吗",
+    "可以继续",
+    "可以了",
+    "可以",
+    "已继续",
+    "继续了",
+    "好的",
+    "好",
+    "行",
+    "没问题",
+    "sure",
+    "okay",
+    "ok"
+  ].some((candidate) => candidate.startsWith(normalized) && candidate !== normalized);
 }
 
 function createAssistantStageSignature(content: string) {

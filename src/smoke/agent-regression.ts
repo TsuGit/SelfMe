@@ -4080,6 +4080,7 @@ async function main() {
   await verifyChineseOptimizationProposalExecutesPreviousProposal();
   await verifyColloquialChineseOptimizationProposalExecutesPreviousProposal();
   await verifyColloquialNextStepProposalExecutesPreviousProposal();
+  await verifyStreamedAcknowledgementPrefixGetsSanitizedBeforeEmission();
   await verifyDirectEditFollowUpExecutesPreviousProposal();
   await verifyFollowPreviousPlanExecutesPreviousProposal();
   await verifyFollowPreviousPlanVariantExecutesPreviousProposal();
@@ -8775,6 +8776,92 @@ async function verifyColloquialNextStepProposalExecutesPreviousProposal() {
     followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1 · updated")),
     "expected colloquial next-step proposal follow-up to finish the view edit"
   );
+}
+
+async function verifyStreamedAcknowledgementPrefixGetsSanitizedBeforeEmission() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-streamed-ack-prefix-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "package.json"),
+    '{\n  "name": "node-todo",\n  "version": "1.0.0"\n}\n',
+    "utf8"
+  );
+
+  class StreamedAcknowledgementPrefixProvider implements ProviderClient {
+    readonly name = "streamed-acknowledgement-prefix-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "读取 node-todo/package.json 并告诉我 name 字段。";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/package.json",
+            startLine: 1,
+            endLine: 3
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          yield { delta: "已" };
+          yield { delta: "继续" };
+          yield { delta: "，" };
+          yield { delta: "node-todo/package.json 里的 name 是 node-todo。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new StreamedAcknowledgementPrefixProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const beforeEvents = await transcriptStore.readEventsBySession(session.sessionId);
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "读取 node-todo/package.json 并告诉我 name 字段。"
+  });
+
+  const events = (await transcriptStore.readEventsBySession(session.sessionId)).slice(beforeEvents.length);
+  const streamedAssistantText = collectAssistantText(events, result.taskId);
+  const streamedChunks = events.filter((event): event is Extract<RuntimeEvent, { type: "assistant.delta.received" }> =>
+    event.type === "assistant.delta.received" && event.taskId === result.taskId
+  );
+
+  assert.equal(result.assistantText, "node-todo/package.json 里的 name 是 node-todo。");
+  assert.equal(streamedAssistantText, "node-todo/package.json 里的 name 是 node-todo。");
+  assert.ok(streamedChunks.length >= 1, "expected at least one streamed assistant delta");
+  assert.doesNotMatch(streamedChunks[0]?.payload.delta ?? "", /^(?:已继续|可以继续|可以)/u);
 }
 
 async function verifyDirectEditFollowUpExecutesPreviousProposal() {
