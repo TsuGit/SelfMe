@@ -3471,157 +3471,125 @@ async function main() {
     "expected invalid tool input recovery not to fail the task"
   );
 
-  console.log("task: resume after repeated invalid tool input failure");
-  const invalidToolInputFailedResult = await runAgentTask({
+  console.log("task: auto-continue after repeated invalid tool input failure");
+  const invalidToolInputResult = await runAgentTask({
     bus,
     transcriptStore,
     sessionId: session.sessionId,
-    prompt: "Read app.config.json and fix invalid-tool-resume-report.mjs so running `node invalid-tool-resume-report.mjs` prints exactly `SelfMe:3000` on one line. Keep working until the output is exact, even if a shell tool input becomes invalid.",
-    expectedState: "failed"
-  });
-
-  assert.ok(
-    invalidToolInputFailedResult.runtimeErrors.length > 0,
-    "expected repeated invalid tool input to fail before resume"
-  );
-
-  const invalidToolInputResumeResult = await runAgentTask({
-    bus,
-    transcriptStore,
-    sessionId: session.sessionId,
-    prompt: "还能继续吗"
+    prompt: "Read app.config.json and fix invalid-tool-resume-report.mjs so running `node invalid-tool-resume-report.mjs` prints exactly `SelfMe:3000` on one line. Keep working until the output is exact, even if a shell tool input becomes invalid."
   });
 
   const invalidToolResumeContent = await readFile(join(workspace, "invalid-tool-resume-report.mjs"), "utf8");
   assert.match(invalidToolResumeContent, /app\.config\.json/);
-  assert.match(invalidToolInputResumeResult.assistantText, /SelfMe:3000|invalid-tool-resume-report\.mjs/i);
+  assert.match(invalidToolInputResult.assistantText, /SelfMe:3000|invalid-tool-resume-report\.mjs/i);
   assert.equal(
-    invalidToolInputResumeResult.toolSummaries.some((summary) => summary.startsWith("app.config.json:1-4")),
-    false,
-    "expected invalid-tool-input resume to skip rereading the config source after continue"
+    invalidToolInputResult.toolSummaries.filter((summary) => summary.startsWith("app.config.json:1-4")).length,
+    1,
+    "expected repeated invalid-tool-input auto-continuation to preserve the original config read without rereading it"
   );
   assert.ok(
-    invalidToolInputResumeResult.toolSummaries.some((summary) => summary.startsWith("invalid-tool-resume-report.mjs:1-2")),
-    "expected invalid-tool-input resume to continue directly into the pending file read"
+    invalidToolInputResult.toolSummaries.some((summary) => summary.startsWith("invalid-tool-resume-report.mjs:1-2")),
+    "expected repeated invalid-tool-input auto-continuation to continue directly into the pending file read"
   );
   assert.ok(
-    invalidToolInputResumeResult.toolSummaries.some((summary) => summary.startsWith("invalid-tool-resume-report.mjs:1-1 · updated")),
-    "expected invalid-tool-input resume to repair the pending file after reading it"
+    invalidToolInputResult.toolSummaries.some((summary) => summary.startsWith("invalid-tool-resume-report.mjs:1-1 · updated")),
+    "expected repeated invalid-tool-input auto-continuation to repair the pending file after reading it"
   );
   assert.ok(
-    invalidToolInputResumeResult.toolSummaries.some((summary) => summary.startsWith("node invalid-tool-resume-report.mjs · completed")),
-    "expected invalid-tool-input resume to finish verification after the repair"
+    invalidToolInputResult.toolSummaries.some((summary) => summary.startsWith("node invalid-tool-resume-report.mjs · completed")),
+    "expected repeated invalid-tool-input auto-continuation to finish verification after the repair"
+  );
+  assert.equal(
+    invalidToolInputResult.runtimeErrors.length,
+    0,
+    "expected repeated invalid tool input to recover within the same task"
   );
 
-  console.log("task: resume after invalid tool input before the first real tool runs");
-  const noToolInvalidResumeFailedResult = await runAgentTask({
+  console.log("task: auto-continue after invalid tool input before the first real tool runs");
+  const noToolInvalidResult = await runAgentTask({
     bus,
     transcriptStore,
     sessionId: session.sessionId,
-    prompt: "Fix no-tool-invalid-resume-report.mjs so running `node no-tool-invalid-resume-report.mjs` prints exactly `ready`. Verify it before finishing, even if your first edit tool input is invalid.",
-    expectedState: "failed"
-  });
-
-  assert.ok(
-    noToolInvalidResumeFailedResult.runtimeErrors.length > 0,
-    "expected repeated invalid first-tool input to fail before resume"
-  );
-
-  const noToolInvalidResumeResult = await runAgentTask({
-    bus,
-    transcriptStore,
-    sessionId: session.sessionId,
-    prompt: "还能继续吗"
+    prompt: "Fix no-tool-invalid-resume-report.mjs so running `node no-tool-invalid-resume-report.mjs` prints exactly `ready`. Verify it before finishing, even if your first edit tool input is invalid."
   });
 
   const noToolInvalidResumeContent = await readFile(join(workspace, "no-tool-invalid-resume-report.mjs"), "utf8");
   assert.match(noToolInvalidResumeContent, /ready/);
-  assert.match(noToolInvalidResumeResult.assistantText, /ready|no-tool-invalid-resume-report\.mjs/i);
+  assert.match(noToolInvalidResult.assistantText, /ready|no-tool-invalid-resume-report\.mjs/i);
   assert.ok(
-    noToolInvalidResumeResult.toolSummaries.some((summary) => summary.startsWith("no-tool-invalid-resume-report.mjs:1-1")),
-    "expected first-tool invalid-input resume to inspect the original target file"
+    noToolInvalidResult.toolSummaries.some((summary) => summary.startsWith("no-tool-invalid-resume-report.mjs:1-1")),
+    "expected first-tool invalid-input auto-continuation to inspect the original target file"
   );
   assert.ok(
-    noToolInvalidResumeResult.toolSummaries.some((summary) => summary.startsWith("no-tool-invalid-resume-report.mjs:1-1 · updated")),
-    "expected first-tool invalid-input resume to repair the original target file"
+    noToolInvalidResult.toolSummaries.some((summary) => summary.startsWith("no-tool-invalid-resume-report.mjs:1-1 · updated")),
+    "expected first-tool invalid-input auto-continuation to repair the original target file"
   );
   assert.ok(
-    noToolInvalidResumeResult.toolSummaries.some((summary) => summary.startsWith("node no-tool-invalid-resume-report.mjs · completed")),
-    "expected first-tool invalid-input resume to finish verification after the repair"
+    noToolInvalidResult.toolSummaries.some((summary) => summary.startsWith("node no-tool-invalid-resume-report.mjs · completed")),
+    "expected first-tool invalid-input auto-continuation to finish verification after the repair"
+  );
+  assert.equal(
+    noToolInvalidResult.runtimeErrors.length,
+    0,
+    "expected repeated invalid first-tool input to recover within the same task"
   );
 
-  console.log("task: resume after unknown tool before the first real tool runs");
-  const noToolUnknownResumeFailedResult = await runAgentTask({
+  console.log("task: auto-continue after unknown tool before the first real tool runs");
+  const noToolUnknownResult = await runAgentTask({
     bus,
     transcriptStore,
     sessionId: session.sessionId,
-    prompt: "Fix no-tool-unknown-resume-report.mjs so running `node no-tool-unknown-resume-report.mjs` prints exactly `ready`. Verify it before finishing, even if your first edit tool name is wrong.",
-    expectedState: "failed"
-  });
-
-  assert.ok(
-    noToolUnknownResumeFailedResult.runtimeErrors.length > 0,
-    "expected repeated unknown first-tool request to fail before resume"
-  );
-
-  const noToolUnknownResumeResult = await runAgentTask({
-    bus,
-    transcriptStore,
-    sessionId: session.sessionId,
-    prompt: "还能继续吗"
+    prompt: "Fix no-tool-unknown-resume-report.mjs so running `node no-tool-unknown-resume-report.mjs` prints exactly `ready`. Verify it before finishing, even if your first edit tool name is wrong."
   });
 
   const noToolUnknownResumeContent = await readFile(join(workspace, "no-tool-unknown-resume-report.mjs"), "utf8");
   assert.match(noToolUnknownResumeContent, /ready/);
-  assert.match(noToolUnknownResumeResult.assistantText, /ready|no-tool-unknown-resume-report\.mjs/i);
+  assert.match(noToolUnknownResult.assistantText, /ready|no-tool-unknown-resume-report\.mjs/i);
   assert.ok(
-    noToolUnknownResumeResult.toolSummaries.some((summary) => summary.startsWith("no-tool-unknown-resume-report.mjs:1-1")),
-    "expected first-tool unknown-tool resume to inspect the original target file"
+    noToolUnknownResult.toolSummaries.some((summary) => summary.startsWith("no-tool-unknown-resume-report.mjs:1-1")),
+    "expected first-tool unknown-tool auto-continuation to inspect the original target file"
   );
   assert.ok(
-    noToolUnknownResumeResult.toolSummaries.some((summary) => summary.startsWith("no-tool-unknown-resume-report.mjs:1-1 · updated")),
-    "expected first-tool unknown-tool resume to repair the original target file"
+    noToolUnknownResult.toolSummaries.some((summary) => summary.startsWith("no-tool-unknown-resume-report.mjs:1-1 · updated")),
+    "expected first-tool unknown-tool auto-continuation to repair the original target file"
   );
   assert.ok(
-    noToolUnknownResumeResult.toolSummaries.some((summary) => summary.startsWith("node no-tool-unknown-resume-report.mjs · completed")),
-    "expected first-tool unknown-tool resume to finish verification after the repair"
+    noToolUnknownResult.toolSummaries.some((summary) => summary.startsWith("node no-tool-unknown-resume-report.mjs · completed")),
+    "expected first-tool unknown-tool auto-continuation to finish verification after the repair"
+  );
+  assert.equal(
+    noToolUnknownResult.runtimeErrors.length,
+    0,
+    "expected repeated unknown first-tool request to recover within the same task"
   );
 
-  console.log("task: resume after malformed tool call before the first real tool runs");
-  const noToolMalformedResumeFailedResult = await runAgentTask({
+  console.log("task: auto-continue after malformed tool call before the first real tool runs");
+  const noToolMalformedResult = await runAgentTask({
     bus,
     transcriptStore,
     sessionId: session.sessionId,
-    prompt: "Fix no-tool-malformed-resume-report.mjs so running `node no-tool-malformed-resume-report.mjs` prints exactly `ready`. Verify it before finishing, even if your first edit tool call is malformed.",
-    expectedState: "failed"
-  });
-
-  assert.ok(
-    noToolMalformedResumeFailedResult.runtimeErrors.length > 0,
-    "expected repeated malformed first-tool call to fail before resume"
-  );
-
-  const noToolMalformedResumeResult = await runAgentTask({
-    bus,
-    transcriptStore,
-    sessionId: session.sessionId,
-    prompt: "还能继续吗"
+    prompt: "Fix no-tool-malformed-resume-report.mjs so running `node no-tool-malformed-resume-report.mjs` prints exactly `ready`. Verify it before finishing, even if your first edit tool call is malformed."
   });
 
   const noToolMalformedResumeContent = await readFile(join(workspace, "no-tool-malformed-resume-report.mjs"), "utf8");
   assert.match(noToolMalformedResumeContent, /ready/);
-  assert.match(noToolMalformedResumeResult.assistantText, /ready|no-tool-malformed-resume-report\.mjs/i);
+  assert.match(noToolMalformedResult.assistantText, /ready|no-tool-malformed-resume-report\.mjs/i);
   assert.ok(
-    noToolMalformedResumeResult.toolSummaries.some((summary) => summary.startsWith("no-tool-malformed-resume-report.mjs:1-1")),
-    "expected first-tool malformed-call resume to inspect the original target file"
+    noToolMalformedResult.toolSummaries.some((summary) => summary.startsWith("no-tool-malformed-resume-report.mjs:1-1")),
+    "expected first-tool malformed-call auto-continuation to inspect the original target file"
   );
   assert.ok(
-    noToolMalformedResumeResult.toolSummaries.some((summary) => summary.startsWith("no-tool-malformed-resume-report.mjs:1-1 · updated")),
-    "expected first-tool malformed-call resume to repair the original target file"
+    noToolMalformedResult.toolSummaries.some((summary) => summary.startsWith("no-tool-malformed-resume-report.mjs:1-1 · updated")),
+    "expected first-tool malformed-call auto-continuation to repair the original target file"
   );
   assert.ok(
-    noToolMalformedResumeResult.toolSummaries.some((summary) => summary.startsWith("node no-tool-malformed-resume-report.mjs · completed")),
-    "expected first-tool malformed-call resume to finish verification after the repair"
+    noToolMalformedResult.toolSummaries.some((summary) => summary.startsWith("node no-tool-malformed-resume-report.mjs · completed")),
+    "expected first-tool malformed-call auto-continuation to finish verification after the repair"
+  );
+  assert.equal(
+    noToolMalformedResult.runtimeErrors.length,
+    0,
+    "expected repeated malformed first-tool call to recover within the same task"
   );
 
   console.log("task: accept shell cmd alias payload");
@@ -31315,12 +31283,24 @@ function resolveProviderResponse(content: string) {
       });
     }
 
+    if (toolName === "shell" && /failed \(1\)/.test(summary)) {
+      return toolCall("files", {
+        path: "no-tool-malformed-resume-report.mjs",
+        startLine: 1,
+        endLine: 20
+      });
+    }
+
     if (toolName === "shell" && /completed/.test(summary)) {
       return "Repaired no-tool-malformed-resume-report.mjs and verified the final output is ready.";
     }
   }
 
-  if (content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
+  if (
+    (
+      content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
+      || content.startsWith("The task hit repeated tool-recovery failures but the task context is still actionable.")
+    )
     && /Original task: Read app\.config\.json and fix invalid-tool-resume-report\.mjs/.test(content)
   ) {
     assert.match(content, /Pending next step target: invalid-tool-resume-report\.mjs/);
@@ -31333,7 +31313,11 @@ function resolveProviderResponse(content: string) {
     });
   }
 
-  if (content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
+  if (
+    (
+      content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
+      || content.startsWith("Original user request: The task hit repeated tool-recovery failures but the task context is still actionable.")
+    )
     && /Original task: Read app\.config\.json and fix invalid-tool-resume-report\.mjs/.test(content)
   ) {
     const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
@@ -31359,7 +31343,11 @@ function resolveProviderResponse(content: string) {
     }
   }
 
-  if (content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
+  if (
+    (
+      content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
+      || content.startsWith("The task hit repeated tool-recovery failures but the task context is still actionable.")
+    )
     && /Original task: Fix no-tool-invalid-resume-report\.mjs so running `node no-tool-invalid-resume-report\.mjs` prints exactly `ready`\./.test(content)
   ) {
     assert.match(content, /Pending next step target: no-tool-invalid-resume-report\.mjs/);
@@ -31370,7 +31358,11 @@ function resolveProviderResponse(content: string) {
     });
   }
 
-  if (content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
+  if (
+    (
+      content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
+      || content.startsWith("Original user request: The task hit repeated tool-recovery failures but the task context is still actionable.")
+    )
     && /Original task: Fix no-tool-invalid-resume-report\.mjs so running `node no-tool-invalid-resume-report\.mjs` prints exactly `ready`\./.test(content)
   ) {
     const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
@@ -31396,7 +31388,11 @@ function resolveProviderResponse(content: string) {
     }
   }
 
-  if (content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
+  if (
+    (
+      content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
+      || content.startsWith("The task hit repeated tool-recovery failures but the task context is still actionable.")
+    )
     && /Original task: Fix no-tool-unknown-resume-report\.mjs so running `node no-tool-unknown-resume-report\.mjs` prints exactly `ready`\./.test(content)
   ) {
     assert.match(content, /Pending next step target: no-tool-unknown-resume-report\.mjs/);
@@ -31407,7 +31403,11 @@ function resolveProviderResponse(content: string) {
     });
   }
 
-  if (content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
+  if (
+    (
+      content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
+      || content.startsWith("Original user request: The task hit repeated tool-recovery failures but the task context is still actionable.")
+    )
     && /Original task: Fix no-tool-unknown-resume-report\.mjs so running `node no-tool-unknown-resume-report\.mjs` prints exactly `ready`\./.test(content)
   ) {
     const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
@@ -31433,10 +31433,14 @@ function resolveProviderResponse(content: string) {
     }
   }
 
-  if (content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
+  if (
+    (
+      content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
+      || content.startsWith("The task hit repeated tool-recovery failures but the task context is still actionable.")
+    )
     && /Original task: Fix no-tool-malformed-resume-report\.mjs so running `node no-tool-malformed-resume-report\.mjs` prints exactly `ready`\./.test(content)
   ) {
-    assert.match(content, /Recent editable working file: no-tool-malformed-resume-report\.mjs/);
+    assert.match(content, /Pending next step target: no-tool-malformed-resume-report\.mjs|Recent editable working file: no-tool-malformed-resume-report\.mjs/);
     return toolCall("files", {
       path: "no-tool-malformed-resume-report.mjs",
       startLine: 1,
@@ -31444,7 +31448,11 @@ function resolveProviderResponse(content: string) {
     });
   }
 
-  if (content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
+  if (
+    (
+      content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
+      || content.startsWith("Original user request: The task hit repeated tool-recovery failures but the task context is still actionable.")
+    )
     && /Original task: Fix no-tool-malformed-resume-report\.mjs so running `node no-tool-malformed-resume-report\.mjs` prints exactly `ready`\./.test(content)
   ) {
     const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");

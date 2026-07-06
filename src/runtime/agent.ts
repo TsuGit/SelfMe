@@ -37,6 +37,7 @@ const PROJECT_AGENT_TOOL_STEPS = 32;
 const ASSISTANT_PASS_MULTIPLIER = 4;
 const MAX_AUTO_STEP_LIMIT_CONTINUATIONS = 2;
 const MAX_AUTO_ASSISTANT_PASS_LIMIT_CONTINUATIONS = 1;
+const MAX_AUTO_TOOL_RECOVERY_CONTINUATIONS = 1;
 const MAX_REPEATED_IDENTICAL_TOOL_RESULTS = 2;
 const MAX_REPEATED_IDENTICAL_ASSISTANT_MESSAGES = 2;
 const MAX_MALFORMED_TOOL_CALL_RETRIES = 1;
@@ -627,6 +628,7 @@ export class AgentRuntime {
     let invalidToolInputRetryCount = 0;
     let autoStepLimitContinuationCount = 0;
     let autoAssistantPassContinuationCount = 0;
+    let autoToolRecoveryContinuationCount = 0;
     const activeRun = this.startActiveRun(sessionId, responseTaskId);
     this.taskOriginalRequests.set(responseTaskId, originalRequest);
     this.taskKnownPaths.set(responseTaskId, new Set(extractWritableTaskPaths(originalRequest)));
@@ -703,6 +705,24 @@ export class AgentRuntime {
               nextPrompt,
               previousToolResult: lastToolResult
             });
+
+            if (
+              autoToolRecoveryContinuationCount < MAX_AUTO_TOOL_RECOVERY_CONTINUATIONS
+              && shouldAutoContinueAfterToolRecovery(originalRequest, nextPrompt, lastToolResult)
+            ) {
+              autoToolRecoveryContinuationCount += 1;
+              nextPrompt = buildToolRecoveryAutoContinuationPrompt({
+                originalRequest,
+                nextPrompt,
+                previousToolResult: lastToolResult,
+                recoveryKind: "malformed tool call"
+              });
+              malformedToolCallRetryCount = 0;
+              unknownToolRetryCount = 0;
+              invalidToolInputRetryCount = 0;
+              continue;
+            }
+
             throw new Error(`Model emitted a malformed tool call: ${createMalformedToolCallPreview(assistantPass.rawBuffer)}`);
           }
 
@@ -810,6 +830,24 @@ export class AgentRuntime {
               nextPrompt,
               previousToolResult: lastToolResult
             });
+
+            if (
+              autoToolRecoveryContinuationCount < MAX_AUTO_TOOL_RECOVERY_CONTINUATIONS
+              && shouldAutoContinueAfterToolRecovery(originalRequest, nextPrompt, lastToolResult)
+            ) {
+              autoToolRecoveryContinuationCount += 1;
+              nextPrompt = buildToolRecoveryAutoContinuationPrompt({
+                originalRequest,
+                nextPrompt,
+                previousToolResult: lastToolResult,
+                recoveryKind: `unknown tool ${assistantPass.toolCall.tool}`
+              });
+              malformedToolCallRetryCount = 0;
+              unknownToolRetryCount = 0;
+              invalidToolInputRetryCount = 0;
+              continue;
+            }
+
             throw new Error(`Unknown tool requested by model: ${assistantPass.toolCall.tool}`);
           }
 
@@ -839,6 +877,24 @@ export class AgentRuntime {
               nextPrompt,
               previousToolResult: lastToolResult
             });
+
+            if (
+              autoToolRecoveryContinuationCount < MAX_AUTO_TOOL_RECOVERY_CONTINUATIONS
+              && shouldAutoContinueAfterToolRecovery(originalRequest, nextPrompt, lastToolResult)
+            ) {
+              autoToolRecoveryContinuationCount += 1;
+              nextPrompt = buildToolRecoveryAutoContinuationPrompt({
+                originalRequest,
+                nextPrompt,
+                previousToolResult: lastToolResult,
+                recoveryKind: `invalid ${requestedTool.name} input`
+              });
+              malformedToolCallRetryCount = 0;
+              unknownToolRetryCount = 0;
+              invalidToolInputRetryCount = 0;
+              continue;
+            }
+
             throw error;
           }
 
@@ -7158,6 +7214,33 @@ function buildAssistantPassLimitAutoContinuationPrompt(input: {
   ].filter(Boolean).join("\n");
 }
 
+function buildToolRecoveryAutoContinuationPrompt(input: {
+  originalRequest: string;
+  nextPrompt: string;
+  previousToolResult?: {
+    toolName: string;
+    summary: string;
+  };
+  recoveryKind: string;
+}) {
+  const targetPath = extractPendingTargetPathFromContinuationPrompt(input.nextPrompt)
+    ?? derivePendingTargetPathFromContinuationContext({
+      originalRequest: input.originalRequest,
+      previousToolResult: input.previousToolResult
+    });
+
+  return [
+    "The task hit repeated tool-recovery failures but the task context is still actionable.",
+    `Latest recovery issue: ${input.recoveryKind}.`,
+    "Continue the same task now instead of stopping or asking the user to continue.",
+    "Do not repeat the same broken tool repair loop. Move directly onto the pending next step target and keep working until the original request is complete or truly blocked.",
+    targetPath ? `Pending next step target: ${targetPath}` : "",
+    input.previousToolResult ? `Latest tool in context: ${input.previousToolResult.toolName}` : "",
+    input.previousToolResult ? `Latest tool summary in context: ${input.previousToolResult.summary}` : "",
+    `Original task: ${input.originalRequest}`
+  ].filter(Boolean).join("\n");
+}
+
 function shouldAutoContinueAfterStepLimit(
   originalRequest: string,
   targetPath: string
@@ -7171,6 +7254,29 @@ function shouldAutoContinueAfterStepLimit(
   return hasMutationIntent(taskContent)
     || looksLikeProjectInspectionRequest(taskContent)
     || looksLikeWholeProjectInspectionRequest(taskContent);
+}
+
+function shouldAutoContinueAfterToolRecovery(
+  originalRequest: string,
+  nextPrompt: string,
+  previousToolResult?: {
+    toolName: string;
+    summary: string;
+    rawOutput?: string;
+    errorMessage?: string;
+  }
+) {
+  const pendingTargetPath = extractPendingTargetPathFromContinuationPrompt(nextPrompt)
+    ?? derivePendingTargetPathFromContinuationContext({
+      originalRequest,
+      previousToolResult
+    });
+
+  if (!pendingTargetPath) {
+    return false;
+  }
+
+  return shouldAutoContinueAfterStepLimit(originalRequest, pendingTargetPath);
 }
 
 function looksLikePathScopedCompletionForMultiTargetRequest(
