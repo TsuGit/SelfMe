@@ -4095,6 +4095,7 @@ async function main() {
   await verifyNestedProjectLongHistoryProposalApprovalStillAnchorsAfterCompaction();
   await verifyNestedProjectLongHistoryRewriteProposalApprovalStillAnchorsAfterCompaction();
   await verifyLongHistoryFollowUpStillAnchorsAfterCompaction();
+  await verifyLongHistoryRewriteFollowUpStillAnchorsAfterCompaction();
   await verifyLongHistoryRewriteProposalApprovalStillAnchorsAfterCompaction();
   await verifyBareCompletionReplyStillTriggersVerification();
   await verifyRepeatedIdenticalAssistantRepliesAbortAsStalled();
@@ -7378,6 +7379,205 @@ async function verifyLongHistoryFollowUpStillAnchorsAfterCompaction() {
     result.toolSummaries.some((summary) => /^aaa-sidecar\/(?:package\.json|server\.js):1-\d+/.test(summary)),
     false,
     "expected long-history generic follow-up to avoid drifting into the sibling decoy project after compaction"
+  );
+}
+
+async function verifyLongHistoryRewriteFollowUpStillAnchorsAfterCompaction() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-long-history-rewrite-follow-up-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+  await mkdir(join(workspace, "aaa-sidecar"), { recursive: true });
+  await mkdir(join(workspace, "docs"), { recursive: true });
+
+  await writeFile(join(workspace, "docs", "plan.md"), "# plan\n", "utf8");
+  await writeFile(
+    join(workspace, "node-todo", "package.json"),
+    '{\n  "name": "node-todo",\n  "version": "1.0.0",\n  "main": "app.js"\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const PORT = 3000;\nconsole.log(PORT);\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "aaa-sidecar", "package.json"),
+    '{\n  "name": "aaa-sidecar",\n  "version": "1.0.0",\n  "main": "server.js"\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "aaa-sidecar", "server.js"),
+    'console.log("decoy");\n',
+    "utf8"
+  );
+
+  class LongHistoryRewriteFollowUpProvider implements ProviderClient {
+    readonly name = "long-history-rewrite-follow-up-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      if (input.content === "你能帮我重新写个项目吗") {
+        yield { delta: "可以" };
+        return;
+      }
+
+      if (/^The user replied "你能帮我重新写个项目吗" and wants you to rewrite the most recently inspected project or file now\./.test(input.content)) {
+        assert.match(input.content, /Previous context request: 看看 node-todo 项目/);
+        assert.match(input.content, /Recent editable working file: node-todo\/app\.js/);
+
+        const recentTaskState = input.contextMessages?.find((message) =>
+          message.role === "system" && message.content.includes("Recent task state:")
+        )?.content ?? "";
+        const earlierSummary = input.contextMessages?.find((message) =>
+          message.role === "system" && message.content.includes("Earlier session summary:")
+        )?.content ?? "";
+
+        assert.match(recentTaskState, /Current request: 你能帮我重新写个项目吗/);
+        assert.match(recentTaskState, /Underlying task: 看看 node-todo 项目/);
+        assert.match(recentTaskState, /Working files: node-todo\/app\.js/);
+        assert.ok(earlierSummary.length > 0, "expected long history generic rewrite follow-up to build an earlier session summary");
+
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/app.js",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (/^Original user request: The user replied "你能帮我重新写个项目吗" and wants you to rewrite the most recently inspected project or file now\./.test(input.content)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'const PORT = Number(process.env.PORT || 3000);\nconsole.log(PORT);\n'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield { delta: "我已经在长历史上下文里继续重写了 node-todo/app.js。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  for (let index = 1; index <= 6; index += 1) {
+    const taskId = `older-history-generic-rewrite-${index}`;
+    await transcriptStore.appendEvent(createUserMessageSubmittedEvent({
+      sessionId: session.sessionId,
+      content: `Older request ${index}`
+    }));
+    await transcriptStore.appendEvent(createAssistantDeltaEvent({
+      sessionId: session.sessionId,
+      taskId,
+      delta: `Older answer ${index}`
+    }));
+    await transcriptStore.appendEvent(createAssistantCompletedEvent({
+      sessionId: session.sessionId,
+      taskId,
+      model: "regression-stub"
+    }));
+  }
+
+  await transcriptStore.appendEvent(createToolExecutionCompletedEvent({
+    sessionId: session.sessionId,
+    taskId: "older-history-generic-rewrite-tool",
+    toolName: "shell",
+    summary: "yes · timed out · truncated",
+    rawOutput: "Y".repeat(4000)
+  }));
+
+  await transcriptStore.appendEvent(createUserMessageSubmittedEvent({
+    sessionId: session.sessionId,
+    content: "看看 node-todo 项目"
+  }));
+  await transcriptStore.appendEvent(createToolExecutionCompletedEvent({
+    sessionId: session.sessionId,
+    taskId: "generic-history-rewrite-tool-1",
+    toolName: "shell",
+    summary: "pwd && ls -la · completed",
+    rawOutput: "/workspace\nnode-todo\naaa-sidecar\ndocs"
+  }));
+  await transcriptStore.appendEvent(createToolExecutionCompletedEvent({
+    sessionId: session.sessionId,
+    taskId: "generic-history-rewrite-tool-2",
+    toolName: "files",
+    summary: "node-todo/package.json:1-4",
+    rawOutput: '{\n  "name": "node-todo",\n  "version": "1.0.0",\n  "main": "app.js"\n}'
+  }));
+  await transcriptStore.appendEvent(createToolExecutionCompletedEvent({
+    sessionId: session.sessionId,
+    taskId: "generic-history-rewrite-tool-3",
+    toolName: "files",
+    summary: "node-todo/app.js:1-2",
+    rawOutput: '1 | const PORT = 3000;\n2 | console.log(PORT);'
+  }));
+  await transcriptStore.appendEvent(createAssistantDeltaEvent({
+    sessionId: session.sessionId,
+    taskId: "generic-history-rewrite-inspect",
+    delta: "我已经看完了 node-todo/package.json 和 node-todo/app.js。"
+  }));
+  await transcriptStore.appendEvent(createAssistantCompletedEvent({
+    sessionId: session.sessionId,
+    taskId: "generic-history-rewrite-inspect",
+    model: "regression-stub"
+  }));
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new LongHistoryRewriteFollowUpProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "你能帮我重新写个项目吗"
+  });
+
+  const content = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  assert.equal(content, 'const PORT = Number(process.env.PORT || 3000);\nconsole.log(PORT);\n');
+  assert.match(result.assistantText, /node-todo\/app\.js|process\.env\.PORT/i);
+  assert.doesNotMatch(result.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-2")),
+    "expected long-history generic rewrite follow-up to reread the anchored implementation file"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-1 · updated")),
+    "expected long-history generic rewrite follow-up to complete the anchored implementation edit"
+  );
+  assert.equal(
+    result.toolSummaries.some((summary) => /^aaa-sidecar\/(?:package\.json|server\.js):1-\d+/.test(summary)),
+    false,
+    "expected long-history generic rewrite follow-up to avoid drifting into the sibling decoy project after compaction"
   );
 }
 
