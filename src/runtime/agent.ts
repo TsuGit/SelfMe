@@ -5440,7 +5440,7 @@ function looksLikeAssistantProposal(content: string) {
   const hasOffer = /\b(if you want|if you'd like|i can|next step|if you want me to continue|i would first|i'd first|i would start by|i'd start by|i would begin by|i'd begin by)\b/i.test(normalized)
     || /(如果你愿意|如果你要我继续|我下一步可以|我可以继续|下一步可以|我建议下一步|下一步我可以|我会先|我先)/u.test(normalized);
   const hasAction = /\b(read|write|edit|fix|repair|create|update|change|modify|inspect|review|check|run|look at|rewrite|rebuild|optimize|improve|refactor)\b/i.test(normalized)
-    || /(读取|写入|编辑|修复|创建|更新|修改|检查|运行|改|阅读|查看|看下|看看|审一下|读|重写|优化|改进|重构)/u.test(normalized);
+    || /(读取|写入|编辑|修复|创建|更新|修改|检查|运行|改|阅读|查看|看下|看看|审一下|读|重写|优化|改进|重构|处理下|处理一下|搞下|搞一下|弄下|弄一下|整下|整一下|搞成|弄成|整成)/u.test(normalized);
 
   return hasOffer && hasAction;
 }
@@ -6905,7 +6905,8 @@ function looksLikeExplicitFileContentQuestion(content: string) {
   }
 
   return /\b(what(?:'s| is)?|show|tell me|contents?|inside|line\s+\d+|first line|second line|prints?)\b/i.test(taskContent)
-    || /(内容|里面|写了什么|写了啥|第\s*\d+\s*行|第一行|第二行|是什么|是啥|输出什么|打印什么)/u.test(taskContent);
+    || /(内容|里面|写了什么|写了啥|第\s*\d+\s*行|第一行|第二行|是什么|是啥|输出什么|打印什么)/u.test(taskContent)
+    || /(帮我|给我|你)?\s*(看看|看下|瞅瞅)/u.test(taskContent);
 }
 
 function looksLikeWorkspaceInspectionQuestion(content: string) {
