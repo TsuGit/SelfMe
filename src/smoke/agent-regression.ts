@@ -4079,6 +4079,7 @@ async function main() {
   await verifyEnglishPlanningStyleOptimizationProposalExecutesPreviousProposal();
   await verifyChineseOptimizationProposalExecutesPreviousProposal();
   await verifyColloquialChineseOptimizationProposalExecutesPreviousProposal();
+  await verifyColloquialNextStepProposalExecutesPreviousProposal();
   await verifyDirectEditFollowUpExecutesPreviousProposal();
   await verifyFollowPreviousPlanExecutesPreviousProposal();
   await verifyFollowPreviousPlanVariantExecutesPreviousProposal();
@@ -8626,6 +8627,153 @@ async function verifyColloquialChineseOptimizationProposalExecutesPreviousPropos
   assert.ok(
     followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1 · updated")),
     "expected colloquial Chinese optimize proposal follow-up to finish the view edit"
+  );
+}
+
+async function verifyColloquialNextStepProposalExecutesPreviousProposal() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-colloquial-next-step-proposal-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "node-todo", "views"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const PORT = 3000;\nconsole.log(PORT);\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<input name="title" />\n',
+    "utf8"
+  );
+
+  class ColloquialNextStepProposalProvider implements ProviderClient {
+    readonly name = "colloquial-next-step-proposal-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const proposalPrompt = "看看项目，但先别改，告诉我如果优化 node-todo 你会怎么做。";
+      const executeProposalPrompt = 'The user replied "可以" and wants you to execute the immediately previous optimize proposal now.';
+
+      if (input.content === proposalPrompt) {
+        yield {
+          delta: "我下一步给你整下 node-todo/app.js，再搞下 node-todo/views/index.ejs。"
+        };
+        return;
+      }
+
+      if (input.content.startsWith(executeProposalPrompt)) {
+        assert.match(input.content, /Approved proposal:/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/app.js",
+            startLine: 1,
+            endLine: 2
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${executeProposalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/views/index.ejs",
+              startLine: 1,
+              endLine: 1,
+              replacement: '<input name="title" maxlength="100" />'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          yield { delta: "我已经按刚才那步把 node-todo 优化好了。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ColloquialNextStepProposalProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const proposalResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "看看项目，但先别改，告诉我如果优化 node-todo 你会怎么做。"
+  });
+  assert.match(proposalResult.assistantText, /node-todo\/app\.js/i);
+  assert.match(proposalResult.assistantText, /node-todo\/views\/index\.ejs/i);
+
+  const followUpResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "可以"
+  });
+
+  const optimizedAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const optimizedViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(optimizedAppContent, /process\.env\.PORT/);
+  assert.match(optimizedViewContent, /maxlength="100"/);
+  assert.match(followUpResult.assistantText, /node-todo|优化好了/i);
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-2")),
+    "expected colloquial next-step proposal follow-up to execute from app.js"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1")),
+    "expected colloquial next-step proposal follow-up to continue into views/index.ejs"
+  );
+  assert.ok(
+    followUpResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-1 · updated")),
+    "expected colloquial next-step proposal follow-up to finish the view edit"
   );
 }
 
