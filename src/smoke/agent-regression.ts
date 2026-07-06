@@ -3815,6 +3815,20 @@ async function main() {
     "expected colloquial direct shell success summary"
   );
 
+  console.log("task: handle polite colloquial direct shell success");
+  const politeColloquialDirectShellSuccessResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "帮我跑下 pwd 看看"
+  });
+
+  assert.equal(politeColloquialDirectShellSuccessResult.assistantText, "当前工作目录就是这个会话的工作区目录。");
+  assert.ok(
+    politeColloquialDirectShellSuccessResult.toolSummaries.some((summary) => summary.startsWith("pwd · completed")),
+    "expected polite colloquial direct shell success summary"
+  );
+
   console.log("task: inherit chinese session language for bare direct shell failure");
   const chineseBareDirectShellFailureResult = await runAgentTask({
     bus,
@@ -27077,6 +27091,12 @@ function resolveProviderResponse(content: string) {
     });
   }
 
+  if (content.startsWith("帮我跑下 pwd 看看")) {
+    return toolCall("shell", {
+      command: "pwd"
+    });
+  }
+
   if (content.startsWith("run pwd")) {
     return toolCall("shell", {
       command: "pwd"
@@ -31273,6 +31293,12 @@ function resolveProviderResponse(content: string) {
   }
 
   if (content.startsWith("Original user request: 跑下 pwd 看看")) {
+    assert.match(content, /Tool: shell/);
+    assert.match(content, /Summary: pwd · completed/);
+    return "当前工作目录就是这个会话的工作区目录。";
+  }
+
+  if (content.startsWith("Original user request: 帮我跑下 pwd 看看")) {
     assert.match(content, /Tool: shell/);
     assert.match(content, /Summary: pwd · completed/);
     return "当前工作目录就是这个会话的工作区目录。";

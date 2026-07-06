@@ -8022,8 +8022,9 @@ function describePreferredReplyLanguage(preferredLanguage: PreferredReplyLanguag
 
 function isDirectShellExecutionRequest(content: string) {
   const trimmed = content.trim();
+  const normalized = trimmed.replace(/^(?:请|麻烦|帮我|你|你帮我)\s*/u, "");
 
-  const prefixedMatch = trimmed.match(/^(运行|执行|run|跑下|跑一下|试下|试一下|跑|试)\s+(.+)$/i);
+  const prefixedMatch = normalized.match(/^(运行|执行|run|跑下|跑一下|试下|试一下|跑|试)\s+(.+)$/i);
 
   if (prefixedMatch) {
     const rawCommand = prefixedMatch[2] ?? "";
@@ -8031,7 +8032,7 @@ function isDirectShellExecutionRequest(content: string) {
     return looksLikeStandaloneShellCommand(normalizedCommand);
   }
 
-  return looksLikeStandaloneShellCommand(trimmed);
+  return looksLikeStandaloneShellCommand(normalized);
 }
 
 function looksLikeStandaloneShellCommand(content: string) {
