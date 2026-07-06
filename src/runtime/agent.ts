@@ -2865,6 +2865,7 @@ function buildExecutionConvergencePrompt(
         : "Your previous assistant message explained the situation but did not advance the task.",
       "Do not stop for explanation-only updates.",
       "Take the next concrete step that moves the task forward.",
+      "When the next short chain is already clear from the latest result, keep going through the next obvious 2 to 4 concrete steps instead of stopping after one.",
       "If tools are needed, return exactly one tool call block.",
       "Only answer directly when the task is actually complete or truly blocked on user input."
     ],
@@ -3064,6 +3065,7 @@ function buildToolFailureContinuationPrompt(originalRequest: string, input: {
       "The latest tool attempt failed.",
       "Do not repeat the raw failure twice.",
       "Explain the failure briefly and accurately.",
+      "If the task is still actionable, prefer the next repair tool step over ending on a failure recap.",
       "If another tool can help, return exactly one tool call block.",
       "Otherwise answer directly.",
       "The terminal already shows the raw tool output to the user.",
@@ -3101,6 +3103,7 @@ function buildAgentSystemPrompt(tools: ToolImplementation[], preferredLanguage: 
     "You are SelfMe, a terminal-first coding agent.",
     "Use tools when they materially help complete the user's request.",
     "For actionable requests such as read, create, edit, fix, inspect, run, or verify, start doing the work instead of replying with a plan or status update.",
+    "For concrete coding tasks, prefer a short autonomous chain of the next obvious 2 to 4 steps when each step is directly justified by the latest tool result; do not stop after a single read, edit, or verification if the next concrete step is already clear.",
     "When the user message is only an approval or continue follow-up, do not answer with filler acknowledgements like 可以, 好的, sure, or okay; either do the work or report the concrete result directly.",
     "When a tool is required, respond with exactly one tool call block and no prose before or after it.",
     `${TOOL_CALL_OPEN}`,
@@ -5379,6 +5382,7 @@ function buildApprovedProposalPrompt(input: {
   return [
     `The user replied "${input.content.trim()}" to approve the immediately previous proposal.`,
     "Carry out that approved proposal now instead of restating it.",
+    "Keep going through the approved sequence until the concrete task is actually complete or truly blocked.",
     "Do not start with an acknowledgement like 可以, 可以继续, 好的, sure, or okay.",
     "Start with the concrete work result, current finding, or the next real action.",
     `Approved proposal: ${input.approvedProposal}`
@@ -5393,6 +5397,7 @@ function buildApprovedRewriteProposalPrompt(input: {
   return [
     `The user replied "${input.content.trim()}" and wants you to execute the immediately previous rewrite proposal now.`,
     "Carry out that rewrite now instead of narrowing it to a single-file tweak.",
+    "Keep going through the approved rewrite sequence until the concrete rewrite task is actually complete or truly blocked.",
     "Do the rewrite work now instead of stopping at analysis or another proposal.",
     "Do not ask which file to start from unless the current context truly lacks a concrete target.",
     "Start with the concrete work result, current finding, or the next real action.",
@@ -5410,6 +5415,7 @@ function buildApprovedOptimizeProposalPrompt(input: {
   return [
     `The user replied "${input.content.trim()}" and wants you to execute the immediately previous optimize proposal now.`,
     "Carry out that optimization now instead of turning it into another generic suggestion.",
+    "Keep going through the approved optimization sequence until the concrete task is actually complete or truly blocked.",
     "Do the optimize work now instead of stopping at analysis or another proposal.",
     "Do not ask which file to start from unless the current context truly lacks a concrete target.",
     "Start with the concrete work result, current finding, or the next real action.",
@@ -5430,6 +5436,7 @@ function buildApprovedInspectProposalPrompt(input: {
     input.wholeProjectInspection
       ? "Carry out that whole-project inspection now instead of shrinking it to a single-file glance."
       : "Carry out that inspection now instead of drifting into another generic suggestion.",
+    "Keep going through the approved inspection sequence until the concrete inspection is actually complete or truly blocked.",
     input.wholeProjectInspection
       ? "Treat this as a whole-project inspection follow-up, not a single-file peek."
       : "Inspect the most concrete current target instead of restarting broad exploration.",
