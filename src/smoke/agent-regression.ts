@@ -4069,6 +4069,7 @@ async function main() {
   await verifyNestedProjectMentionWinsOverRicherWorkspaceDecoy();
   await verifyNestedProjectMentionWinsOverRicherWorkspaceDecoyDuringProjectRewrite();
   await verifyAutomaticContinuationAfterAssistantPassLimitFailure();
+  await verifyAutomaticContinuationAcrossMultipleAssistantPassSlices();
   await verifyDeniedLaterApprovalDoesNotRetrySameAction();
   await verifyResumeAfterDeniedLaterApprovalStaysBlocked();
   await verifyAffirmativeAfterDeniedLaterApprovalStaysBlocked();
@@ -10444,6 +10445,184 @@ async function verifyAutomaticContinuationAfterAssistantPassLimitFailure() {
     result.runtimeErrors.some((message) => message.includes("Agent stopped after 96 assistant passes")),
     false,
     "automatic assistant-pass continuation should finish without surfacing the old assistant-pass hard stop"
+  );
+}
+
+async function verifyAutomaticContinuationAcrossMultipleAssistantPassSlices() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-assistant-pass-limit-multi-slice-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  const originalPrompt = "Read app.config.json and fix assistant-pass-limit-report.mjs so running `node assistant-pass-limit-report.mjs` prints exactly `SelfMe:3000` on one line. Keep working until the output is exact.";
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "app.config.json"), '{\n  "name": "SelfMe",\n  "port": 3000\n}\n', "utf8");
+  await writeFile(
+    join(workspace, "assistant-pass-limit-report.mjs"),
+    'import config from "./app.conf.json" with { type: "json" };\nconsole.log(`${config.name}:${config.port}`);\n',
+    "utf8"
+  );
+
+  class AssistantPassLimitMultiSliceProvider implements ProviderClient {
+    readonly name = "assistant-pass-limit-multi-slice-provider";
+    continuationPromptCount = 0;
+    private originalLoopReplyCount = 0;
+    private resumedLoopReplyCount = 0;
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "app.config.json",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /app\.config\.json/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node assistant-pass-limit-report.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /failed \(1\)/.test(summary)) {
+          this.originalLoopReplyCount += 1;
+          yield {
+            delta: `Original assistant-pass loop marker ${this.originalLoopReplyCount} stays focused on assistant-pass-limit-report.mjs and the unresolved import path app.conf.json, the source location is already narrow, this intentionally verbose sentence avoids short progress classification, and no user input ambiguity exists in this branch.`
+          };
+          return;
+        }
+      }
+
+      if (
+        !input.content.startsWith("Original user request:")
+        && input.content.includes("The current task used up its assistant pass budget but still has unfinished work.")
+      ) {
+        this.continuationPromptCount += 1;
+        assert.match(input.content, /Pending next step target: assistant-pass-limit-report\.mjs/);
+
+        if (this.continuationPromptCount === 1) {
+          yield {
+            delta: toolCall("files", {
+              path: "assistant-pass-limit-report.mjs",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (this.continuationPromptCount === 2) {
+          yield {
+            delta: toolCall("edit", {
+              path: "assistant-pass-limit-report.mjs",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'import config from "./app.config.json" with { type: "json" };'
+            })
+          };
+          return;
+        }
+
+        assert.fail(`unexpected assistant-pass continuation prompt ${this.continuationPromptCount}`);
+      }
+
+      if (
+        input.content.startsWith("Original user request: The current task used up its assistant pass budget but still has unfinished work.")
+      ) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /assistant-pass-limit-report\.mjs/.test(summary)) {
+          this.resumedLoopReplyCount += 1;
+          yield {
+            delta: `Resumed assistant-pass loop marker ${this.resumedLoopReplyCount} stays focused on assistant-pass-limit-report.mjs and the already-read import line, the target file is known, this intentionally verbose sentence avoids short progress classification, and the task is not yet complete because the edit has not landed.`
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /assistant-pass-limit-report\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node assistant-pass-limit-report.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /completed/.test(summary)) {
+          yield { delta: "Repaired assistant-pass-limit-report.mjs after two assistant-pass continuation slices and verified the final output is SelfMe:3000." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const provider = new AssistantPassLimitMultiSliceProvider();
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider,
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  bus.on("approval.requested", (event) => {
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: originalPrompt
+  });
+
+  const resumedContent = await readFile(join(workspace, "assistant-pass-limit-report.mjs"), "utf8");
+  assert.match(resumedContent, /app\.config\.json/);
+  assert.match(result.assistantText, /SelfMe:3000|assistant-pass-limit-report\.mjs/i);
+  assert.equal(provider.continuationPromptCount, 2, "assistant-pass auto-continuation should bridge two stalled pass-limit slices before finishing");
+  assert.equal(
+    result.toolSummaries.filter((summary) => summary.startsWith("assistant-pass-limit-report.mjs:1-2")).length,
+    1,
+    "multi-slice assistant-pass continuation should preserve the single resumed file read"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("assistant-pass-limit-report.mjs:1-1 · updated")),
+    "multi-slice assistant-pass continuation should still reach the pending edit"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("node assistant-pass-limit-report.mjs · completed")),
+    "multi-slice assistant-pass continuation should finish verification after the resumed edit"
+  );
+  assert.equal(
+    result.runtimeErrors.some((message) => message.includes("Agent stopped after 96 assistant passes")),
+    false,
+    "multi-slice assistant-pass continuation should finish without surfacing the assistant-pass hard stop"
   );
 }
 
