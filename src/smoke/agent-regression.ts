@@ -4207,6 +4207,7 @@ async function main() {
   await verifyResumeFollowUpAtLatestFailurePoint();
   await verifyResumeFollowUpWhenLatestFailurePointShiftsToHelper();
   await verifyResumeFollowUpWhenHelperFailurePointNeedsToolRecovery();
+  await verifyResumeFollowUpPullsCompletionToneBackIntoHelperFailurePoint();
   await verifyResumeFollowUpPullsExplanationBackIntoLatestFailurePoint();
   await verifyResumeFollowUpPullsCompletionToneBackIntoLatestFailurePoint();
   await verifyResumeFollowUpPullsBlockingQuestionBackIntoLatestFailurePoint();
@@ -26598,6 +26599,298 @@ async function verifyResumeFollowUpWhenHelperFailurePointNeedsToolRecovery() {
   assert.ok(
     approvalCount >= 2,
     "expected approvals for the initial main-file repair and the resumed helper repair"
+  );
+}
+
+async function verifyResumeFollowUpPullsCompletionToneBackIntoHelperFailurePoint() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-helper-completion-tone-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "src"), { recursive: true });
+  await writeFile(
+    join(workspace, "src", "bridge-switch-helper.mjs"),
+    'export function bridgeState() {\n  return "-ready";\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "src", "bridge-switch.mjs"),
+    'import { bridgeStatus } from "./bridge-switch-helperr.mjs";\nconsole.log(`SelfMe${bridgeStatus()}`);\n',
+    "utf8"
+  );
+
+  class ResumeHelperCompletionToneProvider implements ProviderClient {
+    readonly name = "resume-helper-completion-tone-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "Run `node src/bridge-switch.mjs`, fix the existing files so it prints exactly `SelfMe:ready`, and keep verifying until it is correct.";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "node src/bridge-switch.mjs"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell") {
+          if (/bridge-switch-helperr\.mjs/.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "src/bridge-switch.mjs",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+
+          if (/does not provide an export named|bridgeStatus/.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "src/bridge-switch-helper.mjs",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+
+          if (/SelfMe-ready/.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "src/bridge-switch-helper.mjs",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+
+          assert.match(input.content, /SelfMe:ready/);
+          yield { delta: "Fixed the resumed bridge-switch chain from the latest helper failure point and verified SelfMe:ready." };
+          return;
+        }
+
+        if (toolName === "files" && /src\/bridge-switch\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "src/bridge-switch.mjs",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'import { bridgeStatus } from "./bridge-switch-helper.mjs";'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /src\/bridge-switch\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node src/bridge-switch.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /src\/bridge-switch-helper\.mjs/.test(summary)) {
+          await waitForProviderDelay(input.signal, 120);
+          yield {
+            delta: toolCall("edit", {
+              path: "src/bridge-switch-helper.mjs",
+              startLine: 1,
+              endLine: 2,
+              replacement: [
+                "export function bridgeStatus() {",
+                '  return "-ready";'
+              ].join("\n")
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /src\/bridge-switch-helper\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node src/bridge-switch.mjs"
+            })
+          };
+          return;
+        }
+      }
+
+      if (input.content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+        yield { delta: "The bridge-switch helper repair is basically finished overall." };
+        return;
+      }
+
+      if (input.content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (/You have not started the requested work yet\./.test(input.content)) {
+          assert.match(input.content, /Recent editable working file: src\/bridge-switch-helper\.mjs/);
+          yield {
+            delta: toolCall("edit", {
+              path: "src/bridge-switch-helper.mjs",
+              startLine: 1,
+              endLine: 2,
+              replacement: [
+                "export function bridgeStatus() {",
+                '  return "-ready";'
+              ].join("\n")
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /src\/bridge-switch-helper\.mjs/.test(summary)) {
+          if (/export function bridgeStatus/.test(input.content) && /return "-ready"/.test(input.content)) {
+            yield {
+              delta: toolCall("shell", {
+                command: "node src/bridge-switch.mjs"
+              })
+            };
+            return;
+          }
+
+          yield {
+            delta: toolCall("shell", {
+              command: "node src/bridge-switch.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /SelfMe-ready/.test(input.content)) {
+          yield {
+            delta: toolCall("files", {
+              path: "src/bridge-switch-helper.mjs",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /src\/bridge-switch-helper\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "src/bridge-switch-helper.mjs",
+              startLine: 2,
+              endLine: 2,
+              replacement: '  return ":ready";'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell") {
+          assert.match(input.content, /SelfMe:ready/);
+          yield { delta: "Fixed the resumed bridge-switch chain from the latest helper failure point and verified SelfMe:ready." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ResumeHelperCompletionToneProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  let approvalCount = 0;
+  bus.on("approval.requested", (event) => {
+    approvalCount += 1;
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const completionPromise = waitForAssistantTaskCompletion(bus, session.sessionId);
+  const helperReadPromise = waitForToolExecutionCompleted(
+    bus,
+    session.sessionId,
+    (summary) => summary.startsWith("src/bridge-switch-helper.mjs:1-3")
+  );
+
+  bus.emit(createUserMessageSubmittedEvent({
+    sessionId: session.sessionId,
+    content: "Run `node src/bridge-switch.mjs`, fix the existing files so it prints exactly `SelfMe:ready`, and keep verifying until it is correct."
+  }));
+
+  await helperReadPromise;
+  bus.emit(createRuntimeInterruptRequestedEvent({
+    sessionId: session.sessionId,
+    reason: "cancel"
+  }));
+
+  const cancelledTask = await completionPromise;
+  assert.equal(cancelledTask.payload.state, "cancelled");
+
+  const resumedResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "还能继续吗"
+  });
+
+  const resumedEvents = await transcriptStore.readEventsBySession(session.sessionId);
+  assert.ok(
+    resumedEvents.some((event) =>
+      event.type === "assistant.delta.received"
+      && /The bridge-switch helper repair is basically finished overall\./.test(event.payload.delta)
+    ),
+    "resume helper completion-tone recovery should preserve the intermediate completion-tone reply before retrying the helper failure point"
+  );
+
+  const bridgeSwitchContent = await readFile(join(workspace, "src", "bridge-switch.mjs"), "utf8");
+  const bridgeSwitchHelperContent = await readFile(join(workspace, "src", "bridge-switch-helper.mjs"), "utf8");
+  assert.match(bridgeSwitchContent, /bridge-switch-helper\.mjs/);
+  assert.match(bridgeSwitchHelperContent, /export function bridgeStatus/);
+  assert.match(bridgeSwitchHelperContent, /return ":ready"/);
+  assert.match(resumedResult.assistantText, /latest helper failure point|SelfMe:ready/i);
+  assert.doesNotMatch(resumedResult.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("src/bridge-switch.mjs:1-2")),
+    false,
+    "resume helper completion-tone recovery should not reread the earlier main file after the helper became the latest failure point"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.filter((summary) =>
+      /^src\/bridge-switch-helper\.mjs:\d+-\d+\s+· updated/.test(summary)
+    ).length >= 2,
+    "resume helper completion-tone recovery should still finish the pending helper repairs"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.filter((summary) => summary.startsWith("node src/bridge-switch.mjs · completed")).length >= 2,
+    "resume helper completion-tone recovery should keep verifying after the resumed helper repairs"
+  );
+  assert.ok(
+    approvalCount >= 2,
+    "expected approvals for the initial main-file repair and the resumed helper completion-tone repairs"
   );
 }
 
