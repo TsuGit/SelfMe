@@ -4073,6 +4073,7 @@ async function main() {
   await verifyNestedProjectMentionWinsOverRicherWorkspaceDecoyDuringProjectRewrite();
   await verifyAutomaticContinuationAfterAssistantPassLimitFailure();
   await verifyAutomaticContinuationAfterAssistantPassLimitBeforeCommandOnlyShell();
+  await verifyAutomaticContinuationAfterRepeatedStallBeforeCommandOnlyShell();
   await verifyAutomaticContinuationAcrossMultipleAssistantPassSlices();
   await verifyAutomaticContinuationAcrossMultipleToolRecoverySlices();
   await verifyAutomaticContinuationAcrossMixedRecoveryAndStallSlices();
@@ -11396,6 +11397,197 @@ async function verifyAutomaticContinuationAfterAssistantPassLimitBeforeCommandOn
     result.runtimeErrors.some((message) => message.includes("Agent stopped after 32 assistant passes")),
     false,
     "assistant-pass command-only continuation should not surface the standard assistant-pass hard stop"
+  );
+}
+
+async function verifyAutomaticContinuationAfterRepeatedStallBeforeCommandOnlyShell() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-command-only-stall-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  const originalPrompt = "Read beta-a.txt, beta-b.txt, and package.json, then run `npm test` until it prints exactly `ready`, fixing whatever is needed before finishing.";
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "beta-a.txt"), "beta-a\n", "utf8");
+  await writeFile(join(workspace, "beta-b.txt"), "beta-b\n", "utf8");
+  await writeFile(
+    join(workspace, "package.json"),
+    '{\n  "name": "command-only-stall",\n  "version": "1.0.0",\n  "scripts": {\n    "test": "node verify-commandless-stall.mjs"\n  }\n}\n',
+    "utf8"
+  );
+  await writeFile(join(workspace, "verify-commandless-stall.mjs"), 'console.log("pending");\n', "utf8");
+
+  class CommandOnlyStallProvider implements ProviderClient {
+    readonly name = "command-only-stall-provider";
+    private repeatedShellCount = 0;
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "beta-a.txt",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /beta-a\.txt/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "beta-b.txt",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /beta-b\.txt/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "package.json",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "npm test"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /npm test · completed/.test(summary)) {
+          this.repeatedShellCount += 1;
+
+          if (this.repeatedShellCount <= 2) {
+            yield {
+              delta: toolCall("shell", {
+                command: "npm test"
+              })
+            };
+            return;
+          }
+        }
+      }
+
+      if (
+        !input.content.startsWith("Original user request:")
+        && input.content.includes("The task stalled after repeated identical progress signals but the task context is still actionable.")
+      ) {
+        assert.match(input.content, /Latest stall kind: repeated identical shell results\./);
+        assert.match(input.content, /Pending next step target: npm test/);
+        assert.match(input.content, /Latest tool in context: shell/);
+        yield {
+          delta: toolCall("files", {
+            path: "verify-commandless-stall.mjs",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (
+        input.content.startsWith("Original user request: The task stalled after repeated identical progress signals but the task context is still actionable.")
+      ) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /verify-commandless-stall\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "verify-commandless-stall.mjs",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'console.log("ready");'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /verify-commandless-stall\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "npm test"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /npm test · completed/.test(summary)) {
+          yield { delta: "npm test now prints ready after the stall recovery edit." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new CommandOnlyStallProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  bus.on("approval.requested", (event) => {
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: originalPrompt
+  });
+
+  const verifyContent = await readFile(join(workspace, "verify-commandless-stall.mjs"), "utf8");
+  assert.match(verifyContent, /ready/);
+  assert.match(result.assistantText, /ready|npm test/i);
+  assert.ok(
+    result.toolSummaries.filter((summary) => summary.startsWith("npm test · completed")).length >= 3,
+    "command-only repeated-stall continuation should preserve the stalled npm test loop before recovery"
+  );
+  assert.equal(
+    result.toolSummaries.filter((summary) => summary.startsWith("verify-commandless-stall.mjs:1-1")).length,
+    1,
+    "command-only repeated-stall continuation should inspect the hidden verification file once after the stall handoff"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("verify-commandless-stall.mjs:1-1 · updated")),
+    "command-only repeated-stall continuation should still reach the recovery edit"
+  );
+  assert.equal(
+    result.runtimeErrors.length,
+    0,
+    "command-only repeated-stall continuation should recover within the same task"
   );
 }
 
