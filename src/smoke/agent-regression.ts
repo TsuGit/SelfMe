@@ -41,7 +41,7 @@ class RegressionProvider implements ProviderClient {
   readonly name = "regression-provider";
 
   async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
-    const output = resolveProviderResponse(input.content);
+    const output = resolveProviderResponse(input.content, input.contextMessages);
 
     if (output.trim().length === 0) {
       throw new Error(`Regression provider produced an empty response for prompt:\n${input.content}`);
@@ -1561,6 +1561,222 @@ async function main() {
   assert.ok(
     workingFileContinuationResult.toolSummaries.some((summary) => summary.startsWith("node explain-report.mjs · completed")),
     "expected verification after the forced working-file edit"
+  );
+
+  console.log("task: start direct explicit project inspection without an unnecessary workspace listing");
+  const directExplicitProjectInspectionResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "看看 node-todo 项目，然后直接看核心实现。"
+  });
+
+  assert.match(directExplicitProjectInspectionResult.assistantText, /node-todo/i);
+  assert.doesNotMatch(directExplicitProjectInspectionResult.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
+  assert.equal(
+    directExplicitProjectInspectionResult.toolSummaries.some((summary) => summary.startsWith("pwd && ls -la")),
+    false,
+    "expected explicit project-root inspection to avoid the redundant workspace listing"
+  );
+  assert.ok(
+    directExplicitProjectInspectionResult.toolSummaries.some((summary) => /^node-todo\/package\.json:1-\d+$/.test(summary)),
+    "expected explicit project-root inspection to start from the named project entry"
+  );
+  assert.ok(
+    directExplicitProjectInspectionResult.toolSummaries.some((summary) => /^node-todo\/app\.js:1-\d+/.test(summary)),
+    "expected explicit project-root inspection to continue into the named project's implementation file"
+  );
+
+  console.log("task: start direct explicit file work without an unnecessary workspace listing");
+  const directExplicitFileWorkResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "直接看看 node-todo/app.js，然后把端口改成 process.env.PORT。"
+  });
+
+  assert.match(directExplicitFileWorkResult.assistantText, /process\.env\.PORT|node-todo\/app\.js/i);
+  assert.doesNotMatch(directExplicitFileWorkResult.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
+  assert.equal(
+    directExplicitFileWorkResult.toolSummaries.some((summary) => summary.startsWith("pwd && ls -la")),
+    false,
+    "expected explicit file work to avoid the redundant workspace listing"
+  );
+  assert.ok(
+    directExplicitFileWorkResult.toolSummaries.some((summary) => /^node-todo\/app\.js:1-\d+/.test(summary)),
+    "expected explicit file work to start from the named file"
+  );
+  assert.ok(
+    directExplicitFileWorkResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:3-3 · updated")),
+    "expected explicit file work to edit the named file directly"
+  );
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const express = require("express");\nconst app = express();\nconst PORT = 3000;\napp.listen(PORT, () => {\n  console.log(`Todo app is running at http://localhost:${PORT}`);\n});\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<!DOCTYPE html>\n<form action="/add" method="post">\n  <input name="title" />\n</form>\n',
+    "utf8"
+  );
+
+  console.log("task: start direct explicit project optimization without an unnecessary workspace listing");
+  const directExplicitProjectOptimizationResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "直接优化 node-todo 项目：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100。"
+  });
+
+  const directExplicitProjectOptimizationAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const directExplicitProjectOptimizationViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(directExplicitProjectOptimizationAppContent, /process\.env\.PORT/);
+  assert.match(directExplicitProjectOptimizationViewContent, /maxlength="100"/);
+  assert.match(directExplicitProjectOptimizationResult.assistantText, /process\.env\.PORT/);
+  assert.match(directExplicitProjectOptimizationResult.assistantText, /maxlength/i);
+  assert.doesNotMatch(directExplicitProjectOptimizationResult.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
+  assert.equal(
+    directExplicitProjectOptimizationResult.toolSummaries.some((summary) => summary.startsWith("pwd && ls -la")),
+    false,
+    "expected direct explicit project optimization to avoid the redundant workspace listing"
+  );
+  assert.ok(
+    directExplicitProjectOptimizationResult.toolSummaries.some((summary) => /^node-todo\/app\.js:1-\d+/.test(summary)),
+    "expected direct explicit project optimization to start from the first named file target"
+  );
+  assert.ok(
+    directExplicitProjectOptimizationResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:3-3 · updated")),
+    "expected direct explicit project optimization to edit app.js first"
+  );
+  assert.ok(
+    directExplicitProjectOptimizationResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-4")),
+    "expected direct explicit project optimization to continue into the second named file"
+  );
+  assert.ok(
+    directExplicitProjectOptimizationResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:3-3 · updated")),
+    "expected direct explicit project optimization to edit the second named file"
+  );
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const express = require("express");\nconst app = express();\nconst PORT = 3000;\napp.listen(PORT, () => {\n  console.log(`Todo app is running at http://localhost:${PORT}`);\n});\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "views", "index.ejs"),
+    '<!DOCTYPE html>\n<form action="/add" method="post">\n  <input name="title" />\n</form>\n',
+    "utf8"
+  );
+
+  console.log("task: start direct explicit project rewrite without an unnecessary workspace listing");
+  const directExplicitProjectRewriteResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "直接重写 node-todo 项目：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100。"
+  });
+
+  const directExplicitProjectRewriteAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  const directExplicitProjectRewriteViewContent = await readFile(join(workspace, "node-todo", "views", "index.ejs"), "utf8");
+  assert.match(directExplicitProjectRewriteAppContent, /process\.env\.PORT/);
+  assert.match(directExplicitProjectRewriteViewContent, /maxlength="100"/);
+  assert.match(directExplicitProjectRewriteResult.assistantText, /process\.env\.PORT|重写|rewrite/i);
+  assert.match(directExplicitProjectRewriteResult.assistantText, /maxlength/i);
+  assert.doesNotMatch(directExplicitProjectRewriteResult.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
+  assert.equal(
+    directExplicitProjectRewriteResult.toolSummaries.some((summary) => summary.startsWith("pwd && ls -la")),
+    false,
+    "expected direct explicit project rewrite to avoid the redundant workspace listing"
+  );
+  assert.ok(
+    directExplicitProjectRewriteResult.toolSummaries.some((summary) => /^node-todo\/app\.js:1-\d+/.test(summary)),
+    "expected direct explicit project rewrite to start from the first named file target"
+  );
+  assert.ok(
+    directExplicitProjectRewriteResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:3-3 · updated")),
+    "expected direct explicit project rewrite to edit app.js first"
+  );
+  assert.ok(
+    directExplicitProjectRewriteResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:1-4")),
+    "expected direct explicit project rewrite to continue into the second named file"
+  );
+  assert.ok(
+    directExplicitProjectRewriteResult.toolSummaries.some((summary) => summary.startsWith("node-todo/views/index.ejs:3-3 · updated")),
+    "expected direct explicit project rewrite to edit the second named file"
+  );
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const express = require("express");\nconst app = express();\nconst PORT = 3000;\napp.listen(PORT, () => {\n  console.log(`Todo app is running at http://localhost:${PORT}`);\n});\n',
+    "utf8"
+  );
+
+  console.log("task: start direct explicit project improvement from the named project entry");
+  const directExplicitProjectEntryImprovementResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "直接优化 node-todo 项目。你自己直接搞完。"
+  });
+
+  const directExplicitProjectEntryImprovementAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  assert.match(directExplicitProjectEntryImprovementAppContent, /process\.env\.PORT/);
+  assert.match(directExplicitProjectEntryImprovementResult.assistantText, /process\.env\.PORT|node-todo/i);
+  assert.doesNotMatch(directExplicitProjectEntryImprovementResult.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
+  assert.equal(
+    directExplicitProjectEntryImprovementResult.toolSummaries.some((summary) => summary.startsWith("pwd && ls -la")),
+    false,
+    "expected direct explicit project improvement to avoid the redundant workspace listing"
+  );
+  assert.ok(
+    directExplicitProjectEntryImprovementResult.toolSummaries.some((summary) => /^node-todo\/package\.json:1-\d+$/.test(summary)),
+    "expected direct explicit project improvement to start from the named project entry"
+  );
+  assert.ok(
+    directExplicitProjectEntryImprovementResult.toolSummaries.some((summary) => /^node-todo\/app\.js:1-\d+/.test(summary)),
+    "expected direct explicit project improvement to continue from the project entry into app.js"
+  );
+  assert.ok(
+    directExplicitProjectEntryImprovementResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:3-3 · updated")),
+    "expected direct explicit project improvement to edit app.js after the project entry read"
+  );
+
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const express = require("express");\nconst app = express();\nconst PORT = 3000;\napp.listen(PORT, () => {\n  console.log(`Todo app is running at http://localhost:${PORT}`);\n});\n',
+    "utf8"
+  );
+
+  console.log("task: start direct explicit project rewrite from the named project entry");
+  const directExplicitProjectEntryRewriteResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "直接重写 node-todo 项目。你自己直接搞完。"
+  });
+
+  const directExplicitProjectEntryRewriteAppContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  assert.match(directExplicitProjectEntryRewriteAppContent, /process\.env\.PORT/);
+  assert.match(directExplicitProjectEntryRewriteResult.assistantText, /process\.env\.PORT|重写|rewrite|node-todo/i);
+  assert.doesNotMatch(directExplicitProjectEntryRewriteResult.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
+  assert.equal(
+    directExplicitProjectEntryRewriteResult.toolSummaries.some((summary) => summary.startsWith("pwd && ls -la")),
+    false,
+    "expected direct explicit project rewrite to avoid the redundant workspace listing"
+  );
+  assert.ok(
+    directExplicitProjectEntryRewriteResult.toolSummaries.some((summary) => /^node-todo\/package\.json:1-\d+$/.test(summary)),
+    "expected direct explicit project rewrite to start from the named project entry"
+  );
+  assert.ok(
+    directExplicitProjectEntryRewriteResult.toolSummaries.some((summary) => /^node-todo\/app\.js:1-\d+/.test(summary)),
+    "expected direct explicit project rewrite to continue from the project entry into app.js"
+  );
+  assert.ok(
+    directExplicitProjectEntryRewriteResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:3-3 · updated")),
+    "expected direct explicit project rewrite to edit app.js after the project entry read"
   );
 
   console.log("task: continue project inspection after directory listing");
@@ -4072,11 +4288,18 @@ async function main() {
   await verifyAutomaticContinuationAfterToolStepLimitBeforeWrappedShell();
   await verifyAutomaticContinuationAfterToolStepLimitBeforeCommandOnlyShell();
   await verifyAutomaticContinuationAfterToolStepLimitDuringWholeProjectInspection();
+  await verifyTerseProjectMentionStartsDirectInspectionWithoutWorkspaceListing();
   await verifyExplicitProjectMentionWinsOverRicherWorkspaceDecoy();
   await verifyExplicitProjectMentionWinsOverRicherWorkspaceDecoyDuringProjectImprovement();
   await verifyExplicitProjectMentionWinsOverRicherWorkspaceDecoyDuringProjectRewrite();
+  await verifyDirectExplicitProjectMentionWinsOverRicherWorkspaceDecoyDuringProjectImprovement();
+  await verifyDirectExplicitProjectMentionWinsOverRicherWorkspaceDecoyDuringProjectRewrite();
+  await verifyTerseDirectProjectMentionWinsOverRicherWorkspaceDecoyDuringProjectImprovement();
   await verifyNestedProjectMentionWinsOverRicherWorkspaceDecoy();
   await verifyNestedProjectMentionWinsOverRicherWorkspaceDecoyDuringProjectRewrite();
+  await verifyDirectNestedProjectMentionWinsOverRicherWorkspaceDecoyDuringProjectImprovement();
+  await verifyDirectNestedProjectMentionWinsOverRicherWorkspaceDecoyDuringProjectRewrite();
+  await verifyTerseDirectNestedProjectMentionWinsOverRicherWorkspaceDecoyDuringProjectRewrite();
   await verifyAutomaticContinuationAfterAssistantPassLimitFailure();
   await verifyAutomaticContinuationAfterAssistantPassLimitBeforeCommandOnlyShell();
   await verifyAutomaticContinuationAcrossAssistantPassAndToolRecoveryBeforeCommandOnlyShell();
@@ -4296,6 +4519,7 @@ async function main() {
   await verifyPathScopedCompletionDoesNotEndDualFileExecution();
   await verifyImplicitRemainingChainDoesNotEndAtHelperCompletion();
   await verifyNearMissShellCompletionToneStillRepairsRemainingHelper();
+  await verifyProjectCommandStageSummaryResume();
   verifyInterruptFallbackWhenWorkingUiLingers();
   verifyExitCommandShutsDownTerminalLoop();
   console.log("task: verify context compaction");
@@ -4312,6 +4536,8 @@ async function main() {
   verifyContextCompactionCarriesPendingApprovalThroughResumeFollowUp();
   verifyContextCompactionCarriesPendingNextStepThroughResumeFollowUp();
   verifyContextCompactionCarriesHiddenPendingNextStepCheckpointThroughResumeFollowUp();
+  verifyContextCompactionPreservesHiddenCommandPendingNextStepCheckpoint();
+  verifyContextCompactionCarriesHiddenCommandPendingNextStepCheckpointThroughResumeFollowUp();
   verifyContextCompactionPreservesNestedProjectPendingNextStep();
   verifyContextCompactionCarriesNestedProjectResumeAnchorThroughFollowUp();
   verifyContextCompactionPreservesAssistantStageBoundaries();
@@ -10745,6 +10971,111 @@ async function verifyExplicitProjectMentionWinsOverRicherWorkspaceDecoy() {
   );
 }
 
+async function verifyTerseProjectMentionStartsDirectInspectionWithoutWorkspaceListing() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-project-name-terse-direct-inspection-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  const originalPrompt = "看看 node-todo";
+  await mkdir(join(workspace, "aaa-workbench"), { recursive: true });
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+
+  await writeFile(join(workspace, "aaa-workbench", "package.json"), '{\n  "name": "aaa-workbench"\n}\n', "utf8");
+  await writeFile(join(workspace, "aaa-workbench", "README.md"), '# aaa-workbench\n', "utf8");
+  await writeFile(join(workspace, "aaa-workbench", "app.js"), 'console.log("decoy");\n', "utf8");
+  await writeFile(join(workspace, "node-todo", "package.json"), '{\n  "name": "node-todo"\n}\n', "utf8");
+  await writeFile(join(workspace, "node-todo", "app.js"), 'console.log("todo");\n', "utf8");
+
+  class TerseProjectInspectionProvider implements ProviderClient {
+    readonly name = "terse-project-inspection-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const systemContext = (input.contextMessages ?? [])
+        .filter((message) => message.role === "system")
+        .map((message) => message.content)
+        .join("\n\n");
+
+      if (input.content === originalPrompt) {
+        assert.match(systemContext, /Current task execution guidance:/);
+        assert.match(systemContext, /Preferred starting project entry: node-todo\/package\.json/);
+        assert.doesNotMatch(systemContext, /aaa-workbench\/package\.json/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/package.json",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (/^Original user request: 看看 node-todo(?:\n|$)/.test(input.content)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield { delta: "我已经看了 node-todo/package.json 和 node-todo/app.js。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new TerseProjectInspectionProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: originalPrompt
+  });
+
+  assert.equal(
+    result.toolSummaries.some((summary) => summary.startsWith("pwd && ls -la")),
+    false,
+    "terse project inspection should avoid the redundant workspace listing"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => /^node-todo\/package\.json:1-\d+$/.test(summary)),
+    "terse project inspection should anchor on node-todo/package.json"
+  );
+  assert.equal(
+    result.toolSummaries.some((summary) => /^aaa-workbench\/package\.json:1-\d+$/.test(summary)),
+    false,
+    "terse project inspection should not drift into the richer decoy project"
+  );
+}
+
 async function verifyExplicitProjectMentionWinsOverRicherWorkspaceDecoyDuringProjectImprovement() {
   const root = await mkdtemp(join(tmpdir(), "selfme-agent-project-name-improvement-priority-"));
   const workspace = join(root, "workspace");
@@ -10982,6 +11313,368 @@ async function verifyExplicitProjectMentionWinsOverRicherWorkspaceDecoyDuringPro
   );
 }
 
+async function verifyDirectExplicitProjectMentionWinsOverRicherWorkspaceDecoyDuringProjectImprovement() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-project-name-direct-improvement-priority-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  const originalPrompt = "直接优化 node-todo 项目。你自己直接搞完。";
+  await mkdir(join(workspace, "aaa-workbench"), { recursive: true });
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+
+  await writeFile(join(workspace, "aaa-workbench", "package.json"), '{\n  "name": "aaa-workbench"\n}\n', "utf8");
+  await writeFile(join(workspace, "aaa-workbench", "README.md"), '# aaa-workbench\n', "utf8");
+  await writeFile(join(workspace, "aaa-workbench", "app.js"), 'console.log("decoy");\n', "utf8");
+  await writeFile(join(workspace, "aaa-workbench", "server.js"), 'console.log("server");\n', "utf8");
+  await writeFile(join(workspace, "node-todo", "package.json"), '{\n  "name": "node-todo"\n}\n', "utf8");
+  await writeFile(join(workspace, "node-todo", "app.js"), 'const PORT = 3000;\nconsole.log(PORT);\n', "utf8");
+
+  class DirectProjectNameImprovementPriorityProvider implements ProviderClient {
+    readonly name = "direct-project-name-improvement-priority-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const systemContext = (input.contextMessages ?? [])
+        .filter((message) => message.role === "system")
+        .map((message) => message.content)
+        .join("\n\n");
+
+      if (input.content === originalPrompt) {
+        assert.match(systemContext, /Current task execution guidance:/);
+        assert.match(systemContext, /Preferred starting project entry: node-todo\/package\.json/);
+        assert.doesNotMatch(systemContext, /aaa-workbench\/package\.json/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/package.json",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (/^Original user request: 直接优化 node-todo 项目。你自己直接搞完。(?:\n|$)/.test(input.content)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          assert.match(input.content, /Likely working file: node-todo\/app\.js/);
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'const PORT = Number(process.env.PORT || 3000);\nconsole.log(PORT);\n'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield { delta: "我已经直接把 node-todo/app.js 的端口配置改成了 process.env.PORT。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new DirectProjectNameImprovementPriorityProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: originalPrompt
+  });
+
+  const appContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  assert.match(appContent, /process\.env\.PORT/);
+  assert.equal(
+    result.toolSummaries.some((summary) => summary.startsWith("pwd && ls -la")),
+    false,
+    "direct explicit project improvement should avoid the redundant workspace listing even when a richer decoy project exists"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => /^node-todo\/package\.json:1-\d+$/.test(summary)),
+    "direct explicit project improvement should anchor on node-todo/package.json even when a richer decoy project exists"
+  );
+  assert.equal(
+    result.toolSummaries.some((summary) => /^aaa-workbench\/package\.json:1-\d+$/.test(summary)),
+    false,
+    "direct explicit project improvement should not drift into the richer decoy project"
+  );
+}
+
+async function verifyDirectExplicitProjectMentionWinsOverRicherWorkspaceDecoyDuringProjectRewrite() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-project-name-direct-rewrite-priority-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  const originalPrompt = "直接重写 node-todo 项目。你自己直接搞完。";
+  await mkdir(join(workspace, "aaa-workbench"), { recursive: true });
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+
+  await writeFile(join(workspace, "aaa-workbench", "package.json"), '{\n  "name": "aaa-workbench"\n}\n', "utf8");
+  await writeFile(join(workspace, "aaa-workbench", "README.md"), '# aaa-workbench\n', "utf8");
+  await writeFile(join(workspace, "aaa-workbench", "app.js"), 'console.log("decoy");\n', "utf8");
+  await writeFile(join(workspace, "aaa-workbench", "server.js"), 'console.log("server");\n', "utf8");
+  await writeFile(join(workspace, "node-todo", "package.json"), '{\n  "name": "node-todo"\n}\n', "utf8");
+  await writeFile(join(workspace, "node-todo", "app.js"), 'const PORT = 3000;\nconsole.log(PORT);\n', "utf8");
+
+  class DirectProjectNameRewritePriorityProvider implements ProviderClient {
+    readonly name = "direct-project-name-rewrite-priority-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const systemContext = (input.contextMessages ?? [])
+        .filter((message) => message.role === "system")
+        .map((message) => message.content)
+        .join("\n\n");
+
+      if (input.content === originalPrompt) {
+        assert.match(systemContext, /Current task execution guidance:/);
+        assert.match(systemContext, /Preferred starting project entry: node-todo\/package\.json/);
+        assert.doesNotMatch(systemContext, /aaa-workbench\/package\.json/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/package.json",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (/^Original user request: 直接重写 node-todo 项目。你自己直接搞完。(?:\n|$)/.test(input.content)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          assert.match(input.content, /Likely working file: node-todo\/app\.js/);
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'const PORT = Number(process.env.PORT || 3000);\nconsole.log(PORT);\n'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield { delta: "我已经直接把 node-todo 这轮重写落在了真正的实现文件上，而不是被其他项目带偏。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new DirectProjectNameRewritePriorityProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: originalPrompt
+  });
+
+  const appContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  assert.match(appContent, /process\.env\.PORT/);
+  assert.equal(
+    result.toolSummaries.some((summary) => summary.startsWith("pwd && ls -la")),
+    false,
+    "direct explicit project rewrite should avoid the redundant workspace listing even when a richer decoy project exists"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => /^node-todo\/package\.json:1-\d+$/.test(summary)),
+    "direct explicit project rewrite should anchor on node-todo/package.json even when a richer decoy project exists"
+  );
+  assert.equal(
+    result.toolSummaries.some((summary) => /^aaa-workbench\/package\.json:1-\d+$/.test(summary)),
+    false,
+    "direct explicit project rewrite should not drift into the richer decoy project"
+  );
+}
+
+async function verifyTerseDirectProjectMentionWinsOverRicherWorkspaceDecoyDuringProjectImprovement() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-project-name-terse-direct-improvement-priority-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  const originalPrompt = "直接优化 node-todo。你自己直接搞完。";
+  await mkdir(join(workspace, "aaa-workbench"), { recursive: true });
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+
+  await writeFile(join(workspace, "aaa-workbench", "package.json"), '{\n  "name": "aaa-workbench"\n}\n', "utf8");
+  await writeFile(join(workspace, "aaa-workbench", "README.md"), '# aaa-workbench\n', "utf8");
+  await writeFile(join(workspace, "aaa-workbench", "app.js"), 'console.log("decoy");\n', "utf8");
+  await writeFile(join(workspace, "node-todo", "package.json"), '{\n  "name": "node-todo"\n}\n', "utf8");
+  await writeFile(join(workspace, "node-todo", "app.js"), 'const PORT = 3000;\nconsole.log(PORT);\n', "utf8");
+
+  class TerseDirectProjectImprovementProvider implements ProviderClient {
+    readonly name = "terse-direct-project-improvement-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const systemContext = (input.contextMessages ?? [])
+        .filter((message) => message.role === "system")
+        .map((message) => message.content)
+        .join("\n\n");
+
+      if (input.content === originalPrompt) {
+        assert.match(systemContext, /Current task execution guidance:/);
+        assert.match(systemContext, /Preferred starting project entry: node-todo\/package\.json/);
+        assert.doesNotMatch(systemContext, /aaa-workbench\/package\.json/);
+        yield {
+          delta: toolCall("files", {
+            path: "node-todo/package.json",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (/^Original user request: 直接优化 node-todo。你自己直接搞完。(?:\n|$)/.test(input.content)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          assert.match(input.content, /Likely working file: node-todo\/app\.js/);
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'const PORT = Number(process.env.PORT || 3000);\nconsole.log(PORT);\n'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          yield { delta: "我已经直接把 node-todo/app.js 的端口配置改成了 process.env.PORT。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new TerseDirectProjectImprovementProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: originalPrompt
+  });
+
+  const appContent = await readFile(join(workspace, "node-todo", "app.js"), "utf8");
+  assert.match(appContent, /process\.env\.PORT/);
+  assert.equal(
+    result.toolSummaries.some((summary) => summary.startsWith("pwd && ls -la")),
+    false,
+    "terse direct project improvement should avoid the redundant workspace listing"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => /^node-todo\/package\.json:1-\d+$/.test(summary)),
+    "terse direct project improvement should anchor on node-todo/package.json"
+  );
+  assert.equal(
+    result.toolSummaries.some((summary) => /^aaa-workbench\/package\.json:1-\d+$/.test(summary)),
+    false,
+    "terse direct project improvement should not drift into the richer decoy project"
+  );
+}
+
 async function verifyNestedProjectMentionWinsOverRicherWorkspaceDecoy() {
   const root = await mkdtemp(join(tmpdir(), "selfme-agent-nested-project-name-listing-priority-"));
   const workspace = join(root, "workspace");
@@ -11202,6 +11895,368 @@ async function verifyNestedProjectMentionWinsOverRicherWorkspaceDecoyDuringProje
     result.toolSummaries.some((summary) => /^packages\/aaa-workbench\/package\.json:1-\d+$/.test(summary)),
     false,
     "nested project mention should not drift into the richer nested decoy project during project rewrite"
+  );
+}
+
+async function verifyDirectNestedProjectMentionWinsOverRicherWorkspaceDecoyDuringProjectImprovement() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-nested-project-name-direct-improvement-priority-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  const originalPrompt = "直接优化 packages/demo-core 项目。你自己直接搞完。";
+  await mkdir(join(workspace, "packages", "aaa-workbench"), { recursive: true });
+  await mkdir(join(workspace, "packages", "demo-core"), { recursive: true });
+
+  await writeFile(join(workspace, "packages", "aaa-workbench", "package.json"), '{\n  "name": "aaa-workbench"\n}\n', "utf8");
+  await writeFile(join(workspace, "packages", "aaa-workbench", "README.md"), '# aaa-workbench\n', "utf8");
+  await writeFile(join(workspace, "packages", "aaa-workbench", "app.js"), 'console.log("decoy");\n', "utf8");
+  await writeFile(join(workspace, "packages", "aaa-workbench", "server.js"), 'console.log("server");\n', "utf8");
+  await writeFile(join(workspace, "packages", "demo-core", "package.json"), '{\n  "name": "demo-core"\n}\n', "utf8");
+  await writeFile(join(workspace, "packages", "demo-core", "app.js"), 'const PORT = 3000;\nconsole.log(PORT);\n', "utf8");
+
+  class DirectNestedProjectNameImprovementPriorityProvider implements ProviderClient {
+    readonly name = "direct-nested-project-name-improvement-priority-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const systemContext = (input.contextMessages ?? [])
+        .filter((message) => message.role === "system")
+        .map((message) => message.content)
+        .join("\n\n");
+
+      if (input.content === originalPrompt) {
+        assert.match(systemContext, /Current task execution guidance:/);
+        assert.match(systemContext, /Preferred starting project entry: packages\/demo-core\/package\.json/);
+        assert.doesNotMatch(systemContext, /packages\/aaa-workbench\/package\.json/);
+        yield {
+          delta: toolCall("files", {
+            path: "packages/demo-core/package.json",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (/^Original user request: 直接优化 packages\/demo-core 项目。你自己直接搞完。(?:\n|$)/.test(input.content)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /packages\/demo-core\/package\.json/.test(summary)) {
+          assert.match(input.content, /Likely working file: packages\/demo-core\/app\.js/);
+          yield {
+            delta: toolCall("files", {
+              path: "packages/demo-core/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /packages\/demo-core\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "packages/demo-core/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'const PORT = Number(process.env.PORT || 3000);\nconsole.log(PORT);\n'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /packages\/demo-core\/app\.js/.test(summary)) {
+          yield { delta: "我已经直接把 packages/demo-core/app.js 的端口配置改成了 process.env.PORT。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new DirectNestedProjectNameImprovementPriorityProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: originalPrompt
+  });
+
+  const appContent = await readFile(join(workspace, "packages", "demo-core", "app.js"), "utf8");
+  assert.match(appContent, /process\.env\.PORT/);
+  assert.equal(
+    result.toolSummaries.some((summary) => summary.startsWith("pwd && ls -la")),
+    false,
+    "direct explicit nested project improvement should avoid the redundant workspace listing even when a richer decoy project exists"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => /^packages\/demo-core\/package\.json:1-\d+$/.test(summary)),
+    "direct explicit nested project improvement should anchor on packages/demo-core/package.json even when a richer decoy project exists"
+  );
+  assert.equal(
+    result.toolSummaries.some((summary) => /^packages\/aaa-workbench\/package\.json:1-\d+$/.test(summary)),
+    false,
+    "direct explicit nested project improvement should not drift into the richer nested decoy project"
+  );
+}
+
+async function verifyDirectNestedProjectMentionWinsOverRicherWorkspaceDecoyDuringProjectRewrite() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-nested-project-name-direct-rewrite-priority-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  const originalPrompt = "直接重写 packages/demo-core 项目。你自己直接搞完。";
+  await mkdir(join(workspace, "packages", "aaa-workbench"), { recursive: true });
+  await mkdir(join(workspace, "packages", "demo-core"), { recursive: true });
+
+  await writeFile(join(workspace, "packages", "aaa-workbench", "package.json"), '{\n  "name": "aaa-workbench"\n}\n', "utf8");
+  await writeFile(join(workspace, "packages", "aaa-workbench", "README.md"), '# aaa-workbench\n', "utf8");
+  await writeFile(join(workspace, "packages", "aaa-workbench", "app.js"), 'console.log("decoy");\n', "utf8");
+  await writeFile(join(workspace, "packages", "aaa-workbench", "server.js"), 'console.log("server");\n', "utf8");
+  await writeFile(join(workspace, "packages", "demo-core", "package.json"), '{\n  "name": "demo-core"\n}\n', "utf8");
+  await writeFile(join(workspace, "packages", "demo-core", "app.js"), 'const PORT = 3000;\nconsole.log(PORT);\n', "utf8");
+
+  class DirectNestedProjectNameRewritePriorityProvider implements ProviderClient {
+    readonly name = "direct-nested-project-name-rewrite-priority-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const systemContext = (input.contextMessages ?? [])
+        .filter((message) => message.role === "system")
+        .map((message) => message.content)
+        .join("\n\n");
+
+      if (input.content === originalPrompt) {
+        assert.match(systemContext, /Current task execution guidance:/);
+        assert.match(systemContext, /Preferred starting project entry: packages\/demo-core\/package\.json/);
+        assert.doesNotMatch(systemContext, /packages\/aaa-workbench\/package\.json/);
+        yield {
+          delta: toolCall("files", {
+            path: "packages/demo-core/package.json",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (/^Original user request: 直接重写 packages\/demo-core 项目。你自己直接搞完。(?:\n|$)/.test(input.content)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /packages\/demo-core\/package\.json/.test(summary)) {
+          assert.match(input.content, /Likely working file: packages\/demo-core\/app\.js/);
+          yield {
+            delta: toolCall("files", {
+              path: "packages/demo-core/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /packages\/demo-core\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "packages/demo-core/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'const PORT = Number(process.env.PORT || 3000);\nconsole.log(PORT);\n'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /packages\/demo-core\/app\.js/.test(summary)) {
+          yield { delta: "我已经把这轮重写稳定落在 packages/demo-core/app.js，而不是被其他 nested project 带偏。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new DirectNestedProjectNameRewritePriorityProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: originalPrompt
+  });
+
+  const appContent = await readFile(join(workspace, "packages", "demo-core", "app.js"), "utf8");
+  assert.match(appContent, /process\.env\.PORT/);
+  assert.equal(
+    result.toolSummaries.some((summary) => summary.startsWith("pwd && ls -la")),
+    false,
+    "direct explicit nested project rewrite should avoid the redundant workspace listing even when a richer decoy project exists"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => /^packages\/demo-core\/package\.json:1-\d+$/.test(summary)),
+    "direct explicit nested project rewrite should anchor on packages/demo-core/package.json even when a richer decoy project exists"
+  );
+  assert.equal(
+    result.toolSummaries.some((summary) => /^packages\/aaa-workbench\/package\.json:1-\d+$/.test(summary)),
+    false,
+    "direct explicit nested project rewrite should not drift into the richer nested decoy project"
+  );
+}
+
+async function verifyTerseDirectNestedProjectMentionWinsOverRicherWorkspaceDecoyDuringProjectRewrite() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-nested-project-name-terse-direct-rewrite-priority-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  const originalPrompt = "直接重写 packages/demo-core。你自己直接搞完。";
+  await mkdir(join(workspace, "packages", "aaa-workbench"), { recursive: true });
+  await mkdir(join(workspace, "packages", "demo-core"), { recursive: true });
+
+  await writeFile(join(workspace, "packages", "aaa-workbench", "package.json"), '{\n  "name": "aaa-workbench"\n}\n', "utf8");
+  await writeFile(join(workspace, "packages", "aaa-workbench", "README.md"), '# aaa-workbench\n', "utf8");
+  await writeFile(join(workspace, "packages", "aaa-workbench", "app.js"), 'console.log("decoy");\n', "utf8");
+  await writeFile(join(workspace, "packages", "demo-core", "package.json"), '{\n  "name": "demo-core"\n}\n', "utf8");
+  await writeFile(join(workspace, "packages", "demo-core", "app.js"), 'const PORT = 3000;\nconsole.log(PORT);\n', "utf8");
+
+  class TerseDirectNestedProjectRewriteProvider implements ProviderClient {
+    readonly name = "terse-direct-nested-project-rewrite-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const systemContext = (input.contextMessages ?? [])
+        .filter((message) => message.role === "system")
+        .map((message) => message.content)
+        .join("\n\n");
+
+      if (input.content === originalPrompt) {
+        assert.match(systemContext, /Current task execution guidance:/);
+        assert.match(systemContext, /Preferred starting project entry: packages\/demo-core\/package\.json/);
+        assert.doesNotMatch(systemContext, /packages\/aaa-workbench\/package\.json/);
+        yield {
+          delta: toolCall("files", {
+            path: "packages/demo-core/package.json",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (/^Original user request: 直接重写 packages\/demo-core。你自己直接搞完。(?:\n|$)/.test(input.content)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /packages\/demo-core\/package\.json/.test(summary)) {
+          assert.match(input.content, /Likely working file: packages\/demo-core\/app\.js/);
+          yield {
+            delta: toolCall("files", {
+              path: "packages/demo-core/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /packages\/demo-core\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "packages/demo-core/app.js",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'const PORT = Number(process.env.PORT || 3000);\nconsole.log(PORT);\n'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /packages\/demo-core\/app\.js/.test(summary)) {
+          yield { delta: "我已经把这轮重写稳定落在 packages/demo-core/app.js，而不是被其他 nested project 带偏。" };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new TerseDirectNestedProjectRewriteProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: originalPrompt
+  });
+
+  const appContent = await readFile(join(workspace, "packages", "demo-core", "app.js"), "utf8");
+  assert.match(appContent, /process\.env\.PORT/);
+  assert.equal(
+    result.toolSummaries.some((summary) => summary.startsWith("pwd && ls -la")),
+    false,
+    "terse direct nested project rewrite should avoid the redundant workspace listing"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => /^packages\/demo-core\/package\.json:1-\d+$/.test(summary)),
+    "terse direct nested project rewrite should anchor on packages/demo-core/package.json"
+  );
+  assert.equal(
+    result.toolSummaries.some((summary) => /^packages\/aaa-workbench\/package\.json:1-\d+$/.test(summary)),
+    false,
+    "terse direct nested project rewrite should not drift into the richer nested decoy project"
   );
 }
 
@@ -30234,6 +31289,245 @@ async function verifyProjectStageSummaryResume(
   );
 }
 
+async function verifyProjectCommandStageSummaryResume() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-project-command-stage-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(workspace, { recursive: true });
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "package.json"),
+    '{\n  "name": "node-todo",\n  "version": "1.0.0",\n  "scripts": {\n    "start": "node app.js"\n  }\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const express = require("express");\nconst app = express();\nconst PORT = 3000;\napp.listen(PORT, () => {\n  console.log(`Todo app is running at http://localhost:${PORT}`);\n});\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "verify-setup.mjs"),
+    [
+      'import { readFileSync } from "node:fs";',
+      'const app = readFileSync(new URL("./app.js", import.meta.url), "utf8");',
+      'console.log(/process\\.env\\.PORT/.test(app) ? "ready" : "pending");'
+    ].join("\n") + "\n",
+    "utf8"
+  );
+
+  class ResumeProjectCommandStageProvider implements ProviderClient {
+    readonly name = "resume-project-command-stage-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "看看项目，然后直接优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，并运行 `node node-todo/verify-setup.mjs` 验证，直到输出 exactly `ready`。";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "pwd && ls -la && find . -maxdepth 2 -type f | sed 's#^./##' | sort | head -200"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell") {
+          if (/You are in the middle of a concrete project inspection request\./.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/package.json",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+
+          assert.match(input.content, /ready/);
+          yield { delta: "Completed the node-todo command-stage resume chain and verified the final output is ready." };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 3,
+              endLine: 3,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          if (
+            /You are already inside the execution phase of a concrete task\./.test(input.content)
+            || /You are still inside the same multi-step task\./.test(input.content)
+          ) {
+            yield {
+              delta: toolCall("shell", {
+                command: "node node-todo/verify-setup.mjs"
+              })
+            };
+            return;
+          }
+
+          yield {
+            delta: "I updated node-todo/app.js and will rerun node node-todo/verify-setup.mjs next."
+          };
+          return;
+        }
+      }
+
+      if (input.content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+        assert.match(input.content, /Original task: 看看项目，然后直接优化 node-todo/);
+        assert.match(input.content, /Pending next step target: node node-todo\/verify-setup\.mjs/);
+        assert.match(input.content, /Latest tool in context: edit/);
+        assert.match(input.content, /Latest tool summary in context: node-todo\/app\.js:3-3 · updated/);
+        yield {
+          delta: toolCall("shell", {
+            command: "node node-todo/verify-setup.mjs"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+
+        if (toolName === "shell") {
+          assert.match(input.content, /ready/);
+          yield { delta: "Completed the node-todo command-stage resume chain and verified the final output is ready." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new ResumeProjectCommandStageProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  let approvalCount = 0;
+  bus.on("approval.requested", (event) => {
+    approvalCount += 1;
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const originalPrompt = "看看项目，然后直接优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，并运行 `node node-todo/verify-setup.mjs` 验证，直到输出 exactly `ready`。";
+  const completionPromise = waitForAssistantTaskCompletion(bus, session.sessionId);
+  const stageSummaryPromise = waitForAssistantDeltaContaining(
+    bus,
+    session.sessionId,
+    /I updated node-todo\/app\.js and will rerun node node-todo\/verify-setup\.mjs next\./
+  );
+
+  bus.emit(createUserMessageSubmittedEvent({
+    sessionId: session.sessionId,
+    content: originalPrompt
+  }));
+
+  await stageSummaryPromise;
+  await waitForBusyPhase(bus, session.sessionId, "assistant");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  bus.emit(createRuntimeInterruptRequestedEvent({
+    sessionId: session.sessionId,
+    reason: "cancel"
+  }));
+
+  const cancelledTask = await completionPromise;
+  assert.equal(cancelledTask.payload.state, "cancelled");
+
+  const interruptedEvents = await transcriptStore.readEventsBySession(session.sessionId);
+  assert.ok(
+    interruptedEvents.some((event) =>
+      event.type === "tool.execution.completed" && event.payload.summary.startsWith("node-todo/app.js:3-3 · updated")
+    ),
+    "interrupted command-stage task should preserve the app.js edit before stop"
+  );
+  assert.ok(
+    interruptedEvents.some((event) =>
+      event.type === "assistant.delta.received"
+      && /I updated node-todo\/app\.js and will rerun node node-todo\/verify-setup\.mjs next\./.test(event.payload.delta)
+    ),
+    "interrupted command-stage task should preserve the command-only stage summary before stop"
+  );
+  assert.equal(
+    interruptedEvents.some((event) =>
+      event.type === "tool.execution.completed" && event.payload.summary.startsWith("node node-todo/verify-setup.mjs · completed")
+    ),
+    false,
+    "interrupted command-stage task should stop before rerunning the verification command"
+  );
+
+  const resumedResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "还能继续吗"
+  });
+
+  assert.match(resumedResult.assistantText, /ready|command-stage resume/i);
+  assert.doesNotMatch(resumedResult.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/package.json:1-")),
+    false,
+    "command-stage resume should not restart from package.json"
+  );
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node-todo/app.js:1-")),
+    false,
+    "command-stage resume should not reread app.js after the pending verification command is already known"
+  );
+  assert.equal(
+    resumedResult.toolSummaries.filter((summary) => summary.startsWith("node node-todo/verify-setup.mjs · completed")).length,
+    1,
+    "command-stage resume should rerun the pending verification command exactly once"
+  );
+  assert.equal(
+    approvalCount,
+    1,
+    "expected only the original app.js edit approval before the resumed command-only verification"
+  );
+}
+
 async function verifyResumeFollowUpInImplicitProjectStageSummaryChain() {
   await verifyImplicitProjectStageSummaryResume("还能继续吗");
 }
@@ -38045,6 +39339,73 @@ function verifyContextCompactionCarriesHiddenPendingNextStepCheckpointThroughRes
   assert.match(recentTaskStateMessage, /Pending next step: I updated node-todo\/app\.js and will continue with node-todo\/views\/index\.ejs next\./);
 }
 
+function verifyContextCompactionPreservesHiddenCommandPendingNextStepCheckpoint() {
+  const sessionId = "compaction-hidden-command-pending-next-step-session";
+  const events: RuntimeEvent[] = [];
+
+  events.push(createUserMessageSubmittedEvent({
+    sessionId,
+    content: "Update node-todo/package.json and run `npm test` before finishing."
+  }));
+  events.push(createToolExecutionCompletedEvent({
+    sessionId,
+    taskId: "hidden-command-pending-next-tool-1",
+    toolName: "edit",
+    summary: "node-todo/package.json:4-4 · updated (7 -> 8 lines)"
+  }));
+  events.push(createAssistantCheckpointRecordedEvent({
+    sessionId,
+    taskId: "hidden-command-pending-next-turn",
+    kind: "pending_next_step",
+    content: "I updated node-todo/package.json and will run npm test next.",
+    targetPath: "npm test"
+  }));
+
+  const messages = buildContextMessages(events);
+  const recentTaskStateMessage = messages.find((message) => message.role === "system" && message.content.includes("Recent task state:"))?.content ?? "";
+
+  assert.match(recentTaskStateMessage, /Current request: Update node-todo\/package\.json and run `npm test` before finishing\./);
+  assert.match(recentTaskStateMessage, /Target verification: npm test/);
+  assert.match(recentTaskStateMessage, /Working files: node-todo\/package\.json/);
+  assert.match(recentTaskStateMessage, /Pending next step: I updated node-todo\/package\.json and will run npm test next\./);
+}
+
+function verifyContextCompactionCarriesHiddenCommandPendingNextStepCheckpointThroughResumeFollowUp() {
+  const sessionId = "compaction-resume-hidden-command-pending-next-step-session";
+  const events: RuntimeEvent[] = [];
+
+  events.push(createUserMessageSubmittedEvent({
+    sessionId,
+    content: "Update node-todo/package.json and run `npm test` before finishing."
+  }));
+  events.push(createToolExecutionCompletedEvent({
+    sessionId,
+    taskId: "resume-hidden-command-pending-next-tool-1",
+    toolName: "edit",
+    summary: "node-todo/package.json:4-4 · updated (7 -> 8 lines)"
+  }));
+  events.push(createAssistantCheckpointRecordedEvent({
+    sessionId,
+    taskId: "resume-hidden-command-pending-next-turn",
+    kind: "pending_next_step",
+    content: "I updated node-todo/package.json and will run npm test next.",
+    targetPath: "npm test"
+  }));
+  events.push(createUserMessageSubmittedEvent({
+    sessionId,
+    content: "继续"
+  }));
+
+  const messages = buildContextMessages(events);
+  const recentTaskStateMessage = messages.find((message) => message.role === "system" && message.content.includes("Recent task state:"))?.content ?? "";
+
+  assert.match(recentTaskStateMessage, /Current request: 继续/);
+  assert.match(recentTaskStateMessage, /Underlying task: Update node-todo\/package\.json and run `npm test` before finishing\./);
+  assert.match(recentTaskStateMessage, /Target verification: npm test/);
+  assert.match(recentTaskStateMessage, /Working files: node-todo\/package\.json/);
+  assert.match(recentTaskStateMessage, /Pending next step: I updated node-todo\/package\.json and will run npm test next\./);
+}
+
 function verifyContextCompactionPreservesNestedProjectPendingNextStep() {
   const sessionId = "compaction-nested-pending-next-step-session";
   const events: RuntimeEvent[] = [];
@@ -38326,7 +39687,12 @@ function verifyContextCompactionClipsLongRecentTurns() {
   assert.doesNotMatch(clippedAssistant, /A{1500}/);
 }
 
-function resolveProviderResponse(content: string) {
+function resolveProviderResponse(content: string, contextMessages: ProviderStreamInput["contextMessages"] = []) {
+  const systemContext = contextMessages
+    .filter((message) => message.role === "system")
+    .map((message) => message.content)
+    .join("\n\n");
+
   if (content.startsWith('Fix greet.mjs so it prints "Hello, SelfMe!"')) {
     return toolCall("files", {
       path: "greet.mjs",
@@ -38408,6 +39774,66 @@ function resolveProviderResponse(content: string) {
   if (content.startsWith("Optimize node-todo by updating node-todo/app.js to use process.env.PORT and updating node-todo/views/index.ejs so the title input has maxlength 100. Do the changes directly, and do not stop after only one file.")) {
     return toolCall("files", {
       path: "node-todo/app.js",
+      startLine: 1,
+      endLine: 20
+    });
+  }
+
+  if (content === "看看 node-todo 项目，然后直接看核心实现。") {
+    assert.match(systemContext, /Current task execution guidance:/);
+    assert.match(systemContext, /Preferred starting project entry: node-todo\/package\.json/);
+    return toolCall("files", {
+      path: "node-todo/package.json",
+      startLine: 1,
+      endLine: 20
+    });
+  }
+
+  if (content === "直接看看 node-todo/app.js，然后把端口改成 process.env.PORT。") {
+    assert.match(systemContext, /Current task execution guidance:/);
+    assert.match(systemContext, /Preferred starting file target: node-todo\/app\.js/);
+    return toolCall("files", {
+      path: "node-todo/app.js",
+      startLine: 1,
+      endLine: 20
+    });
+  }
+
+  if (content === "直接优化 node-todo 项目：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100。") {
+    assert.match(systemContext, /Current task execution guidance:/);
+    assert.match(systemContext, /Preferred starting file target: node-todo\/app\.js/);
+    return toolCall("files", {
+      path: "node-todo/app.js",
+      startLine: 1,
+      endLine: 20
+    });
+  }
+
+  if (content === "直接重写 node-todo 项目：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100。") {
+    assert.match(systemContext, /Current task execution guidance:/);
+    assert.match(systemContext, /Preferred starting file target: node-todo\/app\.js/);
+    return toolCall("files", {
+      path: "node-todo/app.js",
+      startLine: 1,
+      endLine: 20
+    });
+  }
+
+  if (content === "直接优化 node-todo 项目。你自己直接搞完。") {
+    assert.match(systemContext, /Current task execution guidance:/);
+    assert.match(systemContext, /Preferred starting project entry: node-todo\/package\.json/);
+    return toolCall("files", {
+      path: "node-todo/package.json",
+      startLine: 1,
+      endLine: 20
+    });
+  }
+
+  if (content === "直接重写 node-todo 项目。你自己直接搞完。") {
+    assert.match(systemContext, /Current task execution guidance:/);
+    assert.match(systemContext, /Preferred starting project entry: node-todo\/package\.json/);
+    return toolCall("files", {
+      path: "node-todo/package.json",
       startLine: 1,
       endLine: 20
     });
@@ -39400,6 +40826,130 @@ function resolveProviderResponse(content: string) {
     }
   }
 
+  if (content.startsWith("Original user request: 直接优化 node-todo 项目：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100。")) {
+    const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
+    const summary = extractLine(content, "Summary:") ?? extractLine(content, "Latest summary:") ?? "";
+
+    if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+      return toolCall("edit", {
+        path: "node-todo/app.js",
+        startLine: 3,
+        endLine: 3,
+        replacement: "const PORT = Number(process.env.PORT || 3000);"
+      });
+    }
+
+    if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+      return toolCall("files", {
+        path: "node-todo/views/index.ejs",
+        startLine: 1,
+        endLine: 4
+      });
+    }
+
+    if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+      return toolCall("edit", {
+        path: "node-todo/views/index.ejs",
+        startLine: 3,
+        endLine: 3,
+        replacement: '  <input name="title" maxlength="100" />'
+      });
+    }
+
+    if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+      return "我已经完成这轮直接项目优化：node-todo/app.js 改成了 process.env.PORT，node-todo/views/index.ejs 的 title input 也加上了 maxlength 100。";
+    }
+  }
+
+  if (content.startsWith("Original user request: 直接重写 node-todo 项目：把 node-todo/app.js 的端口改成 process.env.PORT，再给 node-todo/views/index.ejs 的 title input 加上 maxlength 100。")) {
+    const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
+    const summary = extractLine(content, "Summary:") ?? extractLine(content, "Latest summary:") ?? "";
+
+    if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+      return toolCall("edit", {
+        path: "node-todo/app.js",
+        startLine: 3,
+        endLine: 3,
+        replacement: "const PORT = Number(process.env.PORT || 3000);"
+      });
+    }
+
+    if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+      return toolCall("files", {
+        path: "node-todo/views/index.ejs",
+        startLine: 1,
+        endLine: 4
+      });
+    }
+
+    if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+      return toolCall("edit", {
+        path: "node-todo/views/index.ejs",
+        startLine: 3,
+        endLine: 3,
+        replacement: '  <input name="title" maxlength="100" />'
+      });
+    }
+
+    if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+      return "我已经完成这轮直接项目重写：node-todo/app.js 改成了 process.env.PORT，node-todo/views/index.ejs 的 title input 也加上了 maxlength 100。";
+    }
+  }
+
+  if (content.startsWith("Original user request: 直接优化 node-todo 项目。你自己直接搞完。")) {
+    const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
+    const summary = extractLine(content, "Summary:") ?? extractLine(content, "Latest summary:") ?? "";
+
+    if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+      assert.match(content, /Likely working file: node-todo\/app\.js/);
+      return toolCall("files", {
+        path: "node-todo/app.js",
+        startLine: 1,
+        endLine: 20
+      });
+    }
+
+    if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+      return toolCall("edit", {
+        path: "node-todo/app.js",
+        startLine: 3,
+        endLine: 3,
+        replacement: "const PORT = Number(process.env.PORT || 3000);"
+      });
+    }
+
+    if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+      return "我已经直接优化了 node-todo/app.js，现在端口配置改成了 process.env.PORT。";
+    }
+  }
+
+  if (content.startsWith("Original user request: 直接重写 node-todo 项目。你自己直接搞完。")) {
+    const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
+    const summary = extractLine(content, "Summary:") ?? extractLine(content, "Latest summary:") ?? "";
+
+    if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+      assert.match(content, /Likely working file: node-todo\/app\.js/);
+      return toolCall("files", {
+        path: "node-todo/app.js",
+        startLine: 1,
+        endLine: 20
+      });
+    }
+
+    if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+      return toolCall("edit", {
+        path: "node-todo/app.js",
+        startLine: 3,
+        endLine: 3,
+        replacement: "const PORT = Number(process.env.PORT || 3000);"
+      });
+    }
+
+    if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+      return "我已经直接重写了 node-todo/app.js，现在端口配置改成了 process.env.PORT。";
+    }
+  }
+
   if (/^Original user request: The user replied ".+" to approve the immediately previous proposal\./.test(content)) {
     const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
     const summary = extractLine(content, "Summary:") ?? extractLine(content, "Latest summary:") ?? "";
@@ -40389,6 +41939,41 @@ function resolveProviderResponse(content: string) {
 
     if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
       return "我先看了工作区列表，然后继续读了 node-todo/package.json 和 node-todo/app.js；当前最像可继续分析的项目是 node-todo，这个项目的核心入口实现目前在 app.js。";
+    }
+  }
+
+  if (/^Original user request: 看看 node-todo 项目，然后直接看核心实现。(?:\n|$)/.test(content)) {
+    const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
+    const summary = extractLine(content, "Summary:") ?? extractLine(content, "Latest summary:") ?? "";
+
+    if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+      return toolCall("files", {
+        path: "node-todo/app.js",
+        startLine: 1,
+        endLine: 20
+      });
+    }
+
+    if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+      return "I inspected node-todo/package.json and node-todo/app.js directly.";
+    }
+  }
+
+  if (/^Original user request: 直接看看 node-todo\/app\.js，然后把端口改成 process\.env\.PORT。(?:\n|$)/.test(content)) {
+    const toolName = extractLine(content, "Tool:") ?? extractLine(content, "Latest tool:");
+    const summary = extractLine(content, "Summary:") ?? extractLine(content, "Latest summary:") ?? "";
+
+    if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+      return toolCall("edit", {
+        path: "node-todo/app.js",
+        startLine: 3,
+        endLine: 3,
+        replacement: "const PORT = process.env.PORT || 3000;"
+      });
+    }
+
+    if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+      return "Updated node-todo/app.js to use process.env.PORT.";
     }
   }
 

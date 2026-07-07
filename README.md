@@ -246,7 +246,7 @@ src/
 
 ## Current Checkpoint
 
-As of `2026-07-02`, the npm package name has been finalized as `selfme`, and the install path is:
+As of `2026-07-07`, the npm package name has been finalized as `selfme`, and the install path is:
 
 ```bash
 npm i -g selfme
@@ -257,8 +257,10 @@ The current development checkpoint is:
 - npm CLI packaging is in place and published under `selfme`
 - terminal UX baseline is established enough to keep runtime work moving
 - `pnpm smoke:agent` is green on the current continuation / resume / multi-step baseline
+- when the very first user turn already names a concrete project root like `node-todo` or a concrete file like `node-todo/app.js`, runtime now injects a preferred starting target so the task can begin from that entry directly instead of spending the first slice on a redundant workspace listing
 - ordinary tool execution failures now stay on the unified failed-tool event path, so missing-file / edit-range failures keep usable task history instead of falling into ad hoc runtime-error-only branches
 - when a task hits either the tool-step ceiling before the next `files` / `edit` / `write` action executes, including the common case where the agent already read the target file and gets cut off just before the real `edit`, the assistant-pass ceiling while a concrete next file is already implied by the continuation prompt, a repeated assistant/tool stall after the task has already narrowed to a concrete next file, or a repeated malformed/unknown/invalid tool-call loop either after narrowing from a real tool result or even before the first real tool executes, runtime now records that pending target so a later `继续` can resume from the blocked step instead of restarting broad exploration
+- that pending-step recovery now also preserves command-shaped checkpoints such as `npm test` or `node verify.mjs`, so a resumed task can rerun the exact pending verification command instead of reopening broader project files first
 - the active work is still runtime hardening, not feature expansion
 
 The next runtime questions remain:

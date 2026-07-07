@@ -1592,11 +1592,18 @@ export class AgentRuntime {
     this.input.bus.emit(startedEvent);
 
     const historyEvents = await this.input.transcriptStore.readEventsBySession(input.sessionId);
+    const currentTaskExecutionGuidance = buildCurrentTaskExecutionGuidance(input.content);
     const contextMessages = [
       {
         role: "system" as const,
         content: buildAgentSystemPrompt(this.input.tools.list(), input.preferredLanguage)
       },
+      ...(currentTaskExecutionGuidance
+        ? [{
+          role: "system" as const,
+          content: currentTaskExecutionGuidance
+        }]
+        : []),
       ...buildContextMessages(historyEvents)
     ];
 
@@ -5499,6 +5506,61 @@ function buildApprovedProposalPrompt(input: {
   ].join("\n");
 }
 
+function buildCurrentTaskExecutionGuidance(originalRequest: string) {
+  if (
+    !looksLikeActionableTaskRequest(originalRequest)
+    || originalRequest.startsWith("Original user request:")
+    || isSyntheticFollowUpRequest(originalRequest)
+  ) {
+    return undefined;
+  }
+
+  const taskContent = extractEmbeddedTaskContent(originalRequest);
+
+  if (looksLikeDiscussionRequest(taskContent) || looksLikeNextStepProposalRequest(taskContent)) {
+    return undefined;
+  }
+
+  const firstExplicitMutationTarget = extractExplicitRequestedMutationTargets(taskContent)[0];
+  const firstExplicitFileTarget = extractExplicitFileTargets(taskContent)[0];
+  const preferredStartingFile = firstExplicitMutationTarget ?? firstExplicitFileTarget;
+
+  if (preferredStartingFile) {
+    return [
+      "Current task execution guidance:",
+      "The request already names a concrete file target.",
+      `Preferred starting file target: ${preferredStartingFile}`,
+      "Do not start with a workspace-wide listing or unrelated project scan before reading or editing that target, unless the path is ambiguous or missing."
+    ].join("\n");
+  }
+
+  if (
+    !looksLikeProjectInspectionRequest(taskContent)
+    && !looksLikeBroadProjectImprovementRequest(taskContent)
+    && !looksLikeExecutableProjectRewriteRequest(taskContent)
+  ) {
+    return undefined;
+  }
+
+  const preferredProjectRoot = [...extractMentionedProjectRoots(taskContent)]
+    .sort((left, right) => right.length - left.length)[0];
+
+  if (!preferredProjectRoot) {
+    return undefined;
+  }
+
+  const normalizedProjectRoot = normalizePromptPath(preferredProjectRoot);
+  const preferredProjectEntry = `${normalizedProjectRoot}/package.json`;
+
+  return [
+    "Current task execution guidance:",
+    "The request already names a concrete project target.",
+    `Preferred starting project entry: ${preferredProjectEntry}`,
+    "Do not start with a workspace-wide listing or unrelated project scan before reading that project entry, unless the path is ambiguous or missing.",
+    "If that entry is only a thin manifest, continue into the likely implementation file instead of stopping there."
+  ].join("\n");
+}
+
 function buildApprovedRewriteProposalPrompt(input: {
   content: string;
   approvedProposal: string;
@@ -7075,6 +7137,10 @@ function looksLikeActionableTaskRequest(content: string) {
     return true;
   }
 
+  if (looksLikeProjectInspectionRequest(taskContent)) {
+    return true;
+  }
+
   if (hasMutationIntent(taskContent)) {
     return true;
   }
@@ -7231,11 +7297,20 @@ function looksLikeDiscussionRequest(content: string) {
 
 function looksLikeProjectInspectionRequest(content: string) {
   const taskContent = extractEmbeddedTaskContent(content);
+  const hasNamedProjectRootWithoutExplicitFile = extractExplicitFileTargets(taskContent).length === 0
+    && extractMentionedProjectRoots(taskContent).size > 0;
 
   return looksLikeWholeProjectInspectionRequest(taskContent)
     || /\b(look at|inspect|review|check|explore)\s+(the\s+)?(project|repo|repository|codebase)\b/i.test(taskContent)
     || /(看看|检查|看下|瞅瞅).*(项目|仓库|代码)/u.test(taskContent)
-    || /(项目|仓库|代码).*(看看|检查|看下|瞅瞅)/u.test(taskContent);
+    || /(项目|仓库|代码).*(看看|检查|看下|瞅瞅)/u.test(taskContent)
+    || (
+      hasNamedProjectRootWithoutExplicitFile
+      && (
+        /\b(look at|inspect|review|check|explore|scan|analyze)\b/i.test(taskContent)
+        || /(看看|检查|看下|瞅瞅|扫一遍|过一遍|分析)/u.test(taskContent)
+      )
+    );
 }
 
 function looksLikeWholeProjectInspectionRequest(content: string) {
@@ -7258,9 +7333,13 @@ function looksLikeBroadProjectImprovementRequest(content: string) {
     return false;
   }
 
+  const hasNamedProjectRootWithoutExplicitFile = extractExplicitFileTargets(taskContent).length === 0
+    && extractMentionedProjectRoots(taskContent).size > 0;
+
   return looksLikeProjectInspectionRequest(taskContent)
     || /\b(project|repo|repository|codebase)\b/i.test(taskContent)
-    || /(项目|仓库|代码)/u.test(taskContent);
+    || /(项目|仓库|代码)/u.test(taskContent)
+    || hasNamedProjectRootWithoutExplicitFile;
 }
 
 function looksLikeProjectRewriteRequest(content: string) {
@@ -7272,8 +7351,12 @@ function looksLikeProjectRewriteRequest(content: string) {
     return false;
   }
 
+  const hasNamedProjectRootWithoutExplicitFile = extractExplicitFileTargets(taskContent).length === 0
+    && extractMentionedProjectRoots(taskContent).size > 0;
+
   return /\b(project|repo|repository|codebase)\b/i.test(taskContent)
-    || /(项目|仓库|代码)/u.test(taskContent);
+    || /(项目|仓库|代码)/u.test(taskContent)
+    || hasNamedProjectRootWithoutExplicitFile;
 }
 
 function looksLikeExecutableProjectRewriteRequest(content: string) {
@@ -7601,11 +7684,27 @@ function extractLikelyNextTargetPathFromAssistantMessage(content: string) {
 
   const targets = extractExplicitFileTargets(content);
 
-  if (targets.length === 0) {
-    return undefined;
+  if (targets.length > 0) {
+    return targets.at(-1);
   }
 
-  return targets.at(-1);
+  const commandTargets = extractExplicitCommandTargets(content);
+  return commandTargets.at(-1);
+}
+
+function extractExplicitCommandTargets(content: string) {
+  const backtickValues = [...content.matchAll(/`([^`]+)`/g)]
+    .map((match) => match[1]?.trim())
+    .filter((value): value is string => Boolean(value))
+    .filter((value) => looksLikeExecutableCommandAnchor(value));
+  const inlineCommands = matchAllGroups(
+    content,
+    /\b((?:node|pnpm|npm|yarn|bun|deno|python|python3|pytest|cargo|go|make|sh|bash|tsx)(?:\s+[A-Za-z0-9_./:@=+-]+)+)\b/gi
+  )
+    .map((value) => value.trim().replace(/\s+/g, " "))
+    .filter((value) => looksLikeExecutableCommandAnchor(value));
+
+  return dedupePromptLines([...backtickValues, ...inlineCommands]);
 }
 
 function resolvePendingNextStepTargetFromAssistantStage(input: {
@@ -7621,6 +7720,10 @@ function resolvePendingNextStepTargetFromAssistantStage(input: {
 
   if (!explicitTarget) {
     return undefined;
+  }
+
+  if (looksLikeExecutableCommandAnchor(explicitTarget)) {
+    return explicitTarget.trim().replace(/\s+/g, " ");
   }
 
   const inferredTarget = inferPendingNextStepTargetFromRecentToolContext({

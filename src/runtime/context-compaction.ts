@@ -482,7 +482,12 @@ function buildRecentTaskState(
     requestedPaths,
     false
   )).slice(0, 4);
-  const pendingAssistantStep = extractPendingAssistantCheckpoint(rawEvents, requestedPaths, latestUserRequest)
+  const pendingAssistantStep = extractPendingAssistantCheckpoint(
+    rawEvents,
+    requestedPaths,
+    latestUserRequest,
+    requestedVerificationCommand
+  )
     ?? extractPendingAssistantStep(taskStateEntries, requestedPaths);
   const lastRepairSummary = buildRecentRepairSummary(taskStateEntries, requestedPaths, requestedVerificationCommand)
     .map((line) => line.replace(/^- /, ""))
@@ -621,7 +626,8 @@ function extractPendingAssistantStep(entries: SessionTimelineEntry[], requestedP
 function extractPendingAssistantCheckpoint(
   events: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>,
   requestedPaths: string[] = [],
-  latestUserRequest?: string
+  latestUserRequest?: string,
+  requestedVerificationCommand?: string
 ) {
   const taskAnchorUserEventIndex = resolveTaskAnchorUserEventIndex(events, latestUserRequest);
   const relevantEvents = taskAnchorUserEventIndex >= 0 ? events.slice(taskAnchorUserEventIndex + 1) : events;
@@ -636,6 +642,10 @@ function extractPendingAssistantCheckpoint(
     if (
       requestedPaths.length > 0
       && event.payload.targetPath
+      && (
+        !requestedVerificationCommand
+        || normalizePreviewText(event.payload.targetPath) !== normalizePreviewText(requestedVerificationCommand)
+      )
       && !requestedPaths.includes(event.payload.targetPath)
     ) {
       continue;

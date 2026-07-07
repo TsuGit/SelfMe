@@ -197,7 +197,7 @@
         </div>
         <div class="rule">
           <strong>当前状态说明：</strong>
-          仓库已经具备可运行的 CLI、真实工具调用、审批链路和一批 runtime 回归；stage summary / progress-only reply 之后的 continuation、resume 和多步骤执行基线已经进入回归保护，<code>pnpm smoke:agent</code> 当前是全绿状态。接下来的重点不再是补 smoke 闭环本身，而是把这套收敛能力继续压实到真实交互场景里。
+          仓库已经具备可运行的 CLI、真实工具调用、审批链路和一批 runtime 回归；stage summary / progress-only reply 之后的 continuation、resume 和多步骤执行基线已经进入回归保护，显式点名项目根或文件的首轮 direct-start 也已经进入 smoke 覆盖，<code>pnpm smoke:agent</code> 当前是全绿状态。接下来的重点不再是补 smoke 闭环本身，而是把这套收敛能力继续压实到真实交互场景里。
         </div>
       </section>
 
@@ -245,7 +245,7 @@
           </article>
           <article class="card">
             <h3>Project Inspection</h3>
-            <p>像“看看项目”这类请求，agent 现在会在目录 listing 之后优先继续读取最像项目入口的 <code>package.json</code>、<code>README</code> 或主源文件，而不是停在泛泛追问；如果用户明确要看“整个项目”而不是只看入口，runtime 也会在读完项目入口后继续下钻到核心实现文件，而且不会在第一个入口实现文件就急着收口；如果用户语义已经带有“帮我优化下”这类改造意图，读到项目入口后还会继续落到更像工作对象的实现文件，而不是停在“下一步我可以看 app.js”这种半路说明；如果同一轮请求里已经明确点了多个具体文件，runtime 也会在第一处成功改动后继续推进到下一处具体文件，而不是把“我下一步会继续改 views”这种阶段性说明误当成最终完成；如果用户先看完项目、下一句才单独说“帮我优化下”或“你能帮我重新写个项目吗”，runtime 也会优先锚到最近刚 inspected 的项目/文件上下文，而不是把它当成完全无锚点的新问题；如果前一轮 assistant 已经给出明确的项目级 rewrite proposal，后面再来一句宽泛的“重新写个项目”，runtime 也会直接执行那套跨文件 proposal，而不是缩水成单文件试探；如果前一轮 assistant 已经给出明确的项目级 optimize proposal，后面再来一句宽泛的“帮我优化下”，runtime 也会继续落回那条项目级执行上下文，而不是退回泛化建议；如果普通项目执行链本身已经跑到一半又被 stop，后续一句宽泛的“帮我优化下”或“帮我看看”，现在也会优先恢复那条中断执行链，而不是重新回到 listing、package 或泛化分析；如果这套 rewrite proposal 本身还带有 verify / exact-output 约束，后续宽 follow-up 也会继续把整条改动和验证链跑完，而不是只把 proposal 执行到 edit 阶段就停住；如果这套 rewrite proposal 已经实际执行到一半又被 stop，后续 bare `可以`、宽泛的“重新写个项目”，以及对应的 optimize / inspect follow-up，runtime 也会优先恢复那条已经开跑的执行链，而不是回到 proposal 起点重读和重改前半段；如果用户先要 rewrite 方案、后面再用一句“可以”批准，runtime 也会把这句批准绑定回刚才的项目级提议并直接开始跨文件执行，而不是重新回到只读或解释态；如果最近已经有明确的 editable working file，宽 follow-up 会优先直接回到这个文件，而不是倒退去重读更宽的项目入口；这条锚点策略现在不仅覆盖优化类 follow-up，也覆盖“帮我看看 / 看看这个”这类 inspect follow-up。</p>
+            <p>像“看看项目”这类请求，agent 现在会在目录 listing 之后优先继续读取最像项目入口的 <code>package.json</code>、<code>README</code> 或主源文件，而不是停在泛泛追问；如果用户一开始就明确点了具体项目根或具体文件，例如 <code>node-todo</code>、<code>packages/demo-core</code>、<code>node-todo/app.js</code>，runtime 也会在首轮 prompt 里显式注入 preferred starting target，尽量直接从那个项目入口或文件起跑，而不是先做一轮无价值的 workspace listing；如果用户明确要看“整个项目”而不是只看入口，runtime 也会在读完项目入口后继续下钻到核心实现文件，而且不会在第一个入口实现文件就急着收口；如果用户语义已经带有“帮我优化下”这类改造意图，读到项目入口后还会继续落到更像工作对象的实现文件，而不是停在“下一步我可以看 app.js”这种半路说明；如果同一轮请求里已经明确点了多个具体文件，runtime 也会在第一处成功改动后继续推进到下一处具体文件，而不是把“我下一步会继续改 views”这种阶段性说明误当成最终完成；如果用户先看完项目、下一句才单独说“帮我优化下”或“你能帮我重新写个项目吗”，runtime 也会优先锚到最近刚 inspected 的项目/文件上下文，而不是把它当成完全无锚点的新问题；如果前一轮 assistant 已经给出明确的项目级 rewrite proposal，后面再来一句宽泛的“重新写个项目”，runtime 也会直接执行那套跨文件 proposal，而不是缩水成单文件试探；如果前一轮 assistant 已经给出明确的项目级 optimize proposal，后面再来一句宽泛的“帮我优化下”，runtime 也会继续落回那条项目级执行上下文，而不是退回泛化建议；如果普通项目执行链本身已经跑到一半又被 stop，后续一句宽泛的“帮我优化下”或“帮我看看”，现在也会优先恢复那条中断执行链，而不是重新回到 listing、package 或泛化分析；如果这套 rewrite proposal 本身还带有 verify / exact-output 约束，后续宽 follow-up 也会继续把整条改动和验证链跑完，而不是只把 proposal 执行到 edit 阶段就停住；如果这套 rewrite proposal 已经实际执行到一半又被 stop，后续 bare `可以`、宽泛的“重新写个项目”，以及对应的 optimize / inspect follow-up，runtime 也会优先恢复那条已经开跑的执行链，而不是回到 proposal 起点重读和重改前半段；如果用户先要 rewrite 方案、后面再用一句“可以”批准，runtime 也会把这句批准绑定回刚才的项目级提议并直接开始跨文件执行，而不是重新回到只读或解释态；如果最近已经有明确的 editable working file，宽 follow-up 会优先直接回到这个文件，而不是倒退去重读更宽的项目入口；这条锚点策略现在不仅覆盖优化类 follow-up，也覆盖“帮我看看 / 看看这个”这类 inspect follow-up。</p>
           </article>
         </div>
       </section>
@@ -254,9 +254,10 @@
         <div class="tag next">Checkpoint</div>
         <h2>当前恢复锚点</h2>
         <ul>
-          <li>截至 2026-07-02，npm 包名已经定为 <code>selfme</code>，安装命令是 <code>npm i -g selfme</code>，可执行命令是 <code>selfme</code>。</li>
+          <li>截至 2026-07-07，npm 包名已经定为 <code>selfme</code>，安装命令是 <code>npm i -g selfme</code>，可执行命令是 <code>selfme</code>。</li>
           <li>当前仓库的终端交互、审批、工具消息和基础恢复链已经够用，后续主线不再回到“先补产品壳层”或“先扩表面功能”。</li>
           <li><code>pnpm smoke:agent</code> 已经覆盖 continuation、resume、project inspection、rewrite / optimize follow-up、exact-output / verify 收口等关键 runtime 收敛路径，并保持全绿。</li>
+          <li>如果用户首轮就明确点名 <code>node-todo</code>、<code>packages/demo-core</code> 这类项目根，或 <code>node-todo/app.js</code> 这类具体文件，runtime 现在会优先从该项目入口或该文件起跑，而不是先做一次工作区 listing；这条也覆盖更短的 prompt 形态，例如 <code>看看 node-todo</code>、<code>直接优化 node-todo</code>、<code>直接重写 packages/demo-core</code>，不再要求用户必须显式写出“项目 / project”。</li>
           <li>普通工具执行失败（例如缺文件、edit range 越界）现在也会进入统一的 failed tool result 历史，而不是掉进零散的 runtime error 分支，后续 continuation / repair 能直接复用这条失败锚点。</li>
           <li>项目入口、第一个核心实现文件，或第一处已落到的工作文件后的长解释句，现在也会继续被拉回到下一个真正动作，而不是停在“我已经看出问题了”的说明态。</li>
           <li>即便 stop 发生在项目入口刚读完、assistant 还没来得及吐出“下一步我会继续看 app.js / server.js”这类阶段总结之前，resume 现在也会优先根据最近 tool 上下文推断下一步，而不是重新从 listing、package 或 README 起跑。</li>
