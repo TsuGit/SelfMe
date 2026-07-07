@@ -2628,16 +2628,18 @@ function buildFailureRecoveryPrompt(
   },
   preferredLanguage: PreferredReplyLanguage
 ) {
+  const resumedFollowUp = isSyntheticFollowUpRequest(originalRequest);
   const lines = buildAssistantToolPromptLines({
     originalRequest,
     instructionLines: [
       "A single failed tool result does not complete this task.",
       "Your previous assistant message stopped after a failure instead of continuing the repair loop.",
+      resumedFollowUp ? "This is a resume follow-up, so do not spend the first resumed pass on recap or explanation." : "",
       "Keep working from the failure you already have.",
       "If tools are needed, return exactly one tool call block.",
       "Only answer directly if the task is truly blocked on missing user input or a denied permission.",
       "Do not just restate the failure."
-    ],
+    ].filter(Boolean),
     preferredLanguage,
     assistantMessage,
     latestTool: input
@@ -2856,6 +2858,7 @@ function buildExecutionConvergencePrompt(
   preferredLanguage: PreferredReplyLanguage
 ) {
   const progressOnly = looksLikeProgressOnlyAssistantReply(assistantMessage);
+  const resumedFollowUp = isSyntheticFollowUpRequest(originalRequest);
   const lines = buildAssistantToolPromptLines({
     originalRequest,
     instructionLines: [
@@ -2863,13 +2866,14 @@ function buildExecutionConvergencePrompt(
       progressOnly
         ? "Your previous assistant message was only a progress update, not a completed result."
         : "Your previous assistant message explained the situation but did not advance the task.",
+      resumedFollowUp ? "This is a resume follow-up, so do not spend the first resumed pass on recap or explanation." : "",
       "Do not stop for explanation-only updates.",
       "Take the next concrete step that moves the task forward.",
       "When the next short chain is already clear from the latest result, keep going through the next obvious 2 to 6 concrete steps instead of stopping after one.",
       "For multi-file or project-wide tasks, do not stop after the first successful mutation or near-miss verification when the next requested file edit or verifier repair is already clear.",
       "If tools are needed, return exactly one tool call block.",
       "Only answer directly when the task is actually complete or truly blocked on user input."
-    ],
+    ].filter(Boolean),
     preferredLanguage,
     assistantMessage,
     latestTool: input
