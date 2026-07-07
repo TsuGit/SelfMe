@@ -7,7 +7,12 @@ import { EventBus } from "../app/event-bus.js";
 import { EditorController } from "../editor/composer.js";
 import type { ProviderClient, ProviderStreamChunk, ProviderStreamInput } from "../providers/base.js";
 import { AgentRuntime } from "../runtime/agent.js";
-import { getIncompleteSlashCommandNotice, parseToolCommand } from "../runtime/commands.js";
+import {
+  getIncompleteSlashCommandNotice,
+  listCommandPaletteItems,
+  parseToolCommand,
+  renderHelpLines
+} from "../runtime/commands.js";
 import { createDefaultSessionRecord } from "../runtime/context.js";
 import { buildContextMessages } from "../runtime/context-compaction.js";
 import { formatToolSummaryLine } from "../terminal/tool-message.js";
@@ -4291,6 +4296,7 @@ async function main() {
   await verifyImplicitRemainingChainDoesNotEndAtHelperCompletion();
   await verifyNearMissShellCompletionToneStillRepairsRemainingHelper();
   verifyInterruptFallbackWhenWorkingUiLingers();
+  verifyExitCommandShutsDownTerminalLoop();
   console.log("task: verify context compaction");
   verifyContextCompaction();
   verifyContextCompactionSwitchesMainTask();
@@ -4310,6 +4316,7 @@ async function main() {
   verifyContextCompactionPreservesAssistantStageBoundaries();
   verifyContextCompactionKeepsWholeTurns();
   verifyToolSummaryFormatting();
+  verifyCommandPaletteIncludesExit();
   verifyIncompleteSlashCommandHandling();
   verifyMultilineSlashCommands();
   verifyContextCompactionClipsLongRecentTurns();
@@ -37020,6 +37027,82 @@ function verifyInterruptFallbackWhenWorkingUiLingers() {
   }
 }
 
+function verifyExitCommandShutsDownTerminalLoop() {
+  const bus = new EventBus();
+  const editor = new EditorController();
+  const panel = new TerminalPanelController();
+  const sessionId = "terminal-exit-command";
+  const originalExit = process.exit;
+  const originalWrite = process.stdout.write.bind(process.stdout);
+  const existingDataListeners = process.stdin.listeners("data") as Array<(...args: any[]) => void>;
+  const writes: string[] = [];
+
+  const terminal = new TerminalEventLoop({
+    bus,
+    editor,
+    panel,
+    sessionId
+  });
+
+  (process as typeof process & {
+    exit: (code?: number) => never;
+  }).exit = ((code?: number) => {
+    throw new Error(`EXIT:${code ?? 0}`);
+  }) as typeof process.exit;
+
+  (process.stdout as typeof process.stdout & {
+    write: typeof process.stdout.write;
+  }).write = ((chunk: string | Uint8Array, ...args: unknown[]) => {
+    writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+    return originalWrite(chunk as never, ...(args as []));
+  }) as typeof process.stdout.write;
+
+  try {
+    terminal.start();
+
+    assert.ok(
+      (process.stdin.listeners("data") as Array<(...args: any[]) => void>).length > existingDataListeners.length,
+      "terminal loop should attach a stdin data listener while running"
+    );
+
+    assert.throws(
+      () => {
+        bus.emit(createTerminalCommandInvokedEvent({
+          sessionId,
+          content: "/exit"
+        }));
+      },
+      /EXIT:0/
+    );
+
+    const remainingListeners = process.stdin.listeners("data") as Array<(...args: any[]) => void>;
+    assert.equal(
+      remainingListeners.filter((listener) => !existingDataListeners.includes(listener)).length,
+      0,
+      "exit command should detach terminal stdin listeners before process shutdown"
+    );
+    assert.ok(
+      writes.some((chunk) => chunk.includes("\u001b[<u")),
+      "exit command should disable extended keyboard reporting during shutdown"
+    );
+    assert.ok(
+      writes.some((chunk) => chunk.includes("\n")),
+      "exit command should finish with a trailing newline"
+    );
+  } finally {
+    process.exit = originalExit;
+    (process.stdout as typeof process.stdout & {
+      write: typeof process.stdout.write;
+    }).write = originalWrite;
+
+    for (const listener of process.stdin.listeners("data") as Array<(...args: any[]) => void>) {
+      if (!existingDataListeners.includes(listener)) {
+        process.stdin.off("data", listener);
+      }
+    }
+  }
+}
+
 function waitForAssistantTaskCompletion(bus: EventBus, sessionId: string) {
   return new Promise<TaskStateChangedEvent>((resolve) => {
     let rootTaskId: string | undefined;
@@ -37209,6 +37292,17 @@ function verifyToolSummaryFormatting() {
   assert.equal(formatToolSummaryLine("shell", "shell · pwd · completed"), "Shell · pwd · completed");
   assert.equal(formatToolSummaryLine("edit", ""), "Edit · Completed");
   assert.equal(formatToolSummaryLine("shell", "completed"), "Shell · completed");
+}
+
+function verifyCommandPaletteIncludesExit() {
+  const items = listCommandPaletteItems();
+  const exitItem = items.find((item) => item.key === "exit");
+  const helpText = renderHelpLines().join("\n");
+
+  assert.ok(exitItem, "command palette should expose /exit");
+  assert.equal(exitItem?.command, "/exit");
+  assert.equal(exitItem?.requiresInput, undefined);
+  assert.match(helpText, /\/exit exits SelfMe immediately/);
 }
 
 function verifyContextCompaction() {
@@ -37995,6 +38089,10 @@ function verifyIncompleteSlashCommandHandling() {
     "Command does not take additional input: /stop"
   );
   assert.equal(
+    getIncompleteSlashCommandNotice("/exit now")?.message,
+    "Command does not take additional input: /exit"
+  );
+  assert.equal(
     getIncompleteSlashCommandNotice("/read")?.message,
     "Command requires more input: /read <path[:start-end]> [--max-bytes N]"
   );
@@ -38007,6 +38105,7 @@ function verifyIncompleteSlashCommandHandling() {
     "Command requires an approval id: /approve <approval-id>"
   );
   assert.equal(getIncompleteSlashCommandNotice("/help"), undefined);
+  assert.equal(getIncompleteSlashCommandNotice("/exit"), undefined);
   assert.equal(getIncompleteSlashCommandNotice("/shell echo hi"), undefined);
   assert.equal(
     getIncompleteSlashCommandNotice("/write\nhello")?.message,

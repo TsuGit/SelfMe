@@ -1,4 +1,4 @@
-export type BuiltInCommandName = "help" | "stop";
+export type BuiltInCommandName = "help" | "stop" | "exit";
 
 export interface CommandPaletteItem {
   key: string;
@@ -25,6 +25,14 @@ const commandPaletteItems: CommandPaletteItem[] = [
     display: "/stop",
     summary: "Stop current task",
     usage: "/stop",
+    hint: "Runs immediately."
+  },
+  {
+    key: "exit",
+    command: "/exit",
+    display: "/exit",
+    summary: "Exit SelfMe",
+    usage: "/exit",
     hint: "Runs immediately."
   },
   {
@@ -103,7 +111,8 @@ export function renderHelpLines() {
     "Esc closes the approval panel",
     "",
     "Control",
-    "Esc, Ctrl+C, or /stop stops the current response"
+    "Esc, Ctrl+C, or /stop stops the current response",
+    "/exit exits SelfMe immediately"
   ];
 }
 
@@ -116,6 +125,10 @@ export function parseBuiltInCommand(content: string): BuiltInCommandName | undef
 
   if (trimmed === "/stop") {
     return "stop";
+  }
+
+  if (trimmed === "/exit") {
+    return "exit";
   }
 
   return undefined;

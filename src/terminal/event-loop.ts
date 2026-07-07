@@ -17,6 +17,9 @@ import type { LinearTerminalRenderer } from "./linear-renderer.js";
 
 export class TerminalEventLoop {
   private isBusy = false;
+  private inputListener?: (chunk: Buffer | string) => void;
+  private processExitListener?: () => void;
+  private cleanedUp = false;
 
   constructor(
     private readonly input: {
@@ -39,7 +42,17 @@ export class TerminalEventLoop {
 
     enableExtendedKeyboardReporting();
     process.stdin.resume();
-    process.stdin.on("data", (chunk) => {
+    this.input.bus.on("terminal.command.invoked", (event) => {
+      if (event.sessionId !== (this.input.sessionId ?? "local-session")) {
+        return;
+      }
+
+      if (event.payload.content.trim() === "/exit") {
+        this.shutdown(0);
+      }
+    });
+
+    this.inputListener = (chunk) => {
       for (const event of parseTerminalInput(chunk)) {
         const currentValue = this.input.editor.getState().value;
         const panelState = this.input.panel.getState(currentValue);
@@ -54,8 +67,8 @@ export class TerminalEventLoop {
             continue;
           }
 
-          process.stdout.write("\n");
-          process.exit(0);
+          this.shutdown(0);
+          return;
         }
 
         if (event.type === "newline") {
@@ -124,7 +137,7 @@ export class TerminalEventLoop {
             this.input.bus.emit(createSystemMessageAppendedEvent({
               sessionId: this.input.sessionId ?? "local-session",
               title: "Busy",
-              content: "A task is still running. Press Esc, Ctrl+C, or /stop before sending a new message."
+              content: "A task is still running. Press Esc, Ctrl+C, /stop, or /exit before sending a new message."
             }));
             continue;
           }
@@ -236,11 +249,13 @@ export class TerminalEventLoop {
           this.emitEditorState();
         }
       }
-    });
+    };
+    process.stdin.on("data", this.inputListener);
 
-    process.on("exit", () => {
-      disableExtendedKeyboardReporting();
-    });
+    this.processExitListener = () => {
+      this.cleanupTerminalState();
+    };
+    process.on("exit", this.processExitListener);
   }
 
   private emitEditorState() {
@@ -266,6 +281,39 @@ export class TerminalEventLoop {
 
   private hasInterruptibleTask() {
     return this.isBusy || this.input.renderer?.hasInterruptibleVisualState() === true;
+  }
+
+  private shutdown(code: number) {
+    this.cleanupTerminalState();
+    process.stdout.write("\n");
+    process.exit(code);
+  }
+
+  private cleanupTerminalState() {
+    if (this.cleanedUp) {
+      return;
+    }
+
+    this.cleanedUp = true;
+    disableExtendedKeyboardReporting();
+
+    if (this.inputListener) {
+      process.stdin.off("data", this.inputListener);
+      this.inputListener = undefined;
+    }
+
+    if (this.processExitListener) {
+      process.off("exit", this.processExitListener);
+      this.processExitListener = undefined;
+    }
+
+    if (process.stdin.isTTY) {
+      try {
+        process.stdin.setRawMode(false);
+      } catch {
+        // Ignore TTY teardown failures during shutdown.
+      }
+    }
   }
 }
 

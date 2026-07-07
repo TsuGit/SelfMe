@@ -154,7 +154,7 @@ export class AgentRuntime {
       }
 
       if (this.isLockedForSession(event.sessionId)) {
-        this.emitTransientStatus(event.sessionId, "Busy", "A task is still running. Press Esc, Ctrl+C, or /stop before sending a new message.");
+        this.emitTransientStatus(event.sessionId, "Busy", "A task is still running. Press Esc, Ctrl+C, /stop, or /exit before sending a new message.");
         return;
       }
 
@@ -384,6 +384,10 @@ export class AgentRuntime {
       return true;
     }
 
+    if (builtInCommand === "exit") {
+      return true;
+    }
+
     if (!persistUserMessage && builtInCommand === "help") {
       await this.processCommandOnlyInput({
         sessionId,
@@ -414,7 +418,7 @@ export class AgentRuntime {
     }
 
     if (this.isLockedForSession(sessionId)) {
-      this.emitTransientStatus(sessionId, "Busy", "A task is still running. Press Esc, Ctrl+C, or /stop before starting another action.");
+      this.emitTransientStatus(sessionId, "Busy", "A task is still running. Press Esc, Ctrl+C, /stop, or /exit before starting another action.");
       return true;
     }
 
@@ -516,6 +520,10 @@ export class AgentRuntime {
 
     const builtInCommand = parseBuiltInCommand(input.content);
     const parsedToolCommand = parseToolCommand(input.content);
+
+    if (builtInCommand === "exit") {
+      return true;
+    }
 
     if (parsedToolCommand) {
       const taskId = randomUUID();
