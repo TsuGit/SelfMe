@@ -4072,6 +4072,7 @@ async function main() {
   await verifyNestedProjectMentionWinsOverRicherWorkspaceDecoy();
   await verifyNestedProjectMentionWinsOverRicherWorkspaceDecoyDuringProjectRewrite();
   await verifyAutomaticContinuationAfterAssistantPassLimitFailure();
+  await verifyAutomaticContinuationAfterAssistantPassLimitBeforeCommandOnlyShell();
   await verifyAutomaticContinuationAcrossMultipleAssistantPassSlices();
   await verifyAutomaticContinuationAcrossMultipleToolRecoverySlices();
   await verifyAutomaticContinuationAcrossMixedRecoveryAndStallSlices();
@@ -11242,6 +11243,159 @@ async function verifyAutomaticContinuationAfterAssistantPassLimitFailure() {
     result.runtimeErrors.some((message) => message.includes("Agent stopped after 96 assistant passes")),
     false,
     "automatic assistant-pass continuation should finish without surfacing the old assistant-pass hard stop"
+  );
+}
+
+async function verifyAutomaticContinuationAfterAssistantPassLimitBeforeCommandOnlyShell() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-assistant-pass-command-only-shell-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  const originalPrompt = "Read beta-a.txt, beta-b.txt, and package.json, then run `npm test` before finishing.";
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "beta-a.txt"), "beta-a\n", "utf8");
+  await writeFile(join(workspace, "beta-b.txt"), "beta-b\n", "utf8");
+  await writeFile(
+    join(workspace, "package.json"),
+    '{\n  "name": "assistant-pass-command-shell",\n  "version": "1.0.0",\n  "scripts": {\n    "test": "node verify-assistant-pass-command-only.mjs"\n  }\n}\n',
+    "utf8"
+  );
+  await writeFile(join(workspace, "verify-assistant-pass-command-only.mjs"), 'console.log("ready");\n', "utf8");
+
+  class AssistantPassCommandOnlyShellProvider implements ProviderClient {
+    readonly name = "assistant-pass-command-only-shell-provider";
+    private loopReplyCount = 0;
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "beta-a.txt",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /beta-a\.txt/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "beta-b.txt",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /beta-b\.txt/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "package.json",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /package\.json/.test(summary)) {
+          this.loopReplyCount += 1;
+          yield {
+            delta: `Assistant-pass command-only loop marker ${this.loopReplyCount} stays focused on the pending npm test step, the package.json read is already complete, this intentionally verbose sentence avoids short progress classification, and there is still a concrete verification command left to run before the task can finish.`
+          };
+          return;
+        }
+      }
+
+      if (
+        !input.content.startsWith("Original user request:")
+        && input.content.includes("The current task used up its assistant pass budget but still has unfinished work.")
+      ) {
+        assert.match(input.content, /Original task: Read beta-a\.txt, beta-b\.txt, and package\.json, then run `npm test` before finishing\./);
+        assert.match(input.content, /Pending next step target: npm test/);
+        assert.match(input.content, /Latest tool in context: files/);
+        assert.match(input.content, /Latest tool summary in context: package\.json:1-6/);
+        yield {
+          delta: toolCall("shell", {
+            command: "npm test"
+          })
+        };
+        return;
+      }
+
+      if (
+        input.content.startsWith("Original user request: The current task used up its assistant pass budget but still has unfinished work.")
+      ) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell" && /npm test/.test(summary)) {
+          yield { delta: "npm test completed and printed ready." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new AssistantPassCommandOnlyShellProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: originalPrompt
+  });
+
+  assert.match(result.assistantText, /ready|npm test/i);
+  assert.equal(
+    result.toolSummaries.filter((summary) => summary.startsWith("beta-a.txt:1-1")).length,
+    1,
+    "assistant-pass command-only continuation should preserve the original first read"
+  );
+  assert.equal(
+    result.toolSummaries.filter((summary) => summary.startsWith("beta-b.txt:1-1")).length,
+    1,
+    "assistant-pass command-only continuation should preserve the original second read"
+  );
+  assert.equal(
+    result.toolSummaries.filter((summary) => summary.startsWith("package.json:1-6")).length,
+    1,
+    "assistant-pass command-only continuation should preserve the original package read without rereading it"
+  );
+  assert.equal(
+    result.toolSummaries.filter((summary) => summary.startsWith("npm test · completed")).length,
+    1,
+    "assistant-pass command-only continuation should execute the pending verification command exactly once after the pass-limit handoff"
+  );
+  assert.equal(
+    result.runtimeErrors.some((message) => message.includes("Agent stopped after 32 assistant passes")),
+    false,
+    "assistant-pass command-only continuation should not surface the standard assistant-pass hard stop"
   );
 }
 

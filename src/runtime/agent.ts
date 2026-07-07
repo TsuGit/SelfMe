@@ -7635,6 +7635,10 @@ function derivePendingTargetPathFromContinuationContext(input: {
     errorMessage?: string;
   };
 }) {
+  const verificationCommand = extractVerificationCommandFromTaskRequest(input.originalRequest);
+  const previousResultPath = input.previousToolResult
+    ? extractPathFromToolSummary(input.previousToolResult.summary)
+    : undefined;
   const explicitMutationTargets = extractExplicitRequestedMutationTargets(input.originalRequest);
   const preferredExplicitTarget = [...explicitMutationTargets]
     .reverse()
@@ -7650,6 +7654,17 @@ function derivePendingTargetPathFromContinuationContext(input: {
     .reverse()
     .find((path) => looksLikeEditableSourcePath(path))
     ?? explicitTargets.at(-1);
+
+  if (
+    verificationCommand
+    && looksLikeExecutableCommandAnchor(verificationCommand)
+    && input.previousToolResult?.toolName === "files"
+    && preferredExplicitFile
+    && previousResultPath
+    && pathsReferToSameTarget(preferredExplicitFile, previousResultPath)
+  ) {
+    return verificationCommand;
+  }
 
   if (preferredExplicitFile) {
     return normalizePromptPath(preferredExplicitFile);
@@ -7685,8 +7700,6 @@ function derivePendingTargetPathFromContinuationContext(input: {
     if (likelyTargetFile) {
       return likelyTargetFile;
     }
-
-    const verificationCommand = extractVerificationCommandFromTaskRequest(input.originalRequest);
 
     if (verificationCommand && looksLikeExecutableCommandAnchor(verificationCommand)) {
       return verificationCommand;
