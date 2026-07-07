@@ -4073,6 +4073,8 @@ async function main() {
   await verifyNestedProjectMentionWinsOverRicherWorkspaceDecoyDuringProjectRewrite();
   await verifyAutomaticContinuationAfterAssistantPassLimitFailure();
   await verifyAutomaticContinuationAfterAssistantPassLimitBeforeCommandOnlyShell();
+  await verifyAutomaticContinuationAcrossAssistantPassAndToolRecoveryBeforeCommandOnlyShell();
+  await verifyAutomaticContinuationAfterToolRecoveryBeforeCommandOnlyShell();
   await verifyAutomaticContinuationAfterRepeatedStallBeforeCommandOnlyShell();
   await verifyAutomaticContinuationAcrossMultipleAssistantPassSlices();
   await verifyAutomaticContinuationAcrossMultipleToolRecoverySlices();
@@ -11397,6 +11399,459 @@ async function verifyAutomaticContinuationAfterAssistantPassLimitBeforeCommandOn
     result.runtimeErrors.some((message) => message.includes("Agent stopped after 32 assistant passes")),
     false,
     "assistant-pass command-only continuation should not surface the standard assistant-pass hard stop"
+  );
+}
+
+async function verifyAutomaticContinuationAfterToolRecoveryBeforeCommandOnlyShell() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-command-only-tool-recovery-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  const originalPrompt = "Read beta-a.txt, beta-b.txt, and package.json, then run `npm test` until it prints exactly `ready`, fixing whatever is needed before finishing, even if your edit tool input first comes out invalid.";
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "beta-a.txt"), "beta-a\n", "utf8");
+  await writeFile(join(workspace, "beta-b.txt"), "beta-b\n", "utf8");
+  await writeFile(
+    join(workspace, "package.json"),
+    '{\n  "name": "command-only-tool-recovery",\n  "version": "1.0.0",\n  "scripts": {\n    "test": "node verify-commandless-tool-recovery.mjs"\n  }\n}\n',
+    "utf8"
+  );
+  await writeFile(join(workspace, "verify-commandless-tool-recovery.mjs"), 'console.log("pending");\n', "utf8");
+
+  class CommandOnlyToolRecoveryProvider implements ProviderClient {
+    readonly name = "command-only-tool-recovery-provider";
+    toolRecoveryContinuationCount = 0;
+    private invalidEditAttemptCount = 0;
+    private recoveredShellCount = 0;
+
+    private buildInvalidEditToolCall() {
+      return toolCall("edit", {
+        startLine: 1,
+        endLine: 1,
+        replacement: 'console.log("ready");'
+      });
+    }
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "beta-a.txt",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /beta-a\.txt/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "beta-b.txt",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /beta-b\.txt/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "package.json",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /package\.json/.test(summary) && this.invalidEditAttemptCount < 2) {
+          this.invalidEditAttemptCount += 1;
+          yield { delta: this.buildInvalidEditToolCall() };
+          return;
+        }
+      }
+
+      if (
+        !input.content.startsWith("Original user request:")
+        && input.content.includes("The task hit repeated tool-recovery failures but the task context is still actionable.")
+      ) {
+        this.toolRecoveryContinuationCount += 1;
+        assert.match(input.content, /Pending next step target: npm test/);
+        assert.match(input.content, /Latest tool in context: files/);
+        assert.match(input.content, /Latest tool summary in context: package\.json:1-6/);
+        yield {
+          delta: toolCall("shell", {
+            command: "npm test"
+          })
+        };
+        return;
+      }
+
+      if (
+        input.content.startsWith("Original user request: The task hit repeated tool-recovery failures but the task context is still actionable.")
+      ) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell" && /npm test/.test(summary) && this.recoveredShellCount === 0) {
+          this.recoveredShellCount += 1;
+          yield {
+            delta: toolCall("files", {
+              path: "verify-commandless-tool-recovery.mjs",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /verify-commandless-tool-recovery\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "verify-commandless-tool-recovery.mjs",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'console.log("ready");'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /verify-commandless-tool-recovery\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "npm test"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /npm test/.test(summary) && this.recoveredShellCount === 1) {
+          this.recoveredShellCount += 1;
+          yield { delta: "npm test now prints ready after the command-only tool-recovery continuation." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new CommandOnlyToolRecoveryProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  bus.on("approval.requested", (event) => {
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: originalPrompt
+  });
+
+  const verifyContent = await readFile(join(workspace, "verify-commandless-tool-recovery.mjs"), "utf8");
+  assert.match(verifyContent, /ready/);
+  assert.match(result.assistantText, /ready|npm test/i);
+  assert.equal(
+    result.toolSummaries.filter((summary) => summary.startsWith("beta-a.txt:1-1")).length,
+    1,
+    "command-only tool-recovery continuation should preserve the original first read"
+  );
+  assert.equal(
+    result.toolSummaries.filter((summary) => summary.startsWith("beta-b.txt:1-1")).length,
+    1,
+    "command-only tool-recovery continuation should preserve the original second read"
+  );
+  assert.equal(
+    result.toolSummaries.filter((summary) => summary.startsWith("package.json:1-6")).length,
+    1,
+    "command-only tool-recovery continuation should preserve the original package read without rereading it"
+  );
+  assert.equal(
+    result.toolSummaries.filter((summary) => summary.startsWith("verify-commandless-tool-recovery.mjs:1-1")).length,
+    1,
+    "command-only tool-recovery continuation should inspect the hidden verification file once after the handoff"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("verify-commandless-tool-recovery.mjs:1-1 · updated")),
+    "command-only tool-recovery continuation should still reach the recovery edit"
+  );
+  assert.equal(
+    result.toolSummaries.filter((summary) => summary.startsWith("npm test · completed")).length,
+    2,
+    "command-only tool-recovery continuation should execute the verification command once to observe failure and once after the recovery edit"
+  );
+  assert.equal(
+    result.runtimeErrors.length,
+    0,
+    "command-only tool-recovery continuation should recover within the same task"
+  );
+}
+
+async function verifyAutomaticContinuationAcrossAssistantPassAndToolRecoveryBeforeCommandOnlyShell() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-assistant-pass-tool-recovery-command-only-shell-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  const originalPrompt = "Read beta-a.txt, beta-b.txt, and package.json, then run `npm test` until it prints exactly `ready`, fixing whatever is needed before finishing, even if you first burn passes on progress replies and later your edit tool input comes out invalid.";
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "beta-a.txt"), "beta-a\n", "utf8");
+  await writeFile(join(workspace, "beta-b.txt"), "beta-b\n", "utf8");
+  await writeFile(
+    join(workspace, "package.json"),
+    '{\n  "name": "assistant-pass-tool-recovery-command-shell",\n  "version": "1.0.0",\n  "scripts": {\n    "test": "node verify-assistant-pass-tool-recovery-command-only.mjs"\n  }\n}\n',
+    "utf8"
+  );
+  await writeFile(join(workspace, "verify-assistant-pass-tool-recovery-command-only.mjs"), 'console.log("pending");\n', "utf8");
+
+  class AssistantPassToolRecoveryCommandOnlyShellProvider implements ProviderClient {
+    readonly name = "assistant-pass-tool-recovery-command-only-shell-provider";
+    assistantPassContinuationCount = 0;
+    toolRecoveryContinuationCount = 0;
+    private loopReplyCount = 0;
+    private invalidEditAttemptCount = 0;
+    private recoveredShellCount = 0;
+
+    private buildInvalidEditToolCall() {
+      return toolCall("edit", {
+        startLine: 1,
+        endLine: 1,
+        replacement: 'console.log("ready");'
+      });
+    }
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "beta-a.txt",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /beta-a\.txt/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "beta-b.txt",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /beta-b\.txt/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "package.json",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /package\.json/.test(summary)) {
+          this.loopReplyCount += 1;
+          yield {
+            delta: `Assistant-pass tool-recovery command-only loop marker ${this.loopReplyCount} stays focused on the pending npm test step, the package.json read is already complete, this intentionally verbose sentence avoids short progress classification, and there is still a concrete verification command left to run before the task can finish.`
+          };
+          return;
+        }
+      }
+
+      if (
+        !input.content.startsWith("Original user request:")
+        && input.content.includes("The current task used up its assistant pass budget but still has unfinished work.")
+      ) {
+        this.assistantPassContinuationCount += 1;
+        assert.match(input.content, /Pending next step target: npm test/);
+        assert.match(input.content, /Latest tool in context: files/);
+        assert.match(input.content, /Latest tool summary in context: package\.json:1-6/);
+        yield { delta: this.buildInvalidEditToolCall() };
+        return;
+      }
+
+      if (
+        input.content.startsWith("Original user request: The current task used up its assistant pass budget but still has unfinished work.")
+      ) {
+        this.invalidEditAttemptCount += 1;
+
+        if (this.invalidEditAttemptCount <= 2) {
+          yield { delta: this.buildInvalidEditToolCall() };
+          return;
+        }
+      }
+
+      if (
+        !input.content.startsWith("Original user request:")
+        && input.content.includes("The task hit repeated tool-recovery failures but the task context is still actionable.")
+      ) {
+        this.toolRecoveryContinuationCount += 1;
+        assert.match(input.content, /Pending next step target: npm test/);
+        assert.match(input.content, /Latest tool in context: files/);
+        assert.match(input.content, /Latest tool summary in context: package\.json:1-6/);
+        yield {
+          delta: toolCall("shell", {
+            command: "npm test"
+          })
+        };
+        return;
+      }
+
+      if (
+        input.content.startsWith("Original user request: The task hit repeated tool-recovery failures but the task context is still actionable.")
+      ) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell" && /npm test/.test(summary) && this.recoveredShellCount === 0) {
+          this.recoveredShellCount += 1;
+          yield {
+            delta: toolCall("files", {
+              path: "verify-assistant-pass-tool-recovery-command-only.mjs",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /verify-assistant-pass-tool-recovery-command-only\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "verify-assistant-pass-tool-recovery-command-only.mjs",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'console.log("ready");'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /verify-assistant-pass-tool-recovery-command-only\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "npm test"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /npm test/.test(summary) && this.recoveredShellCount === 1) {
+          this.recoveredShellCount += 1;
+          yield { delta: "npm test now prints ready after the assistant-pass and tool-recovery command-only continuation chain." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new AssistantPassToolRecoveryCommandOnlyShellProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  bus.on("approval.requested", (event) => {
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: originalPrompt
+  });
+
+  const verifyContent = await readFile(join(workspace, "verify-assistant-pass-tool-recovery-command-only.mjs"), "utf8");
+  assert.match(verifyContent, /ready/);
+  assert.match(result.assistantText, /ready|npm test/i);
+  assert.equal(
+    result.toolSummaries.filter((summary) => summary.startsWith("beta-a.txt:1-1")).length,
+    1,
+    "assistant-pass + tool-recovery command-only continuation should preserve the original first read"
+  );
+  assert.equal(
+    result.toolSummaries.filter((summary) => summary.startsWith("beta-b.txt:1-1")).length,
+    1,
+    "assistant-pass + tool-recovery command-only continuation should preserve the original second read"
+  );
+  assert.equal(
+    result.toolSummaries.filter((summary) => summary.startsWith("package.json:1-6")).length,
+    1,
+    "assistant-pass + tool-recovery command-only continuation should preserve the original package read without rereading it"
+  );
+  assert.equal(
+    result.toolSummaries.filter((summary) => summary.startsWith("verify-assistant-pass-tool-recovery-command-only.mjs:1-1")).length,
+    1,
+    "assistant-pass + tool-recovery command-only continuation should inspect the hidden verification file once after the recovery handoff"
+  );
+  assert.ok(
+    result.toolSummaries.some((summary) => summary.startsWith("verify-assistant-pass-tool-recovery-command-only.mjs:1-1 · updated")),
+    "assistant-pass + tool-recovery command-only continuation should still reach the recovery edit"
+  );
+  assert.equal(
+    result.toolSummaries.filter((summary) => summary.startsWith("npm test · completed")).length,
+    2,
+    "assistant-pass + tool-recovery command-only continuation should execute the verification command once to observe failure and once after the recovery edit"
+  );
+  assert.equal(
+    result.runtimeErrors.length,
+    0,
+    "assistant-pass + tool-recovery command-only continuation should recover within the same task"
   );
 }
 
