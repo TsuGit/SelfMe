@@ -4521,6 +4521,7 @@ async function main() {
   await verifyNearMissShellCompletionToneStillRepairsRemainingHelper();
   await verifyProjectCommandStageSummaryResume();
   await verifyTerminalLoopSubmitsAndContinuesMultiStepTask();
+  await verifyTerminalLoopStopAndResumeCommandStageTask();
   verifyInterruptFallbackWhenWorkingUiLingers();
   verifyExitCommandShutsDownTerminalLoop();
   console.log("task: verify context compaction");
@@ -38614,6 +38615,288 @@ async function verifyTerminalLoopSubmitsAndContinuesMultiStepTask() {
         && event.payload.summary.startsWith("node-todo/views/index.ejs:3-3 · updated")
       ),
       "terminal loop task should continue into the pending view edit within the same task"
+    );
+  } finally {
+    process.exit = originalExit;
+    try {
+      bus.emit(createTerminalCommandInvokedEvent({
+        sessionId,
+        content: "/exit"
+      }));
+    } catch (error) {
+      assert.match(String(error), /EXIT:0/);
+    }
+
+    for (const listener of process.stdin.listeners("data") as Array<(...args: any[]) => void>) {
+      if (!existingDataListeners.includes(listener)) {
+        process.stdin.off("data", listener);
+      }
+    }
+  }
+}
+
+async function verifyTerminalLoopStopAndResumeCommandStageTask() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-terminal-loop-command-stage-resume-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  const sessionId = "terminal-loop-command-stage-resume";
+  await mkdir(workspace, { recursive: true });
+  await mkdir(join(workspace, "node-todo"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "node-todo", "package.json"),
+    '{\n  "name": "node-todo",\n  "version": "1.0.0",\n  "scripts": {\n    "start": "node app.js"\n  }\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "app.js"),
+    'const express = require("express");\nconst app = express();\nconst PORT = 3000;\napp.listen(PORT, () => {\n  console.log(`Todo app is running at http://localhost:${PORT}`);\n});\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "node-todo", "verify-setup.mjs"),
+    [
+      'import { readFileSync } from "node:fs";',
+      'const app = readFileSync(new URL("./app.js", import.meta.url), "utf8");',
+      'console.log(/process\\.env\\.PORT/.test(app) ? "ready" : "pending");'
+    ].join("\n") + "\n",
+    "utf8"
+  );
+
+  class TerminalLoopCommandStageResumeProvider implements ProviderClient {
+    readonly name = "terminal-loop-command-stage-resume-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "看看项目，然后直接优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，并运行 `node node-todo/verify-setup.mjs` 验证，直到输出 exactly `ready`。";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "pwd && ls -la && find . -maxdepth 2 -type f | sed 's#^./##' | sort | head -200"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell") {
+          if (/You are in the middle of a concrete project inspection request\./.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "node-todo/package.json",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+
+          assert.match(input.content, /ready/);
+          yield { delta: "Completed the terminal-loop command-stage resume chain and verified the final output is ready." };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "node-todo/app.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /node-todo\/app\.js/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "node-todo/app.js",
+              startLine: 3,
+              endLine: 3,
+              replacement: "const PORT = Number(process.env.PORT || 3000);"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /node-todo\/app\.js/.test(summary)) {
+          if (
+            /You are already inside the execution phase of a concrete task\./.test(input.content)
+            || /You are still inside the same multi-step task\./.test(input.content)
+          ) {
+            yield {
+              delta: toolCall("shell", {
+                command: "node node-todo/verify-setup.mjs"
+              })
+            };
+            return;
+          }
+
+          yield {
+            delta: "I updated node-todo/app.js and will rerun node node-todo/verify-setup.mjs next."
+          };
+          return;
+        }
+      }
+
+      if (input.content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+        assert.match(input.content, /Original task: 看看项目，然后直接优化 node-todo/);
+        assert.match(input.content, /Pending next step target: node node-todo\/verify-setup\.mjs/);
+        assert.match(input.content, /Latest tool in context: edit/);
+        assert.match(input.content, /Latest tool summary in context: node-todo\/app\.js:3-3 · updated/);
+        yield {
+          delta: toolCall("shell", {
+            command: "node node-todo/verify-setup.mjs"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+
+        if (toolName === "shell") {
+          assert.match(input.content, /ready/);
+          yield { delta: "Completed the terminal-loop command-stage resume chain and verified the final output is ready." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.sessionId = sessionId;
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new TerminalLoopCommandStageResumeProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  let approvalCount = 0;
+  bus.on("approval.requested", (event) => {
+    approvalCount += 1;
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const editor = new EditorController();
+  const panel = new TerminalPanelController();
+  const terminal = new TerminalEventLoop({
+    bus,
+    editor,
+    panel,
+    sessionId
+  });
+
+  const originalExit = process.exit;
+  const existingDataListeners = process.stdin.listeners("data") as Array<(...args: any[]) => void>;
+
+  (process as typeof process & {
+    exit: (code?: number) => never;
+  }).exit = ((code?: number) => {
+    throw new Error(`EXIT:${code ?? 0}`);
+  }) as typeof process.exit;
+
+  try {
+    terminal.start();
+    const initialCompletion = waitForAssistantTaskCompletion(bus, sessionId);
+    const stageSummaryPromise = waitForAssistantDeltaContaining(
+      bus,
+      sessionId,
+      /I updated node-todo\/app\.js and will rerun node node-todo\/verify-setup\.mjs next\./
+    );
+
+    process.stdin.emit("data", Buffer.from("看看项目，然后直接优化 node-todo：把 node-todo/app.js 的端口改成 process.env.PORT，并运行 `node node-todo/verify-setup.mjs` 验证，直到输出 exactly `ready`。\r"));
+
+    await stageSummaryPromise;
+    await waitForBusyPhase(bus, sessionId, "assistant");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    process.stdin.emit("data", "\u001b");
+
+    const cancelledTask = await initialCompletion;
+    assert.equal(cancelledTask.payload.state, "cancelled");
+
+    const interruptedEvents = await transcriptStore.readEventsBySession(sessionId);
+    assert.ok(
+      interruptedEvents.some((event) =>
+        event.type === "tool.execution.completed" && event.payload.summary.startsWith("node-todo/app.js:3-3 · updated")
+      ),
+      "terminal-loop interrupted task should preserve the app.js edit before stop"
+    );
+    assert.ok(
+      interruptedEvents.some((event) =>
+        event.type === "assistant.delta.received"
+        && /I updated node-todo\/app\.js and will rerun node node-todo\/verify-setup\.mjs next\./.test(event.payload.delta)
+      ),
+      "terminal-loop interrupted task should preserve the command-stage summary before stop"
+    );
+    assert.equal(
+      interruptedEvents.some((event) =>
+        event.type === "tool.execution.completed" && event.payload.summary.startsWith("node node-todo/verify-setup.mjs · completed")
+      ),
+      false,
+      "terminal-loop interrupted task should stop before rerunning the verification command"
+    );
+
+    const resumedCompletion = waitForAssistantTaskCompletion(bus, sessionId);
+    process.stdin.emit("data", Buffer.from("还能继续吗\r"));
+    const resumedTask = await resumedCompletion;
+    const resumedEvents = await transcriptStore.readEventsBySession(sessionId);
+    const resumedAssistantText = collectAssistantText(resumedEvents, resumedTask.taskId ?? "");
+
+    assert.equal(resumedTask.payload.state, "completed");
+    assert.equal(editor.getState().value, "", "terminal resume submit should clear the editor buffer");
+    assert.match(resumedAssistantText, /ready|terminal-loop command-stage resume/i);
+    assert.equal(
+      resumedEvents.filter((event) =>
+        event.type === "tool.execution.completed"
+        && event.payload.summary.startsWith("node node-todo/verify-setup.mjs · completed")
+      ).length,
+      1,
+      "terminal-loop resume should rerun the pending verification command exactly once"
+    );
+    assert.equal(
+      resumedEvents.some((event) =>
+        event.type === "tool.execution.completed"
+        && event.payload.summary.startsWith("node-todo/package.json:1-")
+        && event.taskId === resumedTask.taskId
+      ),
+      false,
+      "terminal-loop resume should not restart from package.json"
+    );
+    assert.equal(
+      resumedEvents.some((event) =>
+        event.type === "tool.execution.completed"
+        && event.payload.summary.startsWith("node-todo/app.js:1-")
+        && event.taskId === resumedTask.taskId
+      ),
+      false,
+      "terminal-loop resume should not reread app.js after the pending verification command is known"
+    );
+    assert.equal(
+      approvalCount,
+      1,
+      "terminal-loop command-stage resume should only need the original edit approval"
     );
   } finally {
     process.exit = originalExit;
