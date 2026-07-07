@@ -4064,6 +4064,7 @@ async function main() {
   await verifyAutomaticContinuationAcrossToolStepLimitAndToolRecoverySlices();
   await verifyAutomaticContinuationAcrossToolStepLimitAndRepeatedStallSlices();
   await verifyAutomaticContinuationAfterToolStepLimitBeforeWrappedShell();
+  await verifyAutomaticContinuationAfterToolStepLimitBeforeCommandOnlyShell();
   await verifyAutomaticContinuationAfterToolStepLimitDuringWholeProjectInspection();
   await verifyExplicitProjectMentionWinsOverRicherWorkspaceDecoy();
   await verifyExplicitProjectMentionWinsOverRicherWorkspaceDecoyDuringProjectImprovement();
@@ -10191,6 +10192,154 @@ async function verifyAutomaticContinuationAfterToolStepLimitBeforeWrappedShell()
     result.runtimeErrors.some((message) => message.includes("Agent stopped after 16 tool steps")),
     false,
     "automatic step-limit continuation should finish wrapped shell verification without surfacing the extended-budget hard stop"
+  );
+}
+
+async function verifyAutomaticContinuationAfterToolStepLimitBeforeCommandOnlyShell() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-step-limit-command-only-shell-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  const originalPrompt = "Read beta-1.txt, beta-2.txt, beta-3.txt, beta-4.txt, beta-5.txt, beta-6.txt, beta-7.txt, and package.json, then run `npm test` before finishing.";
+  await mkdir(workspace, { recursive: true });
+
+  for (let index = 1; index <= 7; index += 1) {
+    await writeFile(join(workspace, `beta-${index}.txt`), `beta-${index}\n`, "utf8");
+  }
+
+  await writeFile(
+    join(workspace, "package.json"),
+    '{\n  "name": "step-limit-command-shell",\n  "version": "1.0.0",\n  "scripts": {\n    "test": "node verify-commandless-step-limit.mjs"\n  }\n}\n',
+    "utf8"
+  );
+  await writeFile(join(workspace, "verify-commandless-step-limit.mjs"), 'console.log("ready");\n', "utf8");
+
+  class StepLimitCommandOnlyShellProvider implements ProviderClient {
+    readonly name = "step-limit-command-only-shell-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "beta-1.txt",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        for (let index = 1; index <= 6; index += 1) {
+          if (toolName === "files" && new RegExp(`beta-${index}\\.txt`).test(summary)) {
+            yield {
+              delta: toolCall("files", {
+                path: `beta-${index + 1}.txt`,
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+        }
+
+        if (toolName === "files" && /beta-7\.txt/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "package.json",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "npm test"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /npm test/.test(summary)) {
+          yield { delta: "npm test completed and printed ready." };
+          return;
+        }
+      }
+
+      if (
+        !input.content.startsWith("Original user request:")
+        && input.content.includes("The current task hit the per-slice tool budget but still has unfinished work.")
+      ) {
+        assert.match(input.content, /Original task: Read beta-1\.txt, beta-2\.txt, beta-3\.txt, beta-4\.txt, beta-5\.txt, beta-6\.txt, beta-7\.txt, and package\.json, then run `npm test` before finishing\./);
+        assert.match(input.content, /Pending next step target: npm test/);
+        assert.match(input.content, /Latest tool in context: files/);
+        assert.match(input.content, /Latest tool summary in context: package\.json:1-6/);
+        yield {
+          delta: toolCall("shell", {
+            command: "npm test"
+          })
+        };
+        return;
+      }
+
+      if (
+        input.content.startsWith("Original user request: The current task hit the per-slice tool budget but still has unfinished work.")
+      ) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell" && /npm test/.test(summary)) {
+          yield { delta: "npm test completed and printed ready." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new StepLimitCommandOnlyShellProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const result = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: originalPrompt
+  });
+
+  assert.match(result.assistantText, /ready|npm test/i);
+  assert.equal(
+    result.toolSummaries.filter((summary) => summary.startsWith("npm test · completed")).length,
+    1,
+    "automatic step-limit continuation should execute the pending command-only shell verification exactly once"
+  );
+  assert.equal(
+    result.runtimeErrors.some((message) => message.includes("Agent stopped after 8 tool steps")),
+    false,
+    "automatic step-limit continuation should not fail when the pending next step is a command-only shell target"
   );
 }
 

@@ -4021,6 +4021,21 @@ function extractPrimaryPathFromShellCommand(command: string) {
   return normalized;
 }
 
+function looksLikeExecutableCommandAnchor(value: string) {
+  return /^(?:node|pnpm|npm|yarn|bun|deno|python|python3|pytest|cargo|go|make|sh|bash|tsx)\b/i.test(value.trim());
+}
+
+function extractPendingStepTargetFromShellCommand(command: string) {
+  const targetPath = extractPrimaryPathFromShellCommand(command);
+
+  if (targetPath) {
+    return targetPath;
+  }
+
+  const trimmed = command.trim();
+  return looksLikeExecutableCommandAnchor(trimmed) ? trimmed : undefined;
+}
+
 function extractExpectedExactOutput(content: string) {
   return extractExpectedOutputFromTaskRequest(content);
 }
@@ -7576,7 +7591,7 @@ function extractPendingTargetPathFromToolRequest(toolName: string, toolInput: un
       ? toolInput.command
       : undefined;
 
-    return command ? extractPrimaryPathFromShellCommand(command) : undefined;
+    return command ? extractPendingStepTargetFromShellCommand(command) : undefined;
   }
 
   if (toolName !== "files" && toolName !== "edit" && toolName !== "write") {
@@ -7592,7 +7607,7 @@ function extractPendingTargetPathFromToolRequest(toolName: string, toolInput: un
 
 function extractPendingTargetPathFromContinuationPrompt(content: string) {
   const patterns = [
-    /\bPending next step target:\s*([A-Za-z0-9_./-]+\.(?:tsx|json|mjs|cjs|ejs|html|css|js|ts|txt|md|csv))/i,
+    /\bPending next step target:\s*([^\n]+)/i,
     /\bLikely target file:\s*([A-Za-z0-9_./-]+\.(?:tsx|json|mjs|cjs|ejs|html|css|js|ts|txt|md|csv))/i,
     /\bRecent editable working file:\s*([A-Za-z0-9_./-]+\.(?:tsx|json|mjs|cjs|ejs|html|css|js|ts|txt|md|csv))/i
   ];
@@ -7602,7 +7617,9 @@ function extractPendingTargetPathFromContinuationPrompt(content: string) {
     const targetPath = match?.[1]?.trim();
 
     if (targetPath) {
-      return normalizePromptPath(targetPath);
+      return looksLikeExecutableCommandAnchor(targetPath)
+        ? targetPath
+        : normalizePromptPath(targetPath);
     }
   }
 
@@ -7643,6 +7660,7 @@ function derivePendingTargetPathFromContinuationContext(input: {
   }
 
   if (input.previousToolResult.toolName === "shell") {
+    const latestShellCommand = extractShellCommandFromSummary(input.previousToolResult.summary);
     const likelyProjectEntry = looksLikeProjectInspectionRequest(input.originalRequest)
       || looksLikeWholeProjectInspectionRequest(input.originalRequest)
       || looksLikeBroadProjectImprovementRequest(input.originalRequest)
@@ -7662,7 +7680,19 @@ function derivePendingTargetPathFromContinuationContext(input: {
       input.previousToolResult.errorMessage,
       input.previousToolResult.rawOutput
     ].filter(Boolean).join("\n");
-    return deriveLikelyTargetFileForShellFailure(input.previousToolResult.summary, shellText);
+    const likelyTargetFile = deriveLikelyTargetFileForShellFailure(input.previousToolResult.summary, shellText);
+
+    if (likelyTargetFile) {
+      return likelyTargetFile;
+    }
+
+    const verificationCommand = extractVerificationCommandFromTaskRequest(input.originalRequest);
+
+    if (verificationCommand && looksLikeExecutableCommandAnchor(verificationCommand)) {
+      return verificationCommand;
+    }
+
+    return latestShellCommand ? extractPendingStepTargetFromShellCommand(latestShellCommand) : undefined;
   }
 
   return extractPathFromToolSummary(input.previousToolResult.summary);
