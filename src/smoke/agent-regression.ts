@@ -4206,6 +4206,7 @@ async function main() {
   await verifyVagueOptimizationResumesInterruptedProposalExecution();
   await verifyResumeFollowUpAtLatestFailurePoint();
   await verifyResumeFollowUpWhenLatestFailurePointShiftsToHelper();
+  await verifyResumeFollowUpWhenHelperFailurePointNeedsToolRecovery();
   await verifyResumeFollowUpPullsExplanationBackIntoLatestFailurePoint();
   await verifyResumeFollowUpPullsCompletionToneBackIntoLatestFailurePoint();
   await verifyResumeFollowUpPullsBlockingQuestionBackIntoLatestFailurePoint();
@@ -26318,6 +26319,285 @@ async function verifyResumeFollowUpWhenLatestFailurePointShiftsToHelper() {
   assert.ok(
     approvalCount >= 2,
     "expected approvals for the initial main-file repair and the resumed helper repairs"
+  );
+}
+
+async function verifyResumeFollowUpWhenHelperFailurePointNeedsToolRecovery() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-resume-helper-tool-recovery-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  await mkdir(join(workspace, "src"), { recursive: true });
+  await writeFile(
+    join(workspace, "src", "bridge-helper.mjs"),
+    'export function bridgeStatus() {\n  return "-ready";\n}\n',
+    "utf8"
+  );
+  await writeFile(
+    join(workspace, "src", "bridge.mjs"),
+    'import { bridgeStatus } from "./bridge-helperr.mjs";\nconsole.log(`SelfMe${bridgeStatus()}`);\n',
+    "utf8"
+  );
+
+  class ResumeHelperToolRecoveryProvider implements ProviderClient {
+    readonly name = "resume-helper-tool-recovery-provider";
+    private invalidResumedEditCount = 0;
+    toolRecoveryContinuationCount = 0;
+
+    private buildInvalidEditToolCall() {
+      return toolCall("edit", {
+        startLine: 2,
+        endLine: 2,
+        replacement: '  return ":ready";'
+      });
+    }
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "Run `node src/bridge.mjs`, fix the existing files so it prints exactly `SelfMe:ready`, and keep verifying until it is correct.";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "node src/bridge.mjs"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell") {
+          if (/bridge-helperr\.mjs/.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "src/bridge.mjs",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+
+          if (/SelfMe-ready/.test(input.content)) {
+            yield {
+              delta: toolCall("files", {
+                path: "src/bridge-helper.mjs",
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+
+          assert.match(input.content, /SelfMe:ready/);
+          yield { delta: "Fixed the resumed bridge helper tool-recovery chain and verified SelfMe:ready." };
+          return;
+        }
+
+        if (toolName === "files" && /src\/bridge\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "src/bridge.mjs",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'import { bridgeStatus } from "./bridge-helper.mjs";'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /src\/bridge\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node src/bridge.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /src\/bridge-helper\.mjs/.test(summary)) {
+          await waitForProviderDelay(input.signal, 120);
+          yield { delta: this.buildInvalidEditToolCall() };
+          return;
+        }
+      }
+
+      if (input.content.startsWith('The user replied "还能继续吗" and wants to continue the most recent unfinished task.')) {
+        assert.match(input.content, /Original task: Run `node src\/bridge\.mjs`/);
+        this.invalidResumedEditCount += 1;
+
+        if (this.invalidResumedEditCount <= 2) {
+          yield { delta: this.buildInvalidEditToolCall() };
+          return;
+        }
+
+        yield {
+          delta: toolCall("edit", {
+            path: "src/bridge-helper.mjs",
+            startLine: 2,
+            endLine: 2,
+            replacement: '  return ":ready";'
+          })
+        };
+        return;
+      }
+
+      if (
+        !input.content.startsWith("Original user request:")
+        && input.content.includes("The task hit repeated tool-recovery failures but the task context is still actionable.")
+      ) {
+        this.toolRecoveryContinuationCount += 1;
+        assert.match(input.content, /Pending next step target: src\/bridge-helper\.mjs/);
+        yield {
+          delta: toolCall("edit", {
+            path: "src/bridge-helper.mjs",
+            startLine: 2,
+            endLine: 2,
+            replacement: '  return ":ready";'
+          })
+        };
+        return;
+      }
+
+      if (
+        input.content.startsWith('Original user request: The user replied "还能继续吗" and wants to continue the most recent unfinished task.')
+        || input.content.startsWith("Original user request: The task hit repeated tool-recovery failures but the task context is still actionable.")
+      ) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "edit" && /src\/bridge-helper\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node src/bridge.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell") {
+          assert.match(input.content, /SelfMe:ready/);
+          yield { delta: "Fixed the resumed bridge helper tool-recovery chain and verified SelfMe:ready." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const provider = new ResumeHelperToolRecoveryProvider();
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider,
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  let approvalCount = 0;
+  bus.on("approval.requested", (event) => {
+    approvalCount += 1;
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const completionPromise = waitForAssistantTaskCompletion(bus, session.sessionId);
+  const helperReadPromise = waitForToolExecutionCompleted(
+    bus,
+    session.sessionId,
+    (summary) => summary.startsWith("src/bridge-helper.mjs:1-3")
+  );
+
+  bus.emit(createUserMessageSubmittedEvent({
+    sessionId: session.sessionId,
+    content: "Run `node src/bridge.mjs`, fix the existing files so it prints exactly `SelfMe:ready`, and keep verifying until it is correct."
+  }));
+
+  await helperReadPromise;
+  bus.emit(createRuntimeInterruptRequestedEvent({
+    sessionId: session.sessionId,
+    reason: "cancel"
+  }));
+
+  const cancelledTask = await completionPromise;
+  assert.equal(cancelledTask.payload.state, "cancelled");
+
+  const interruptedEvents = await transcriptStore.readEventsBySession(session.sessionId);
+  assert.ok(
+    interruptedEvents.some((event) =>
+      event.type === "tool.execution.completed" && event.payload.summary.startsWith("src/bridge.mjs:1-1 · updated")
+    ),
+    "interrupted helper tool-recovery task should preserve the main-file repair before stop"
+  );
+  assert.ok(
+    interruptedEvents.some((event) =>
+      event.type === "tool.execution.completed" && event.payload.summary.startsWith("src/bridge-helper.mjs:1-3")
+    ),
+    "interrupted helper tool-recovery task should already have inspected the helper before stop"
+  );
+  assert.equal(
+    interruptedEvents.some((event) =>
+      event.type === "tool.execution.completed" && event.payload.summary.startsWith("src/bridge-helper.mjs:2-2 · updated")
+    ),
+    false,
+    "interrupted helper tool-recovery task should stop before the helper repair is applied"
+  );
+
+  const resumedResult = await runAgentTask({
+    bus,
+    transcriptStore,
+    sessionId: session.sessionId,
+    prompt: "还能继续吗"
+  });
+
+  const bridgeContent = await readFile(join(workspace, "src", "bridge.mjs"), "utf8");
+  const helperContent = await readFile(join(workspace, "src", "bridge-helper.mjs"), "utf8");
+  assert.match(bridgeContent, /bridge-helper\.mjs/);
+  assert.match(helperContent, /return ":ready"/);
+  assert.match(resumedResult.assistantText, /tool-recovery|SelfMe:ready/i);
+  assert.doesNotMatch(resumedResult.assistantText, /^(可以|可以继续|好的|sure|okay)\b/i);
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("src/bridge.mjs:1-2")),
+    false,
+    "resume follow-up should not reread the earlier main file after the helper became the latest failure point"
+  );
+  assert.equal(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("src/bridge.mjs:1-1 · updated")),
+    false,
+    "resume follow-up should not reapply the earlier main-file repair when helper recovery is pending"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("src/bridge-helper.mjs:2-2 · updated")),
+    "resume follow-up should still reach the recovered helper edit"
+  );
+  assert.equal(
+    provider.toolRecoveryContinuationCount,
+    1,
+    "resume follow-up should bridge one tool-recovery slice from the helper failure point"
+  );
+  assert.ok(
+    resumedResult.toolSummaries.some((summary) => summary.startsWith("node src/bridge.mjs · completed")),
+    "resume follow-up should finish verification after the recovered helper edit"
+  );
+  assert.ok(
+    approvalCount >= 2,
+    "expected approvals for the initial main-file repair and the resumed helper repair"
   );
 }
 
