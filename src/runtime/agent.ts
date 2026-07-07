@@ -2669,6 +2669,7 @@ function buildProjectInspectionContinuationPrompt(
   },
   preferredLanguage: PreferredReplyLanguage
 ) {
+  const resumedFollowUp = isSyntheticFollowUpRequest(originalRequest);
   const targetPath = extractPathFromToolSummary(input.summary);
   const continuingFromProjectEntry = Boolean(
     input.toolName === "files"
@@ -2681,18 +2682,20 @@ function buildProjectInspectionContinuationPrompt(
     instructionLines: continuingFromProjectEntry
       ? [
         "You are in the middle of a concrete project inspection request.",
+        resumedFollowUp ? "This is a resume follow-up, so do not spend the first resumed pass on recap or explanation." : "",
         "You already inspected a concrete project entry, so do not stop at a summary of the entry file.",
         "Continue the inspection now by reading the most likely implementation file for this project.",
         "If another tool is needed, return exactly one tool call block.",
         "Only answer directly after you have inspected at least one concrete implementation file or truly hit a blocker."
-      ]
+      ].filter(Boolean)
       : [
         "You are in the middle of a concrete project inspection request.",
+        resumedFollowUp ? "This is a resume follow-up, so do not spend the first resumed pass on recap or explanation." : "",
         "Do not stop at a broad question after the workspace listing.",
         "Continue the inspection now by reading the most likely project entry from the listing.",
         "If another tool is needed, return exactly one tool call block.",
         "Only answer directly after you have inspected at least one concrete project entry."
-      ],
+      ].filter(Boolean),
     preferredLanguage,
     assistantMessage,
     latestTool: input
@@ -2722,6 +2725,7 @@ function buildProjectWorkfileContinuationPrompt(
   },
   preferredLanguage: PreferredReplyLanguage
 ) {
+  const resumedFollowUp = isSyntheticFollowUpRequest(originalRequest);
   const targetPath = extractPathFromToolSummary(input.summary);
   const likelyImprovementPath = targetPath
     ? deriveLikelyProjectImplementationPath(targetPath, input.rawOutput)
@@ -2737,19 +2741,21 @@ function buildProjectWorkfileContinuationPrompt(
     instructionLines: continuingFromThinEntrySource
       ? [
         "You are in the middle of a project improvement task.",
+        resumedFollowUp ? "This is a resume follow-up, so do not spend the first resumed pass on recap or explanation." : "",
         "The file you just inspected is only a thin entry layer, not yet the real implementation target.",
         "Do not stop at analysis or a broad next-step suggestion.",
         "Continue now by reading the most likely local implementation file for the requested work.",
         "If another tool is needed, return exactly one tool call block.",
         "Only answer directly after you have inspected the concrete implementation file or truly completed the task."
-      ]
+      ].filter(Boolean)
       : [
         "You are in the middle of a project improvement task.",
+        resumedFollowUp ? "This is a resume follow-up, so do not spend the first resumed pass on recap or explanation." : "",
         "You already inspected a concrete project entry, so do not stop at analysis or a broad next-step suggestion.",
         "Continue now by reading the most likely implementation file for the requested work.",
         "If another tool is needed, return exactly one tool call block.",
         "Only answer directly after you have inspected a concrete working file or truly completed the task."
-      ],
+      ].filter(Boolean),
     preferredLanguage,
     assistantMessage,
     latestTool: input
@@ -2820,15 +2826,17 @@ function buildMultiTargetMutationContinuationPrompt(
   },
   preferredLanguage: PreferredReplyLanguage
 ) {
+  const resumedFollowUp = isSyntheticFollowUpRequest(originalRequest);
   const lines = buildAssistantToolPromptLines({
     originalRequest,
     instructionLines: [
       "The original request contains multiple concrete file changes.",
       "One successful edit does not complete the task when your own reply says more requested work remains.",
+      resumedFollowUp ? "This is a resume follow-up, so do not spend the first resumed pass on recap or explanation." : "",
       "Continue with the next remaining requested change now.",
       "If tools are needed, return exactly one tool call block.",
       "Only answer directly after the remaining requested edits are done or truly blocked."
-    ],
+    ].filter(Boolean),
     preferredLanguage,
     assistantMessage,
     latestTool: input
