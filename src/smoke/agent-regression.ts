@@ -21549,6 +21549,7 @@ async function verifyResumeAfterThinEntryStageSummary() {
         const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
 
         if (toolName === "files" && /demo-thin-resume\/src\/server\.js/.test(summary)) {
+          assert.match(input.content, /This is a resume follow-up, so do not spend the first resumed pass on recap or explanation\./);
           yield {
             delta: toolCall("edit", {
               path: "demo-thin-resume/src/server.js",
@@ -24951,6 +24952,7 @@ async function verifyVagueInspectionResumesInterruptedProposalExecution() {
         const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
 
         if (toolName === "files" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          assert.match(input.content, /This is a resume follow-up, so do not spend the first resumed pass on recap or explanation\./);
           yield { delta: "Completed the interrupted inspection by continuing directly with node-todo/views/index.ejs." };
           return;
         }
@@ -30951,6 +30953,7 @@ async function verifyResumeFollowUpInImplicitMultiTargetCompletionToneChain() {
         }
 
         if (toolName === "edit" && /node-todo\/views\/index\.ejs/.test(summary)) {
+          assert.match(input.content, /This is a resume follow-up, so do not spend the first resumed pass on recap or explanation\./);
           yield {
             delta: "Completed the interrupted multi-target optimization across node-todo/app.js and node-todo/views/index.ejs."
           };
