@@ -4523,6 +4523,7 @@ async function main() {
   await verifyTerminalLoopSubmitsAndContinuesMultiStepTask();
   await verifyTerminalLoopAutoContinuesAfterToolStepLimit();
   await verifyTerminalLoopAutoContinuesAfterAssistantPassLimit();
+  await verifyTerminalLoopAutoContinuesAcrossMultipleAssistantPassSlices();
   await verifyTerminalLoopAutoContinuesAfterAssistantPassLimitBeforeCommandOnlyShell();
   await verifyTerminalLoopAutoContinuesAcrossAssistantPassAndToolRecoveryBeforeCommandOnlyShell();
   await verifyTerminalLoopContinuesAfterExplanationOnlyReply();
@@ -39074,6 +39075,254 @@ async function verifyTerminalLoopAutoContinuesAfterAssistantPassLimit() {
       ),
       false,
       "terminal assistant-pass auto-continue should finish without surfacing the old assistant-pass hard stop"
+    );
+  } finally {
+    process.exit = originalExit;
+    try {
+      bus.emit(createTerminalCommandInvokedEvent({
+        sessionId,
+        content: "/exit"
+      }));
+    } catch (error) {
+      assert.match(String(error), /EXIT:0/);
+    }
+
+    for (const listener of process.stdin.listeners("data") as Array<(...args: any[]) => void>) {
+      if (!existingDataListeners.includes(listener)) {
+        process.stdin.off("data", listener);
+      }
+    }
+  }
+}
+
+async function verifyTerminalLoopAutoContinuesAcrossMultipleAssistantPassSlices() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-terminal-loop-assistant-pass-multi-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  const sessionId = "terminal-loop-assistant-pass-multi";
+  const originalPrompt = "Read app.config.json and fix terminal-assistant-pass-multi-report.mjs so running `node terminal-assistant-pass-multi-report.mjs` prints exactly `SelfMe:3000` on one line. Keep working until the output is exact.";
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "app.config.json"), '{\n  "name": "SelfMe",\n  "port": 3000\n}\n', "utf8");
+  await writeFile(
+    join(workspace, "terminal-assistant-pass-multi-report.mjs"),
+    'import config from "./app.conf.json" with { type: "json" };\nconsole.log(`${config.name}:${config.port}`);\n',
+    "utf8"
+  );
+
+  class TerminalLoopAssistantPassMultiProvider implements ProviderClient {
+    readonly name = "terminal-loop-assistant-pass-multi-provider";
+    continuationPromptCount = 0;
+    private originalLoopReplyCount = 0;
+    private resumedLoopReplyCount = 0;
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "app.config.json",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /app\.config\.json/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node terminal-assistant-pass-multi-report.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /failed \(1\)/.test(summary)) {
+          this.originalLoopReplyCount += 1;
+          yield {
+            delta: `Original terminal assistant-pass loop marker ${this.originalLoopReplyCount} stays focused on terminal-assistant-pass-multi-report.mjs and the unresolved import path app.conf.json, the source location is already narrow, this intentionally verbose sentence avoids short progress classification, and no user input ambiguity exists in this branch.`
+          };
+          return;
+        }
+      }
+
+      if (
+        !input.content.startsWith("Original user request:")
+        && input.content.includes("The current task used up its assistant pass budget but still has unfinished work.")
+      ) {
+        this.continuationPromptCount += 1;
+        assert.match(input.content, /Pending next step target: terminal-assistant-pass-multi-report\.mjs/);
+
+        if (this.continuationPromptCount === 1) {
+          yield {
+            delta: toolCall("files", {
+              path: "terminal-assistant-pass-multi-report.mjs",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (this.continuationPromptCount === 2) {
+          yield {
+            delta: toolCall("edit", {
+              path: "terminal-assistant-pass-multi-report.mjs",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'import config from "./app.config.json" with { type: "json" };'
+            })
+          };
+          return;
+        }
+
+        assert.fail(`unexpected terminal assistant-pass continuation prompt ${this.continuationPromptCount}`);
+      }
+
+      if (
+        input.content.startsWith("Original user request: The current task used up its assistant pass budget but still has unfinished work.")
+      ) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /terminal-assistant-pass-multi-report\.mjs/.test(summary)) {
+          this.resumedLoopReplyCount += 1;
+          yield {
+            delta: `Resumed terminal assistant-pass loop marker ${this.resumedLoopReplyCount} stays focused on terminal-assistant-pass-multi-report.mjs and the already-read import line, the target file is known, this intentionally verbose sentence avoids short progress classification, and the task is not yet complete because the edit has not landed.`
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /terminal-assistant-pass-multi-report\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node terminal-assistant-pass-multi-report.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /completed/.test(summary)) {
+          yield { delta: "Repaired terminal-assistant-pass-multi-report.mjs after two assistant-pass continuation slices and verified the final output is exactly SelfMe:3000." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const provider = new TerminalLoopAssistantPassMultiProvider();
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.sessionId = sessionId;
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider,
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  bus.on("approval.requested", (event) => {
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const editor = new EditorController();
+  const panel = new TerminalPanelController();
+  const terminal = new TerminalEventLoop({
+    bus,
+    editor,
+    panel,
+    sessionId
+  });
+
+  const originalExit = process.exit;
+  const existingDataListeners = process.stdin.listeners("data") as Array<(...args: any[]) => void>;
+
+  (process as typeof process & {
+    exit: (code?: number) => never;
+  }).exit = ((code?: number) => {
+    throw new Error(`EXIT:${code ?? 0}`);
+  }) as typeof process.exit;
+
+  try {
+    terminal.start();
+    const completion = waitForAssistantTaskCompletion(bus, sessionId);
+    process.stdin.emit("data", Buffer.from("Read app.config.json and fix terminal-assistant-pass-multi-report.mjs so running `node terminal-assistant-pass-multi-report.mjs` prints exactly `SelfMe:3000` on one line. Keep working until the output is exact.\r"));
+    const task = await completion;
+    const events = await transcriptStore.readEventsBySession(sessionId);
+    const assistantText = collectAssistantText(events, task.taskId ?? "");
+    const content = await readFile(join(workspace, "terminal-assistant-pass-multi-report.mjs"), "utf8");
+
+    assert.equal(task.payload.state, "completed");
+    assert.equal(editor.getState().value, "", "terminal multi-slice assistant-pass flow should clear the editor buffer");
+    assert.match(content, /app\.config\.json/);
+    assert.match(assistantText, /SelfMe:3000|terminal-assistant-pass-multi-report\.mjs/i);
+    assert.equal(
+      provider.continuationPromptCount,
+      2,
+      "terminal multi-slice assistant-pass flow should bridge two stalled pass-limit slices before finishing"
+    );
+    assert.ok(
+      events.some((event) =>
+        event.type === "assistant.delta.received"
+        && /Original terminal assistant-pass loop marker/i.test(event.payload.delta)
+      ),
+      "terminal multi-slice assistant-pass flow should preserve the original assistant-pass loop before the first handoff"
+    );
+    assert.ok(
+      events.some((event) =>
+        event.type === "assistant.delta.received"
+        && /Resumed terminal assistant-pass loop marker/i.test(event.payload.delta)
+      ),
+      "terminal multi-slice assistant-pass flow should preserve the resumed assistant-pass loop before the second handoff"
+    );
+    assert.equal(
+      events.filter((event) =>
+        event.type === "tool.execution.completed"
+        && event.payload.summary.startsWith("terminal-assistant-pass-multi-report.mjs:1-2")
+      ).length,
+      1,
+      "terminal multi-slice assistant-pass flow should preserve the single resumed file read"
+    );
+    assert.ok(
+      events.some((event) =>
+        event.type === "tool.execution.completed"
+        && event.payload.summary.startsWith("terminal-assistant-pass-multi-report.mjs:1-1 · updated")
+      ),
+      "terminal multi-slice assistant-pass flow should still reach the pending edit"
+    );
+    assert.ok(
+      events.some((event) =>
+        event.type === "tool.execution.completed"
+        && event.payload.summary.startsWith("node terminal-assistant-pass-multi-report.mjs · completed")
+      ),
+      "terminal multi-slice assistant-pass flow should finish verification after the resumed edit"
+    );
+    assert.equal(
+      events.some((event) =>
+        event.type === "runtime.error.raised"
+        && /Agent stopped after 96 assistant passes/.test(event.payload.message)
+      ),
+      false,
+      "terminal multi-slice assistant-pass flow should finish without surfacing the assistant-pass hard stop"
     );
   } finally {
     process.exit = originalExit;
