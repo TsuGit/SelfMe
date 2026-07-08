@@ -4522,6 +4522,7 @@ async function main() {
   await verifyProjectCommandStageSummaryResume();
   await verifyTerminalLoopSubmitsAndContinuesMultiStepTask();
   await verifyTerminalLoopAutoContinuesAfterToolStepLimit();
+  await verifyTerminalLoopContinuesAfterExplanationOnlyReply();
   await verifyTerminalLoopStopAndResumeCommandStageTask();
   await verifyTerminalLoopStopAndResumeApprovalWaitTask();
   await verifyTerminalLoopStageSummaryApprovalWaitResumeTask();
@@ -38830,6 +38831,209 @@ async function verifyTerminalLoopAutoContinuesAfterToolStepLimit() {
       ),
       false,
       "terminal step-limit auto-continue should finish without surfacing the old hard stop"
+    );
+  } finally {
+    process.exit = originalExit;
+    try {
+      bus.emit(createTerminalCommandInvokedEvent({
+        sessionId,
+        content: "/exit"
+      }));
+    } catch (error) {
+      assert.match(String(error), /EXIT:0/);
+    }
+
+    for (const listener of process.stdin.listeners("data") as Array<(...args: any[]) => void>) {
+      if (!existingDataListeners.includes(listener)) {
+        process.stdin.off("data", listener);
+      }
+    }
+  }
+}
+
+async function verifyTerminalLoopContinuesAfterExplanationOnlyReply() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-terminal-loop-explanation-continue-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  const sessionId = "terminal-loop-explanation-continue";
+  await mkdir(workspace, { recursive: true });
+  await writeFile(join(workspace, "app.config.json"), '{\n  "name": "SelfMe",\n  "port": 3000\n}\n', "utf8");
+  await writeFile(
+    join(workspace, "terminal-converge-report.mjs"),
+    'import config from "./app.conf.json" with { type: "json" };\nconsole.log(`${config.name}:${config.port}`);\n',
+    "utf8"
+  );
+
+  class TerminalLoopExplanationContinueProvider implements ProviderClient {
+    readonly name = "terminal-loop-explanation-continue-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "Read app.config.json and fix terminal-converge-report.mjs so running `node terminal-converge-report.mjs` prints exactly `SelfMe:3000` on one line. Keep working until the output is exact.";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "app.config.json",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /app\.config\.json/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node terminal-converge-report.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /failed \(1\)/.test(summary)) {
+          yield {
+            delta: "The remaining repair is clear in terminal-converge-report.mjs, and the verification failure already points to the exact file."
+          };
+          return;
+        }
+
+        if (toolName === "files" && /terminal-converge-report\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("edit", {
+              path: "terminal-converge-report.mjs",
+              startLine: 1,
+              endLine: 1,
+              replacement: 'import config from "./app.config.json" with { type: "json" };'
+            })
+          };
+          return;
+        }
+
+        if (toolName === "edit" && /terminal-converge-report\.mjs/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "node terminal-converge-report.mjs"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /completed/.test(summary)) {
+          assert.match(input.content, /SelfMe:3000/);
+          yield { delta: "Repaired terminal-converge-report.mjs and verified the final output is exactly SelfMe:3000." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.sessionId = sessionId;
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new TerminalLoopExplanationContinueProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  bus.on("approval.requested", (event) => {
+    bus.emit(createTerminalCommandInvokedEvent({
+      sessionId: event.sessionId,
+      content: `/approve ${event.payload.approvalId}`
+    }));
+  });
+
+  const editor = new EditorController();
+  const panel = new TerminalPanelController();
+  const terminal = new TerminalEventLoop({
+    bus,
+    editor,
+    panel,
+    sessionId
+  });
+
+  const originalExit = process.exit;
+  const existingDataListeners = process.stdin.listeners("data") as Array<(...args: any[]) => void>;
+
+  (process as typeof process & {
+    exit: (code?: number) => never;
+  }).exit = ((code?: number) => {
+    throw new Error(`EXIT:${code ?? 0}`);
+  }) as typeof process.exit;
+
+  try {
+    terminal.start();
+    const completion = waitForAssistantTaskCompletion(bus, sessionId);
+    process.stdin.emit("data", Buffer.from("Read app.config.json and fix terminal-converge-report.mjs so running `node terminal-converge-report.mjs` prints exactly `SelfMe:3000` on one line. Keep working until the output is exact.\r"));
+    const task = await completion;
+    const events = await transcriptStore.readEventsBySession(sessionId);
+    const assistantText = collectAssistantText(events, task.taskId ?? "");
+    const content = await readFile(join(workspace, "terminal-converge-report.mjs"), "utf8");
+
+    assert.equal(task.payload.state, "completed");
+    assert.equal(editor.getState().value, "", "terminal explanation-continue flow should clear the editor buffer");
+    assert.match(content, /app\.config\.json/);
+    assert.match(assistantText, /SelfMe:3000|terminal-converge-report\.mjs/i);
+    assert.ok(
+      events.some((event) =>
+        event.type === "assistant.delta.received"
+        && /remaining repair is clear in terminal-converge-report\.mjs/i.test(event.payload.delta)
+      ),
+      "terminal explanation-continue flow should preserve the intermediate explanation-only reply"
+    );
+    assert.equal(
+      events.filter((event) =>
+        event.type === "tool.execution.completed"
+        && event.payload.summary.startsWith("app.config.json:1-4")
+      ).length,
+      1,
+      "terminal explanation-continue flow should not reread app.config.json after the working file is known"
+    );
+    assert.ok(
+      events.some((event) =>
+        event.type === "tool.execution.completed"
+        && event.payload.summary.startsWith("node terminal-converge-report.mjs · failed (1)")
+      ),
+      "terminal explanation-continue flow should reach a real failed verification before the explanation-only reply"
+    );
+    assert.ok(
+      events.some((event) =>
+        event.type === "tool.execution.completed"
+        && event.payload.summary.startsWith("terminal-converge-report.mjs:1-2")
+      ),
+      "terminal explanation-continue flow should continue into the pending file read after the explanation-only reply"
+    );
+    assert.ok(
+      events.some((event) =>
+        event.type === "tool.execution.completed"
+        && event.payload.summary.startsWith("terminal-converge-report.mjs:1-1 · updated")
+      ),
+      "terminal explanation-continue flow should reach the repair edit after the explanation-only reply"
+    );
+    assert.ok(
+      events.some((event) =>
+        event.type === "tool.execution.completed"
+        && event.payload.summary.startsWith("node terminal-converge-report.mjs · completed")
+      ),
+      "terminal explanation-continue flow should rerun verification after the forced edit"
     );
   } finally {
     process.exit = originalExit;
