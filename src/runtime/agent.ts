@@ -35,14 +35,14 @@ const EXTENDED_AGENT_TOOL_STEPS = 16;
 const VERIFICATION_AGENT_TOOL_STEPS = 24;
 const PROJECT_AGENT_TOOL_STEPS = 32;
 const ASSISTANT_PASS_MULTIPLIER = 4;
-const MAX_AUTO_STEP_LIMIT_CONTINUATIONS_PER_TARGET = 3;
-const MAX_AUTO_STEP_LIMIT_CONTINUATIONS_TOTAL = 12;
-const MAX_AUTO_ASSISTANT_PASS_LIMIT_CONTINUATIONS_PER_TARGET = 3;
-const MAX_AUTO_ASSISTANT_PASS_LIMIT_CONTINUATIONS_TOTAL = 12;
-const MAX_AUTO_TOOL_RECOVERY_CONTINUATIONS_PER_TARGET = 3;
-const MAX_AUTO_TOOL_RECOVERY_CONTINUATIONS_TOTAL = 8;
-const MAX_AUTO_REPEATED_STALL_CONTINUATIONS_PER_TARGET = 3;
-const MAX_AUTO_REPEATED_STALL_CONTINUATIONS_TOTAL = 8;
+const MAX_AUTO_STEP_LIMIT_CONTINUATIONS_PER_TARGET = 4;
+const MAX_AUTO_STEP_LIMIT_CONTINUATIONS_TOTAL = 16;
+const MAX_AUTO_ASSISTANT_PASS_LIMIT_CONTINUATIONS_PER_TARGET = 4;
+const MAX_AUTO_ASSISTANT_PASS_LIMIT_CONTINUATIONS_TOTAL = 16;
+const MAX_AUTO_TOOL_RECOVERY_CONTINUATIONS_PER_TARGET = 4;
+const MAX_AUTO_TOOL_RECOVERY_CONTINUATIONS_TOTAL = 12;
+const MAX_AUTO_REPEATED_STALL_CONTINUATIONS_PER_TARGET = 4;
+const MAX_AUTO_REPEATED_STALL_CONTINUATIONS_TOTAL = 12;
 const MAX_REPEATED_IDENTICAL_TOOL_RESULTS = 2;
 const MAX_REPEATED_IDENTICAL_ASSISTANT_MESSAGES = 2;
 const MAX_MALFORMED_TOOL_CALL_RETRIES = 1;
@@ -3060,7 +3060,7 @@ function buildFollowUpReplyTighteningPrompt(
     originalRequest,
     instructionLines: [
       "Your previous reply was too thin for an approval or continue follow-up.",
-      "Do not start with an acknowledgement like 可以, 已继续, 好的, sure, or okay.",
+      "Do not start with an acknowledgement like 可以, 可以的, 已继续, 好的, 收到, 当然, sure, or okay.",
       "Give one short direct answer that states the concrete work result and the current outcome.",
       "Do not ask a broad follow-up question here.",
       "Do not call more tools unless the latest result still does not actually satisfy the request."
@@ -3206,7 +3206,7 @@ function buildAgentSystemPrompt(tools: ToolImplementation[], preferredLanguage: 
     "For actionable requests such as read, create, edit, fix, inspect, run, or verify, start doing the work instead of replying with a plan or status update.",
     "For concrete coding tasks, prefer a short autonomous chain of the next obvious 2 to 6 steps when each step is directly justified by the latest tool result; do not stop after a single read, edit, or verification if the next concrete step is already clear.",
     "For multi-file or project-wide tasks, do not stop after the first concrete mutation when another requested file edit or an already-established verification step is the obvious next move.",
-    "When the user message is only an approval or continue follow-up, do not answer with filler acknowledgements like 可以, 好的, sure, or okay; either do the work or report the concrete result directly.",
+    "When the user message is only an approval or continue follow-up, do not answer with filler acknowledgements like 可以, 可以的, 好的, 收到, 当然, sure, or okay; either do the work or report the concrete result directly.",
     "When a tool is required, respond with exactly one tool call block and no prose before or after it.",
     `${TOOL_CALL_OPEN}`,
     '{"tool":"shell","input":{"command":"pwd"}}',
@@ -5500,7 +5500,7 @@ function buildApprovedProposalPrompt(input: {
     `The user replied "${input.content.trim()}" to approve the immediately previous proposal.`,
     "Carry out that approved proposal now instead of restating it.",
     "Keep going through the approved sequence until the concrete task is actually complete or truly blocked.",
-    "Do not start with an acknowledgement like 可以, 可以继续, 好的, sure, or okay.",
+    "Do not start with an acknowledgement like 可以, 可以的, 可以继续, 好的, 收到, 当然, sure, or okay.",
     "Start with the concrete work result, current finding, or the next real action.",
     `Approved proposal: ${input.approvedProposal}`
   ].join("\n");
@@ -5790,9 +5790,14 @@ function buildInterruptedTaskResumeForFollowUp(input: {
     }
   }
 
+  const previousAssistantProposal = input.previousAssistantProposal ?? extractPreviousAssistantProposal(input.historyEvents);
+  const originalTask = hasRecentInterruptedProposalExecution(input.historyEvents) && previousAssistantProposal
+    ? previousAssistantProposal
+    : previousUserTask;
+
   return buildInterruptedTaskResumeRequest({
     content: input.content,
-    previousUserTask,
+    originalTask,
     historyEvents: input.historyEvents,
     acknowledgementMode: input.acknowledgementMode
   });
@@ -5800,7 +5805,7 @@ function buildInterruptedTaskResumeForFollowUp(input: {
 
 function buildInterruptedTaskResumeRequest(input: {
   content: string;
-  previousUserTask: string;
+  originalTask: string;
   historyEvents: Awaited<ReturnType<TranscriptStore["readEventsBySession"]>>;
   acknowledgementMode:
     | "discussion question"
@@ -5819,7 +5824,7 @@ function buildInterruptedTaskResumeRequest(input: {
   return [
     `The user replied "${input.content.trim()}" and wants to continue the most recent unfinished task.`,
     `Resume that task now instead of treating this as a ${input.acknowledgementMode}.`,
-    "Do not start with an acknowledgement like 可以, 可以继续, 好的, sure, or okay.",
+    "Do not start with an acknowledgement like 可以, 可以的, 可以继续, 好的, 收到, 当然, sure, or okay.",
     "Start with the concrete work result, current finding, or the next real action.",
     "Continue from the latest task state already in context.",
     recentEditableWorkingFile ? `Recent editable working file: ${recentEditableWorkingFile}` : "",
@@ -5832,7 +5837,7 @@ function buildInterruptedTaskResumeRequest(input: {
     interruptedApprovalAnchor
       ? "The previous run stopped while waiting for that approval. Retry that concrete action first instead of restarting broader inspection."
       : "",
-    `Original task: ${input.previousUserTask}`
+    `Original task: ${input.originalTask}`
   ].filter(Boolean).join("\n");
 }
 
@@ -8702,7 +8707,10 @@ function sanitizeAssistantMessageForRuntime(originalRequest: string, content: st
 function stripLowValueAcknowledgementPrefix(content: string) {
   const leadingWhitespace = content.match(/^\s*/u)?.[0] ?? "";
   const trimmedStart = content.slice(leadingWhitespace.length);
-  const stripped = trimmedStart.replace(/^(?:(?:可以继续吗|可以继续|可以了|可以|已继续|继续了|好的|好|行|没问题|sure|okay|ok)\b[\s,，。!！:：-]*)+/iu, "");
+  const stripped = trimmedStart.replace(
+    /^(?:(?:可以继续吗|可以继续|可以了|可以的|可以|已继续|继续了|好的|好|行|没问题|收到|当然|sure|okay|ok)(?=$|[\s,，。!！:：-])[\s,，。!！:：-]*)+/iu,
+    ""
+  );
   return stripped === trimmedStart ? content : `${leadingWhitespace}${stripped}`;
 }
 
@@ -8717,6 +8725,7 @@ function looksLikePendingLowValueAcknowledgementPrefix(content: string) {
     "可以继续吗",
     "可以继续",
     "可以了",
+    "可以的",
     "可以",
     "已继续",
     "继续了",
@@ -8724,6 +8733,8 @@ function looksLikePendingLowValueAcknowledgementPrefix(content: string) {
     "好",
     "行",
     "没问题",
+    "收到",
+    "当然",
     "sure",
     "okay",
     "ok"

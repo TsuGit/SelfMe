@@ -672,6 +672,14 @@ function resolveTaskAnchorRequest(latestUserRequest: string, entries: SessionTim
     return latestUserRequest;
   }
 
+  if (isContextAffirmativeFollowUp(latestUserRequest)) {
+    const previousAssistantProposal = extractPreviousAssistantProposal(entries);
+
+    if (previousAssistantProposal) {
+      return previousAssistantProposal;
+    }
+  }
+
   return findPreviousActionableUserRequest(entries) ?? latestUserRequest;
 }
 
@@ -708,6 +716,32 @@ function findPreviousActionableUserRequest(entries: SessionTimelineEntry[]) {
     }
 
     if (!isContextRunnableFollowUp(entry.text) && looksLikeContextActionableTaskRequest(entry.text)) {
+      return entry.text;
+    }
+  }
+
+  return undefined;
+}
+
+function extractPreviousAssistantProposal(entries: SessionTimelineEntry[]) {
+  let skippedLatestUser = false;
+
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+
+    if (!skippedLatestUser) {
+      if (entry?.kind === "user") {
+        skippedLatestUser = true;
+      }
+
+      continue;
+    }
+
+    if (entry?.kind === "user" && !isContextRunnableFollowUp(entry.text) && looksLikeContextActionableTaskRequest(entry.text)) {
+      break;
+    }
+
+    if (entry?.kind === "assistant" && looksLikeContextAssistantProposal(entry.text)) {
       return entry.text;
     }
   }
@@ -927,6 +961,21 @@ function looksLikeContextActionableTaskRequest(content: string) {
 function looksLikeContextDiscussionRequest(content: string) {
   return /\b(discuss|brainstorm|explain|why|architecture|tradeoff|plan|strategy|how would you|what would you do|tell me what you(?:'d| would) do)\b/i.test(content)
     || /(讨论|聊聊|为什么|架构|取舍|方案|计划|策略|先讨论|告诉我.*怎么做|会怎么做|你会怎么做)/u.test(content);
+}
+
+function looksLikeContextAssistantProposal(content: string) {
+  const normalized = content.trim();
+
+  if (!normalized) {
+    return false;
+  }
+
+  const hasOffer = /\b(if you want|if you'd like|i can|next step|if you want me to continue|i would first|i'd first|i would start by|i'd start by|i would begin by|i'd begin by)\b/i.test(normalized)
+    || /(如果你愿意|如果你要我继续|我下一步可以|我可以继续|下一步可以|我建议下一步|下一步我可以|我会先|我先|我下一步(?:先)?(?:帮你|给你)?|下一步我(?:先)?(?:帮你|给你)?|我接下来(?:先)?(?:帮你|给你)?|接下来我(?:先)?(?:帮你|给你)?)/u.test(normalized);
+  const hasAction = /\b(read|write|edit|fix|repair|create|update|change|modify|inspect|review|check|run|look at|rewrite|rebuild|optimize|improve|refactor)\b/i.test(normalized)
+    || /(读取|写入|编辑|修复|创建|更新|修改|检查|运行|改|阅读|查看|看下|看看|审一下|读|重写|优化|改进|重构|处理下|处理一下|搞下|搞一下|弄下|弄一下|整下|整一下|搞成|弄成|整成)/u.test(normalized);
+
+  return hasOffer && hasAction;
 }
 
 function looksLikePendingAssistantStep(content: string) {

@@ -84,6 +84,8 @@ export class LinearTerminalRenderer {
         return;
       }
 
+      this.commitLiveAssistantToHistory(event.payload.taskId);
+
       if (!this.clearLiveRuntimeState()) {
         return;
       }
@@ -1218,15 +1220,19 @@ function shortenHomePath(path: string) {
 
 function renderWelcomeLines(session: SessionRecord) {
   const logo = [
-    fg("accentPrimary", "  ▟██▙"),
-    fg("accentPrimary", "▗██████"),
-    fg("accentPrimary", " ▝▘▝▘▝▘")
+    fg("accentPrimary", "  ▄████▄"),
+    `${fg("accentPrimary", " ▟██  ")}${paint("●", { fg: "textPrimary", bold: true })}${fg("accentPrimary", "█▙")}`,
+    fg("accentPrimary", "  ▜████▛"),
+    fg("accentPrimary", "  ▐ ▌▐ ▌"),
+    fg("accentPrimary", " ▝▘▝▘▝▘▝▘")
   ];
 
   return [
     `${logo[0]}   ${paint("SelfMe", { fg: "textPrimary", bold: true })} ${fg("textMuted", `v${session.version}`)}`,
     `${logo[1]}  ${fg("textMuted", session.model)}`,
-    `${logo[2]}  ${fg("textMuted", shortenHomePath(session.cwd ?? process.cwd()))}`
+    logo[2],
+    `${logo[3]}   ${fg("textMuted", shortenHomePath(session.cwd ?? process.cwd()))}`,
+    logo[4]
   ];
 }
 

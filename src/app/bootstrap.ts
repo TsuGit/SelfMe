@@ -22,7 +22,7 @@ import { OpenAIProvider } from "../providers/openai.js";
 import { InMemoryToolRegistry } from "../tools/registry.js";
 
 export async function bootstrapApp() {
-  const workspaceRoot = process.env.SELFME_WORKSPACE_ROOT || process.env.INIT_CWD || process.cwd();
+  const workspaceRoot = resolveWorkspaceRoot();
   const cliRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
   const workspaceStateDir = resolve(workspaceRoot, ".selfme");
   const userStateRoot = resolve(process.env.SELFME_HOME || homedir(), ".selfme");
@@ -102,6 +102,19 @@ export async function bootstrapApp() {
     sessionId: session.sessionId,
     startupNotices
   });
+}
+
+export function resolveWorkspaceRoot(input: {
+  argv?: string[];
+  env?: NodeJS.ProcessEnv;
+  cwd?: string;
+} = {}) {
+  const argv = input.argv ?? process.argv.slice(2);
+  const env = input.env ?? process.env;
+  const cwd = input.cwd ?? process.cwd();
+  const positionalWorkspace = argv.find((value) => !value.startsWith("-"));
+
+  return resolve(positionalWorkspace || env.SELFME_WORKSPACE_ROOT || env.INIT_CWD || cwd);
 }
 
 function buildWorkspaceStateKey(workspaceRoot: string) {
