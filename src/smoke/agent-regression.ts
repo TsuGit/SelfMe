@@ -4522,6 +4522,7 @@ async function main() {
   await verifyProjectCommandStageSummaryResume();
   await verifyTerminalLoopSubmitsAndContinuesMultiStepTask();
   await verifyTerminalLoopAutoContinuesAfterToolStepLimit();
+  await verifyTerminalLoopAutoContinuesAfterToolStepLimitBeforeCommandOnlyShell();
   await verifyTerminalLoopAutoContinuesAfterAssistantPassLimit();
   await verifyTerminalLoopAutoContinuesAcrossMultipleAssistantPassSlices();
   await verifyTerminalLoopAutoContinuesAfterAssistantPassLimitBeforeCommandOnlyShell();
@@ -38842,6 +38843,207 @@ async function verifyTerminalLoopAutoContinuesAfterToolStepLimit() {
       ),
       false,
       "terminal step-limit auto-continue should finish without surfacing the old hard stop"
+    );
+  } finally {
+    process.exit = originalExit;
+    try {
+      bus.emit(createTerminalCommandInvokedEvent({
+        sessionId,
+        content: "/exit"
+      }));
+    } catch (error) {
+      assert.match(String(error), /EXIT:0/);
+    }
+
+    for (const listener of process.stdin.listeners("data") as Array<(...args: any[]) => void>) {
+      if (!existingDataListeners.includes(listener)) {
+        process.stdin.off("data", listener);
+      }
+    }
+  }
+}
+
+async function verifyTerminalLoopAutoContinuesAfterToolStepLimitBeforeCommandOnlyShell() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-terminal-loop-step-limit-command-shell-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  const sessionId = "terminal-loop-step-limit-command-shell";
+  const originalPrompt = "Read beta-1.txt, beta-2.txt, beta-3.txt, beta-4.txt, beta-5.txt, beta-6.txt, beta-7.txt, and package.json, then run `npm test` before finishing.";
+  await mkdir(workspace, { recursive: true });
+
+  for (let index = 1; index <= 7; index += 1) {
+    await writeFile(join(workspace, `beta-${index}.txt`), `beta-${index}\n`, "utf8");
+  }
+
+  await writeFile(
+    join(workspace, "package.json"),
+    '{\n  "name": "terminal-step-limit-command-shell",\n  "version": "1.0.0",\n  "scripts": {\n    "test": "node verify-terminal-commandless-step-limit.mjs"\n  }\n}\n',
+    "utf8"
+  );
+  await writeFile(join(workspace, "verify-terminal-commandless-step-limit.mjs"), 'console.log("ready");\n', "utf8");
+
+  class TerminalLoopStepLimitCommandOnlyProvider implements ProviderClient {
+    readonly name = "terminal-loop-step-limit-command-only-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("files", {
+            path: "beta-1.txt",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        for (let index = 1; index <= 6; index += 1) {
+          if (toolName === "files" && new RegExp(`beta-${index}\\.txt`).test(summary)) {
+            yield {
+              delta: toolCall("files", {
+                path: `beta-${index + 1}.txt`,
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+        }
+
+        if (toolName === "files" && /beta-7\.txt/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "package.json",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("shell", {
+              command: "npm test"
+            })
+          };
+          return;
+        }
+
+        if (toolName === "shell" && /npm test/.test(summary)) {
+          yield { delta: "npm test completed and printed ready." };
+          return;
+        }
+      }
+
+      if (
+        !input.content.startsWith("Original user request:")
+        && input.content.includes("The current task hit the per-slice tool budget but still has unfinished work.")
+      ) {
+        assert.match(input.content, /Pending next step target: npm test/);
+        assert.match(input.content, /Latest tool in context: files/);
+        assert.match(input.content, /Latest tool summary in context: package\.json:1-6/);
+        yield {
+          delta: toolCall("shell", {
+            command: "npm test"
+          })
+        };
+        return;
+      }
+
+      if (
+        input.content.startsWith("Original user request: The current task hit the per-slice tool budget but still has unfinished work.")
+      ) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell" && /npm test/.test(summary)) {
+          yield { delta: "npm test completed and printed ready." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.sessionId = sessionId;
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new TerminalLoopStepLimitCommandOnlyProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const editor = new EditorController();
+  const panel = new TerminalPanelController();
+  const terminal = new TerminalEventLoop({
+    bus,
+    editor,
+    panel,
+    sessionId
+  });
+
+  const originalExit = process.exit;
+  const existingDataListeners = process.stdin.listeners("data") as Array<(...args: any[]) => void>;
+
+  (process as typeof process & {
+    exit: (code?: number) => never;
+  }).exit = ((code?: number) => {
+    throw new Error(`EXIT:${code ?? 0}`);
+  }) as typeof process.exit;
+
+  try {
+    terminal.start();
+    const completion = waitForAssistantTaskCompletion(bus, sessionId);
+    process.stdin.emit("data", Buffer.from("Read beta-1.txt, beta-2.txt, beta-3.txt, beta-4.txt, beta-5.txt, beta-6.txt, beta-7.txt, and package.json, then run `npm test` before finishing.\r"));
+    const task = await completion;
+    const events = await transcriptStore.readEventsBySession(sessionId);
+    const assistantText = collectAssistantText(events, task.taskId ?? "");
+
+    assert.equal(task.payload.state, "completed");
+    assert.equal(editor.getState().value, "", "terminal step-limit command-only flow should clear the editor buffer");
+    assert.match(assistantText, /ready|npm test/i);
+    assert.equal(
+      events.filter((event) =>
+        event.type === "tool.execution.completed"
+        && event.payload.summary.startsWith("package.json:1-6")
+      ).length,
+      1,
+      "terminal step-limit command-only flow should preserve the package read before the handoff"
+    );
+    assert.equal(
+      events.filter((event) =>
+        event.type === "tool.execution.completed"
+        && event.payload.summary.startsWith("npm test · completed")
+      ).length,
+      1,
+      "terminal step-limit command-only flow should execute the pending verification command exactly once"
+    );
+    assert.equal(
+      events.some((event) =>
+        event.type === "runtime.error.raised"
+        && /Agent stopped after 8 tool steps/.test(event.payload.message)
+      ),
+      false,
+      "terminal step-limit command-only flow should not surface the old tool-step hard stop"
     );
   } finally {
     process.exit = originalExit;
