@@ -4521,6 +4521,7 @@ async function main() {
   await verifyNearMissShellCompletionToneStillRepairsRemainingHelper();
   await verifyProjectCommandStageSummaryResume();
   await verifyTerminalLoopSubmitsAndContinuesMultiStepTask();
+  await verifyTerminalLoopAutoContinuesAfterToolStepLimit();
   await verifyTerminalLoopStopAndResumeCommandStageTask();
   await verifyTerminalLoopStopAndResumeApprovalWaitTask();
   await verifyTerminalLoopStageSummaryApprovalWaitResumeTask();
@@ -38619,6 +38620,216 @@ async function verifyTerminalLoopSubmitsAndContinuesMultiStepTask() {
         && event.payload.summary.startsWith("node-todo/views/index.ejs:3-3 · updated")
       ),
       "terminal loop task should continue into the pending view edit within the same task"
+    );
+  } finally {
+    process.exit = originalExit;
+    try {
+      bus.emit(createTerminalCommandInvokedEvent({
+        sessionId,
+        content: "/exit"
+      }));
+    } catch (error) {
+      assert.match(String(error), /EXIT:0/);
+    }
+
+    for (const listener of process.stdin.listeners("data") as Array<(...args: any[]) => void>) {
+      if (!existingDataListeners.includes(listener)) {
+        process.stdin.off("data", listener);
+      }
+    }
+  }
+}
+
+async function verifyTerminalLoopAutoContinuesAfterToolStepLimit() {
+  const root = await mkdtemp(join(tmpdir(), "selfme-agent-terminal-loop-step-limit-auto-"));
+  const workspace = join(root, "workspace");
+  const transcriptPath = join(root, "transcript.jsonl");
+  const logsPath = join(root, "logs.jsonl");
+  const sessionId = "terminal-loop-step-limit-auto";
+  await mkdir(join(workspace, "demo-app", "src"), { recursive: true });
+
+  await writeFile(
+    join(workspace, "demo-app", "package.json"),
+    '{\n  "name": "demo-app",\n  "version": "1.0.0"\n}\n',
+    "utf8"
+  );
+
+  for (let index = 1; index <= 15; index += 1) {
+    await writeFile(
+      join(workspace, "demo-app", "src", `file-${index}.js`),
+      `export const file${index} = ${index};\n`,
+      "utf8"
+    );
+  }
+
+  class TerminalLoopStepLimitAutoContinueProvider implements ProviderClient {
+    readonly name = "terminal-loop-step-limit-auto-continue-provider";
+
+    async *streamResponse(input: ProviderStreamInput): AsyncIterable<ProviderStreamChunk> {
+      const originalPrompt = "帮我看看整个项目";
+
+      if (input.content === originalPrompt) {
+        yield {
+          delta: toolCall("shell", {
+            command: "pwd && ls -la && find demo-app -maxdepth 2 -type f | sort"
+          })
+        };
+        return;
+      }
+
+      if (input.content.startsWith(`Original user request: ${originalPrompt}`)) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "shell") {
+          yield {
+            delta: toolCall("files", {
+              path: "demo-app/package.json",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        if (toolName === "files" && /demo-app\/package\.json/.test(summary)) {
+          yield {
+            delta: toolCall("files", {
+              path: "demo-app/src/file-1.js",
+              startLine: 1,
+              endLine: 20
+            })
+          };
+          return;
+        }
+
+        const fileMatch = summary.match(/^demo-app\/src\/file-(\d+)\.js:1-1$/);
+
+        if (toolName === "files" && fileMatch) {
+          const nextIndex = Number(fileMatch[1]) + 1;
+
+          if (nextIndex <= 15) {
+            yield {
+              delta: toolCall("files", {
+                path: `demo-app/src/file-${nextIndex}.js`,
+                startLine: 1,
+                endLine: 20
+              })
+            };
+            return;
+          }
+
+          yield { delta: "I finished the whole-project inspection through demo-app/src/file-15.js." };
+          return;
+        }
+      }
+
+      if (
+        !input.content.startsWith("Original user request:")
+        && input.content.includes("The current task hit the per-slice tool budget but still has unfinished work.")
+      ) {
+        assert.match(input.content, /Original task: 帮我看看整个项目/);
+        assert.match(input.content, /Pending next step target: demo-app\/src\/file-15\.js/);
+        assert.match(input.content, /Latest tool in context: files/);
+        assert.match(input.content, /Latest tool summary in context: demo-app\/src\/file-14\.js:1-1/);
+        yield {
+          delta: toolCall("files", {
+            path: "demo-app/src/file-15.js",
+            startLine: 1,
+            endLine: 20
+          })
+        };
+        return;
+      }
+
+      if (
+        input.content.startsWith("Original user request: The current task hit the per-slice tool budget but still has unfinished work.")
+      ) {
+        const toolName = extractLine(input.content, "Tool:") ?? extractLine(input.content, "Latest tool:");
+        const summary = extractLine(input.content, "Summary:") ?? extractLine(input.content, "Latest summary:") ?? "";
+
+        if (toolName === "files" && /demo-app\/src\/file-15\.js/.test(summary)) {
+          yield { delta: "I finished the whole-project inspection through demo-app/src/file-15.js." };
+          return;
+        }
+      }
+
+      yield { delta: "ok" };
+    }
+  }
+
+  const bus = new EventBus();
+  const transcriptStore = new TranscriptStore(transcriptPath);
+  const logStore = new LogStore(logsPath);
+  await transcriptStore.ensureInitialized();
+  await logStore.ensureInitialized();
+
+  const session = createDefaultSessionRecord(workspace, VERSION);
+  session.sessionId = sessionId;
+  session.model = "regression-stub";
+
+  const runtime = new AgentRuntime({
+    bus,
+    provider: new TerminalLoopStepLimitAutoContinueProvider(),
+    tools: new InMemoryToolRegistry(),
+    session,
+    transcriptStore,
+    logStore
+  });
+  await runtime.start();
+
+  const editor = new EditorController();
+  const panel = new TerminalPanelController();
+  const terminal = new TerminalEventLoop({
+    bus,
+    editor,
+    panel,
+    sessionId
+  });
+
+  const originalExit = process.exit;
+  const existingDataListeners = process.stdin.listeners("data") as Array<(...args: any[]) => void>;
+
+  (process as typeof process & {
+    exit: (code?: number) => never;
+  }).exit = ((code?: number) => {
+    throw new Error(`EXIT:${code ?? 0}`);
+  }) as typeof process.exit;
+
+  try {
+    terminal.start();
+    const completion = waitForAssistantTaskCompletion(bus, sessionId);
+    process.stdin.emit("data", Buffer.from("帮我看看整个项目\r"));
+    const task = await completion;
+    const events = await transcriptStore.readEventsBySession(sessionId);
+    const assistantText = collectAssistantText(events, task.taskId ?? "");
+
+    assert.equal(task.payload.state, "completed");
+    assert.equal(editor.getState().value, "", "terminal step-limit auto-continue should clear the editor buffer");
+    assert.match(assistantText, /file-15\.js/);
+    assert.equal(
+      events.filter((event) =>
+        event.type === "tool.execution.completed"
+        && event.payload.summary.startsWith("demo-app/src/file-14.js:1-1")
+      ).length,
+      1,
+      "terminal step-limit auto-continue should preserve the pre-limit file read exactly once"
+    );
+    assert.equal(
+      events.filter((event) =>
+        event.type === "tool.execution.completed"
+        && event.payload.summary.startsWith("demo-app/src/file-15.js:1-1")
+      ).length,
+      1,
+      "terminal step-limit auto-continue should continue directly with the pending fifteenth file"
+    );
+    assert.equal(
+      events.some((event) =>
+        event.type === "runtime.error.raised"
+        && /Agent stopped after 16 tool steps/.test(event.payload.message)
+      ),
+      false,
+      "terminal step-limit auto-continue should finish without surfacing the old hard stop"
     );
   } finally {
     process.exit = originalExit;
